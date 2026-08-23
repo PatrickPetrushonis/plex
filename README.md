@@ -75,7 +75,7 @@ Defines, from a single `VIDEOS_BASE` (default `$HOME/Videos`):
 
 No paths or usernames are hardcoded — everything derives from `$HOME` unless overridden.
 
-On the primary machine, `$HOME/Videos` resolves onto `/raid` — an mdadm RAID 1 array (`/dev/md0`, ext4) across two 8TB drives. See `SYSTEM_ARCHITECTURE.md` for the full storage/hardware/network reference.
+On the primary machine, `$HOME/Videos` resolves onto `/raid` — an mdadm RAID 1 array (`/dev/md0`, ext4) across two 8TB drives. See `../system/System Architecture.md` for the full storage/hardware/network reference.
 
 ## Concurrency lock
 
