@@ -1,0 +1,52 @@
+# Canonical language table for the video-encoder scripts.
+# Single source of truth — do not duplicate this data anywhere else.
+# Consumed by:
+#   - lang_table.sh (bash loader, sourced by encoder_params.sh and rename_plex.sh)
+#   - encoder_params.sh's Python probe step (read directly, see probe_file())
+#
+# Format: tab-separated, one language per line.
+#   code3   — primary 3-letter code (ISO 639-2). Used as the -l/SUB_LANGS key
+#             and as the LANG_TABLE key consumed by encoder_params.sh.
+#   code2   — 2-letter code (ISO 639-1). Used for Plex-convention sidecar
+#             filenames (Movie.<code2>.srt) by both scripts.
+#   label   — display label used in track titles and renamer output.
+#   aliases — comma-separated alternate codes that should resolve to this
+#             language (e.g. bibliographic ISO 639-2/B variants), or "-" if
+#             none. Used by rename_plex.sh's language normalization and by
+#             the Python probe step's label lookup; NOT valid values for -l
+#             (the primary code3 is the only accepted -l value).
+#
+# Adding a language: add one row here. Both bash and Python consumers pick it
+# up automatically — nothing else in either script needs to change.
+#
+# code3	code2	label	aliases
+und	en	English	-
+eng	en	English	-
+fra	fr	French	fre
+deu	de	German	ger
+spa	es	Spanish	-
+ita	it	Italian	-
+jpn	ja	Japanese	-
+por	pt	Portuguese	-
+rus	ru	Russian	-
+zho	zh	Chinese	chi
+kor	ko	Korean	-
+ara	ar	Arabic	-
+hin	hi	Hindi	-
+nld	nl	Dutch	dut
+pol	pl	Polish	-
+swe	sv	Swedish	-
+nor	no	Norwegian	-
+dan	da	Danish	-
+fin	fi	Finnish	-
+tur	tr	Turkish	-
+heb	he	Hebrew	-
+tha	th	Thai	-
+vie	vi	Vietnamese	-
+ces	cs	Czech	cze
+slk	sk	Slovak	-
+hun	hu	Hungarian	-
+ron	ro	Romanian	rum
+ukr	uk	Ukrainian	-
+cat	ca	Catalan	-
+hrv	hr	Croatian	-
