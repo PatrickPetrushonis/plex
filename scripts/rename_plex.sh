@@ -107,8 +107,8 @@
 #   Editions - see EDITION_PATTERNS and check_anniversary_edition near
 #   parse_media_name) is scanned for BEFORE year detection or any title
 #   stripping, on either side of the year and whether or not it sits
-#   inside a delimited spec block - e.g. both "Alien 1979 DC (1080p...)"
-#   and "American Psycho (2000) Uncut (1080p...)" have their edition
+#   inside a delimited spec block - e.g. both "Movie Name 1979 DC (1080p...)"
+#   and "Movie Name (2000) Uncut (1080p...)" have their edition
 #   recognized and removed before the title or year is ever touched.
 #   "{edition-X}" is still checked first when present and takes precedence
 #   over a freeform match. Known limitation: a handful of bare fallback
