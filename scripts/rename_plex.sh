@@ -96,6 +96,29 @@
 #   stripped, since telling them apart would need an external metadata
 #   lookup this script deliberately doesn't do.
 #
+#   Edition/cut markers: the "{edition-X}" bracket syntax is Plex's own
+#   convention and won't already exist on a file before this script runs -
+#   relying on it alone would mean editions are silently dropped on every
+#   real-world input. Instead, a comprehensive list of recognized freeform
+#   markers (Director's Cut/DC, Extended Edition/Cut, Theatrical, Uncut,
+#   Uncensored, Unrated, Open Matte, Special/Ultimate/Collector's/
+#   Diamond/Platinum/Definitive Edition, Final/Assembly Cut, International
+#   Cut, Criterion, Remastered, Redux, and ordinal-numbered Anniversary
+#   Editions - see EDITION_PATTERNS and check_anniversary_edition near
+#   parse_media_name) is scanned for BEFORE year detection or any title
+#   stripping, on either side of the year and whether or not it sits
+#   inside a delimited spec block - e.g. both "Alien 1979 DC (1080p...)"
+#   and "American Psycho (2000) Uncut (1080p...)" have their edition
+#   recognized and removed before the title or year is ever touched.
+#   "{edition-X}" is still checked first when present and takes precedence
+#   over a freeform match. Known limitation: a handful of bare fallback
+#   words (Extended, Theatrical, DC) also match inside a related but
+#   distinct label that doesn't have its own dedicated entry - "Extended
+#   Version" isn't listed explicitly, so it falls through to the bare
+#   "Extended" pattern and is recorded as "Extended Edition" rather than
+#   kept verbatim. See EDITION_PATTERNS itself for the exact list and
+#   ordering.
+#
 # Franchise-folder restructuring (movies only):
 #   Target Plex layout: <library>/Franchise Name/Movie Name (YYYY)/Movie
 #   Name (YYYY).mkv. The franchise folder defaults to the bare movie title
@@ -136,8 +159,17 @@
 #   as NO_MATCH - this script doesn't cross-reference sidecar subtitles
 #   against a video file's resolved title/year.
 #   -F disables all of this: files are only ever renamed in place, and no
-#   folders are created or moved, same as -F always disabled the plain
-#   directory-rename pass.
+#   folders are renamed, created, or moved.
+#   The directory the script was invoked against is never itself a rename
+#   target, even if it ends up in the directory pass's candidate set -
+#   which can only happen if a loose file directly inside it has no year
+#   of its own and falls back to the root's own folder name (only possible
+#   if that name happens to look movie/show-shaped, e.g. a root literally
+#   named "Downloads (2020)"). Known limitation: that guard protects the
+#   directory itself, but not the file - in that same narrow scenario the
+#   loose file's own name can still end up derived from the root folder's
+#   name rather than being left as NO_MATCH, since the file-naming fallback
+#   and the directory-rename safeguard are deliberately independent checks.
 #
 # TV episodes:
 #   A name is routed to episode parsing instead of movie parsing if it
@@ -364,6 +396,124 @@ strip_delimited_groups() {
     sed -E 's/\([^()]*\)//g; s/\[[^][]*\]//g' <<< "$1"
 }
 
+# Runs strip_delimited_groups then clean_fragment in sequence - the pairing
+# used everywhere a parsed title/series-title/episode-title fragment is
+# finalized. TRIM_CHAR/TRIM_SIDE ("leading" or "trailing") optionally strip
+# one character in between the two steps: the lone "(" or ")" left behind
+# when a movie title is split right at an already-parenthesized year (see
+# parse_media_name) - unused by series and episode titles, which never have
+# this to trim.
+strip_and_clean() {
+    local s="$1" trim_char="${2:-}" trim_side="${3:-}"
+    s="$(strip_delimited_groups "$s")"
+    case "$trim_side" in
+        trailing) s="${s%$trim_char}" ;;
+        leading)  s="${s#$trim_char}" ;;
+    esac
+    clean_fragment "$s"
+}
+
+# Recognized edition/cut markers, checked as freeform text anywhere in a
+# name - not just the "{edition-X}" bracket syntax, which won't already
+# exist on a file before this script runs. Ordered most-specific
+# phrase first, so e.g. "Ultimate Extended Edition" is matched as that
+# exact three-word phrase before "Extended Edition" or "Ultimate Edition"
+# below it ever get a chance to claim part of it, and "Extended Edition" is
+# matched before the bare "Extended" fallback. Each pattern is PCRE, matched
+# case-insensitively; "[ ._-]" between words tolerates plain spaces as well
+# as the dot/underscore/hyphen-separated scene-naming style (e.g.
+# "Directors.Cut" or "Open_Matte"). Ordinal-numbered anniversary editions
+# ("25th Anniversary Edition") are handled separately, in
+# check_anniversary_edition below, since the number itself has to be
+# captured and reproduced rather than mapped to one fixed label.
+# Known limitation, an accepted tradeoff of matching by keyword at all: the
+# bare fallback words at the bottom (Theatrical, Extended, DC) match inside
+# a related but distinct label that doesn't have its own dedicated entry
+# above them - "Extended Version" isn't listed explicitly, so it falls
+# through to the bare "Extended" pattern and is recorded as "Extended
+# Edition" rather than kept verbatim.
+EDITION_PATTERNS=(
+    "ultimate[ ._-]extended[ ._-]edition::Ultimate Extended Edition"
+    "director'?s[ ._-]cut::Director's Cut"
+    "extended[ ._-]edition::Extended Edition"
+    "extended[ ._-]cut::Extended Cut"
+    "theatrical[ ._-](?:cut|edition|release|version)::Theatrical"
+    "open[ ._-]matte::Open Matte"
+    "collector'?s[ ._-]edition::Collector's Edition"
+    "special[ ._-]edition::Special Edition"
+    "ultimate[ ._-]edition::Ultimate Edition"
+    "diamond[ ._-]edition::Diamond Edition"
+    "platinum[ ._-](?:edition|series)::Platinum Edition"
+    "definitive[ ._-](?:cut|edition)::Definitive Edition"
+    "anniversary[ ._-](?:edition|collection)::Anniversary Edition"
+    "final[ ._-]cut::Final Cut"
+    "assembly[ ._-]cut::Assembly Cut"
+    "international[ ._-](?:cut|version)::International Cut"
+    "criterion(?:[ ._-]collection)?::Criterion"
+    "remaster(?:ed)?::Remastered"
+    "unrated::Unrated"
+    "uncensored::Uncensored"
+    "uncut::Uncut"
+    "redux::Redux"
+    "theatrical::Theatrical"
+    "extended::Extended Edition"
+    "(?<![0-9A-Za-z])dc(?![0-9A-Za-z])::Director's Cut"
+)
+
+# Ordinal-numbered anniversary editions ("25th Anniversary Edition", "40th
+# Anniversary Collector's Edition") can't be handled as a fixed pattern-to-
+# label entry in EDITION_PATTERNS above - there are too many real numbers
+# in circulation to enumerate, so the ordinal itself is captured out of the
+# match and reproduced in the label. A trailing "Edition"/"Collection" word
+# is matched (and removed along with the rest) but not reproduced - the
+# label is always normalized to "<N><suffix> Anniversary Edition"
+# regardless of what, if anything, followed "Anniversary" in the source
+# text. Checked before EDITION_PATTERNS since it needs this different
+# handling; sets EDITION_LABEL only when it actually matches, leaving it
+# for the caller to fall through to the static list otherwise.
+check_anniversary_edition() {
+    local raw="$1" match
+    EDITION_LABEL=""
+    match="$(grep -ioP '[0-9]+(?:st|nd|rd|th)[ ._-]anniversary(?:[ ._-](?:edition|collection))?' <<< "$raw" | head -1)" || true
+    if [[ -n "$match" ]] && [[ "$match" =~ ^([0-9]+)(st|nd|rd|th) ]]; then
+        EDITION_LABEL="${BASH_REMATCH[1]}${BASH_REMATCH[2]} Anniversary Edition"
+        raw="${raw/$match/}"
+    fi
+    EDITION_RAW="$raw"
+}
+
+# Scans RAW for the first recognized edition marker - an ordinal-numbered
+# anniversary edition first (see check_anniversary_edition above), then
+# EDITION_PATTERNS in order, stopping at the first hit anywhere in the
+# string (not necessarily the first hit by position - see the ordering
+# note above). Sets EDITION_LABEL (empty if nothing matched) and
+# EDITION_RAW (the input with the matched text removed, unchanged if
+# nothing matched). Called before year detection or any title stripping in
+# both parse_media_name and parse_episode_name, so an edition marker is
+# recognized regardless of where it sits relative to the year, and never
+# ends up folded into the title or discarded as an undifferentiated
+# release tag.
+extract_known_edition() {
+    local raw="$1" entry pattern label match
+
+    check_anniversary_edition "$raw"
+    [[ -n "$EDITION_LABEL" ]] && return
+    raw="$EDITION_RAW"
+
+    EDITION_LABEL=""
+    for entry in "${EDITION_PATTERNS[@]}"; do
+        pattern="${entry%%::*}"
+        label="${entry#*::}"
+        match="$(grep -ioP "$pattern" <<< "$raw" | head -1)" || true
+        if [[ -n "$match" ]]; then
+            EDITION_LABEL="$label"
+            raw="${raw/$match/}"
+            break
+        fi
+    done
+    EDITION_RAW="$raw"
+}
+
 # Core name parser for MOVIES. Sets PARSED_OK, PARSED_TITLE, PARSED_YEAR,
 # PARSED_EDITION from an already-prefix-stripped name with no extension (a
 # file basename with its extension already stripped, or a directory
@@ -374,12 +524,20 @@ parse_media_name() {
     local raw="$1"
     PARSED_OK=0; PARSED_TITLE=""; PARSED_YEAR=""; PARSED_EDITION=""
 
-    # Extract {edition-X} wherever it appears (rare outside already-Plex-
-    # formatted names, but scanned unconditionally rather than assumed
-    # absent), removing it from the working string.
+    # The explicit "{edition-X}" bracket syntax takes precedence when
+    # present (unambiguous, already in final Plex form), and is checked
+    # first so a freeform match below never fires redundantly against
+    # text that's already been claimed as the edition. Falls back to
+    # freeform keyword matching (see EDITION_PATTERNS above) otherwise -
+    # the normal case, since raw downloads don't already carry
+    # "{edition-X}".
     if [[ "$raw" =~ \{edition-([^}]+)\} ]]; then
         PARSED_EDITION="${BASH_REMATCH[1]}"
         raw="${raw/${BASH_REMATCH[0]}/}"
+    else
+        extract_known_edition "$raw"
+        PARSED_EDITION="$EDITION_LABEL"
+        raw="$EDITION_RAW"
     fi
 
     # Year detection always runs on the untouched string, BEFORE any
@@ -393,9 +551,7 @@ parse_media_name() {
     local year_match="$YEAR_MATCH" offset="$YEAR_OFFSET"
 
     local title_part="${raw:0:$offset}"
-    title_part="$(strip_delimited_groups "$title_part")"
-    title_part="${title_part%(}"   # drop a wrapping "(" left by an already-parenthesized year
-    title_part="$(clean_fragment "$title_part")"
+    title_part="$(strip_and_clean "$title_part" "(" trailing)"   # drop a wrapping "(" left by an already-parenthesized year
 
     if [[ -z "$title_part" ]]; then
         # Nothing usable before the year - try year-FIRST instead of
@@ -407,10 +563,7 @@ parse_media_name() {
         # year-last interpretation came up empty, so a normal
         # "Movie Title (2020)" name is unaffected and still parses year-last.
         local after_offset=$(( offset + ${#year_match} ))
-        title_part="${raw:$after_offset}"
-        title_part="$(strip_delimited_groups "$title_part")"
-        title_part="${title_part#)}"
-        title_part="$(clean_fragment "$title_part")"
+        title_part="$(strip_and_clean "${raw:$after_offset}" ")" leading)"
     fi
 
     [[ -z "$title_part" ]] && return
@@ -469,6 +622,17 @@ parse_episode_name() {
     PARSED_OK=0; PARSED_SERIES=""; PARSED_SEASON=""; PARSED_EPISODE=""
     PARSED_EPTITLE=""; PARSED_EDITION=""
 
+    # Same freeform edition-marker recognition as the movie parser (see
+    # EDITION_PATTERNS above), checked first so a marker on either side of
+    # SxxEyy - "Show Name Director's Cut S01E01" or
+    # "Show Name S01E01 - Uncut" - is captured rather than becoming part of
+    # the series title or being discarded as junk. The literal "{edition-X}"
+    # bracket syntax is still also checked further below, scoped to just
+    # the trailing episode-title segment where it can appear.
+    extract_known_edition "$raw"
+    PARSED_EDITION="$EDITION_LABEL"
+    raw="$EDITION_RAW"
+
     local match offset
     match="$(grep -oP '(?<![0-9A-Za-z])[Ss][0-9]{1,2}[Ee][0-9]{1,3}(?![0-9A-Za-z])' <<< "$raw" | head -1)" || true
     [[ -z "$match" ]] && return
@@ -502,8 +666,7 @@ parse_episode_name() {
     fi
 
     local series_part
-    series_raw="$(strip_delimited_groups "$series_raw")"
-    series_part="$(clean_fragment "$series_raw")"
+    series_part="$(strip_and_clean "$series_raw")"
     [[ -z "$series_part" ]] && return
 
     local rest_part="${raw:$(( offset + ${#match} ))}"
@@ -513,8 +676,7 @@ parse_episode_name() {
             PARSED_EDITION="${BASH_REMATCH[1]}"
             ep_title="${ep_title/${BASH_REMATCH[0]}/}"
         fi
-        ep_title="$(strip_delimited_groups "$ep_title")"
-        PARSED_EPTITLE="$(clean_fragment "$ep_title")"
+        PARSED_EPTITLE="$(strip_and_clean "$ep_title")"
     fi
 
     PARSED_SERIES="$series_part"
@@ -522,7 +684,6 @@ parse_episode_name() {
     PARSED_EPISODE="$(printf '%02d' "$((10#$episode))")"
     PARSED_OK=1
 }
-
 
 # Subtitle language/modifier extraction. Decoupled from parse_media_name
 # entirely: operates on the raw name's trailing dot-segments before the
@@ -610,12 +771,14 @@ attempt_rename() {
     [[ "$old" == "$new" ]] && return 0
 
     if [[ -e "$new" ]]; then
-        if [[ -d "$new" && -d "$old" ]]; then
-            # mv on an existing directory target nests the source inside it
-            # (new/old/...) rather than replacing or merging it - never safe
-            # to force automatically, since it could silently orphan or
-            # shadow files already in the destination. Always skipped,
-            # regardless of -f.
+        if [[ -d "$new" ]]; then
+            # mv onto an existing directory target nests the source inside
+            # it (new/old/...) rather than replacing or merging it - never
+            # safe to force automatically, since it could silently orphan
+            # or shadow files already in the destination, or (if old is a
+            # file, not a directory) produce a nested result that doesn't
+            # match what -f's "overwrite" promises at all. Always skipped,
+            # regardless of -f or what old is.
             echo "SKIPPING (rename target directory already exists — merge manually): $new_base"
             log "SKIPPED (directory collision): $old_base -> $new_base"
             SKIPPED=$(( SKIPPED + 1 ))
@@ -649,6 +812,19 @@ attempt_rename() {
         fi
     fi
     echo "----------------------------------------------------------------"
+}
+
+# Builds the canonical Plex-format movie name - "Title (Year)" or "Title
+# (Year) {edition-X}" when an edition is present - used identically for
+# both the file name (main loop) and the containing folder name (directory
+# pass).
+build_movie_name() {
+    local title="$1" year="$2" edition="$3"
+    if [[ -n "$edition" ]]; then
+        echo "$title ($year) {edition-$edition}"
+    else
+        echo "$title ($year)"
+    fi
 }
 
 # Creates DIR (and any missing parents) unless in dry-run, where nothing on
@@ -806,14 +982,15 @@ while IFS= read -r -d '' FILE_PATH; do
         continue
     fi
 
-    # A movie's own directory holds just that movie (only when it's itself
-    # movie-shaped - see Case B below for when it isn't); an episode's own
-    # directory is a "Season NN" folder, not the show - the show-root
-    # folder is one level further up. Track whichever is the actual
-    # title/year-shaped ancestor, so the directory pass never runs against
-    # "Season NN" itself, and never runs against a plain (non-year) folder
-    # that a Case B move will create a NEW correctly-named subfolder inside
-    # of rather than renaming.
+    # A movie's own directory holds just that movie, but only when it's
+    # itself movie-shaped (i.e. DIR_OK, computed above) - when it isn't, the
+    # file instead relocates into a freshly created subfolder below, and
+    # this plain (non-year) folder is deliberately left out of MATCHED_DIRS
+    # so the directory pass never tries to rename it into a match for the
+    # movie itself. An episode's own directory is a "Season NN" folder, not
+    # the show - the show-root folder is one level further up. Track
+    # whichever is the actual title/year-shaped ancestor, so the directory
+    # pass never runs against "Season NN" itself either.
     if (( IS_EPISODE )); then
         MATCHED_DIRS["$(dirname "$FILE_DIR")"]="show"
     elif (( DIR_OK )); then
@@ -826,19 +1003,15 @@ while IFS= read -r -d '' FILE_PATH; do
         [[ -n "$PARSED_EPTITLE" ]] && CLEAN_PLEX_NAME="$CLEAN_PLEX_NAME - $PARSED_EPTITLE"
         [[ -n "$PARSED_EDITION" ]] && CLEAN_PLEX_NAME="$CLEAN_PLEX_NAME {edition-$PARSED_EDITION}"
     else
-        if [[ -n "$FINAL_EDITION" ]]; then
-            CLEAN_PLEX_NAME="$FINAL_TITLE ($FINAL_YEAR) {edition-$FINAL_EDITION}"
-        else
-            CLEAN_PLEX_NAME="$FINAL_TITLE ($FINAL_YEAR)"
-        fi
+        CLEAN_PLEX_NAME="$(build_movie_name "$FINAL_TITLE" "$FINAL_YEAR" "$FINAL_EDITION")"
     fi
     NEW_FILE_NAME="${CLEAN_PLEX_NAME}${SUB_LANG_TAG}.${FILE_EXT_LOWER}"
 
     # Destination directory. Movies whose immediate parent folder is NOT
-    # movie-shaped (Case B) relocate into a freshly created folder instead
-    # of staying in place - everything else renames in place, exactly as
-    # before. Gated on RENAME_DIRS (-F): with -F, nothing is ever created
-    # or moved, only renamed in place.
+    # movie-shaped (DIR_OK=0) relocate into a freshly created folder
+    # instead of staying in place - everything else renames in place.
+    # Gated on RENAME_DIRS (-F): with -F, nothing is ever created or
+    # moved, only renamed in place.
     RESTRUCTURED=0
     if [[ $IS_EPISODE -eq 0 && $DIR_OK -eq 0 ]] && (( RENAME_DIRS )); then
         ROOT_CHECK=0
@@ -889,9 +1062,10 @@ done < <(find "$TARGET_DIR" -type f -regextype posix-extended -iregex ".*\.(${AL
 # Directory pass. Runs after all file renames complete, over the set of
 # directories that are the title/year-shaped ancestor of at least one
 # successfully-parsed file: a movie's own folder (only when that folder was
-# already movie-shaped going in - see Case B above for when it wasn't), or
-# a show's root folder (one level above "Season NN" for episodes). "Season
-# NN" folders themselves are never in this set and are never touched.
+# already movie-shaped going in - see the MATCHED_DIRS note in the main
+# loop above for when it wasn't), or a show's root folder (one level above
+# "Season NN" for episodes). "Season NN" folders themselves are never in
+# this set and are never touched.
 # Always parsed as movie/show-style (title + year), never as episode-style
 # - a directory basename has no extension and isn't itself an episode
 # file. Year-first names (e.g. a raw download's "(2020) Movie Name"
@@ -902,6 +1076,20 @@ if (( RENAME_DIRS )) && [[ ${#MATCHED_DIRS[@]} -gt 0 ]]; then
     echo "=== Directory pass ==="
     for DIR_PATH in "${!MATCHED_DIRS[@]}"; do
         DIR_TYPE="${MATCHED_DIRS[$DIR_PATH]}"
+
+        # The directory the script was invoked against is never itself a
+        # rename target, even if it ended up in MATCHED_DIRS - which can
+        # only happen if a loose file directly inside it had no year of
+        # its own and fell back to the root's own folder name (only
+        # possible when that name happens to look movie/show-shaped, e.g.
+        # a root literally named "Downloads (2020)"). Renaming the actual
+        # target the caller passed in, out from under the run, would be
+        # far more disruptive than leaving one file's fallback-derived
+        # name as-is.
+        ROOT_CHECK=0
+        check_root "$DIR_PATH" || ROOT_CHECK=$?
+        [[ $ROOT_CHECK -eq 0 ]] && continue
+
         DIR_BASE="$(basename "$DIR_PATH")"
         DIR_PARENT="$(dirname "$DIR_PATH")"
 
@@ -910,11 +1098,7 @@ if (( RENAME_DIRS )) && [[ ${#MATCHED_DIRS[@]} -gt 0 ]]; then
             continue
         fi
 
-        if [[ -n "$PARSED_EDITION" ]]; then
-            NEW_DIR_NAME="$PARSED_TITLE ($PARSED_YEAR) {edition-$PARSED_EDITION}"
-        else
-            NEW_DIR_NAME="$PARSED_TITLE ($PARSED_YEAR)"
-        fi
+        NEW_DIR_NAME="$(build_movie_name "$PARSED_TITLE" "$PARSED_YEAR" "$PARSED_EDITION")"
         NEW_DIR_PATH="${DIR_PARENT}/${NEW_DIR_NAME}"
 
         SKIPPED_BEFORE=$SKIPPED
