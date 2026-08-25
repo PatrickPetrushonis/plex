@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# rename_plex.sh: Rename movie AND TV episode video/subtitle files (and
+# rename_params.sh: Rename movie AND TV episode video/subtitle files (and
 #                  optionally their containing directories) into Plex naming
 #                  convention. Handles both already-Plex-formatted names and
 #                  raw scene-release names — see "Name parsing" below.
 #
-# Usage:  ./rename_plex.sh [OPTIONS] <target_dir>
+# Usage:  ./rename_params.sh [OPTIONS] <target_dir>
 #
 # Options:
 #   -n              Dry run: print decisions, do not rename (default: off)

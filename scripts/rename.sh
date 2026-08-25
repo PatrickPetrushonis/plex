@@ -5,4 +5,4 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 # shellcheck source=./config.sh
 source ./config.sh
 
-./rename_plex.sh -O "$DOWNLOADS_BASE" "$DOWNLOADS_INPUT_DIR"
+./rename_params.sh -O "$DOWNLOADS_BASE" "$DOWNLOADS_INPUT_DIR"

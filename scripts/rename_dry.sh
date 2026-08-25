@@ -5,8 +5,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 # shellcheck source=./config.sh
 source ./config.sh
 
-# Passed as -O's base, not the log dir directly: rename_plex.sh appends
+# Passed as -O's base, not the log dir directly: rename_params.sh appends
 # /Logs and /.locks itself, so this becomes $DOWNLOADS_BASE/Logs and
 # $DOWNLOADS_BASE/.locks — passing ".../Logs" here would have doubled up
 # into ".../Logs/Logs".
-./rename_plex.sh -n -O "$DOWNLOADS_BASE" "$DOWNLOADS_INPUT_DIR"
+./rename_params.sh -n -O "$DOWNLOADS_BASE" "$DOWNLOADS_INPUT_DIR"

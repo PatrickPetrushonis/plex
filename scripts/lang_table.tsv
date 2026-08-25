@@ -1,7 +1,7 @@
 # Canonical language table for the video-encoder scripts.
 # Single source of truth — do not duplicate this data anywhere else.
 # Consumed by:
-#   - lang_table.sh (bash loader, sourced by encoder_params.sh and rename_plex.sh)
+#   - lang_table.sh (bash loader, sourced by encoder_params.sh and rename_params.sh)
 #   - encoder_params.sh's Python probe step (read directly, see probe_file())
 #
 # Format: tab-separated, one language per line.
@@ -12,7 +12,7 @@
 #   label   — display label used in track titles and renamer output.
 #   aliases — comma-separated alternate codes that should resolve to this
 #             language (e.g. bibliographic ISO 639-2/B variants), or "-" if
-#             none. Used by rename_plex.sh's language normalization and by
+#             none. Used by rename_params.sh's language normalization and by
 #             the Python probe step's label lookup; NOT valid values for -l
 #             (the primary code3 is the only accepted -l value).
 #

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # lang_table.sh: Loads video-encoder/scripts/lang_table.tsv into the
-# associative arrays encoder_params.sh and rename_plex.sh both need. Source,
+# associative arrays encoder_params.sh and rename_params.sh both need. Source,
 # don't run directly. Resolves the tsv relative to THIS file's location
 # (not the sourcing script's), so it works regardless of caller cwd.
 #
@@ -9,11 +9,11 @@
 #   LANG_3TO2       code3 -> code2           (sidecar filename lookups)
 #   LANG_LABEL_BASH code3 -> Label           (embedded/sidecar track titles)
 #   LANG_ALIASES    any lowercase code (2-letter, 3-letter, or listed alias)
-#                   -> code2                 (rename_plex.sh normalization)
+#                   -> code2                 (rename_params.sh normalization)
 #
 # shellcheck disable=SC2034
 # File-wide: every array here is written in this file and read only by
-# encoder_params.sh and rename_plex.sh, which source this file — shellcheck
+# encoder_params.sh and rename_params.sh, which source this file — shellcheck
 # can't see across that boundary when checking this file standalone (-x/
 # follow-sources only traces what a file itself sources, not who sources it
 # back). LANG_TABLE specifically is the one exception actually unread by
@@ -21,7 +21,7 @@
 # format for any future consumer that wants the combined form.
 
 # Include guard: safe to source twice (e.g. a future single-entry-point
-# script sourcing both encoder_params.sh and rename_plex.sh in one process).
+# script sourcing both encoder_params.sh and rename_params.sh in one process).
 [[ -n "${LANG_TABLE_LOADED:-}" ]] && return 0
 LANG_TABLE_LOADED=1
 
