@@ -15,10 +15,12 @@
 #                   directory inside an existing target rather than
 #                   replacing it; forcing that would risk silently merging
 #                   or shadowing files already in the destination
-#   -F              Files only: skip renaming containing directories
-#                   (default: off — directories are renamed alongside their
-#                   matched files, since scene-release folders almost always
-#                   need the same site-prefix/junk cleanup as the file inside)
+#   -F              Files only: skip renaming containing directories AND
+#                   skip all franchise-folder restructuring (default: off —
+#                   directories are renamed alongside their matched files,
+#                   and folders are created/moved as described in
+#                   "Franchise-folder restructuring" below). With -F, a
+#                   file is only ever renamed in place, never moved.
 #   -O DIR          Operational directory: base for logs (OPDIR/Logs) and the
 #                   lock file (OPDIR/.locks) — never <target_dir> itself.
 #                   Default: this script's own directory. When invoked
@@ -72,6 +74,71 @@
 #   correct match without an external metadata lookup, which this script
 #   deliberately doesn't do.
 #
+#   Year-FIRST names: if nothing usable is left before the year (e.g.
+#   "(2020) Movie Name" or "2020 Movie Name"), the title is taken from
+#   everything AFTER the year instead. This is tried only as a fallback
+#   when the year-last interpretation comes up empty, so it never competes
+#   with or overrides the normal year-last case - a name like
+#   "Movie Title (2020)" still parses as year-last exactly as before.
+#
+#   Delimited spec blocks: any COMPLETE "(...)" or "[...]" group within the
+#   title portion is stripped entirely, not just trimmed - this handles
+#   third-party encoders that tack on a spec block instead of (or in
+#   addition to) a plain year, e.g. "Movie Name (1080p x264 AAC BluRay
+#   EncoderName).mkv" or "Movie Name (1080p x264 AAC BluRay EncoderName)
+#   (2020).mkv". Year detection always runs on the untouched name first, so
+#   a year sitting inside such a block (e.g. "Movie Name (2020 1080p x264
+#   AAC BluRay EncoderName).mkv") is still found regardless of where it
+#   appears - this stripping only removes the leftover non-year text once
+#   the title portion is known. Known limitation: this can't distinguish an
+#   encoder's spec parentheses from parentheses that are genuinely part of
+#   a title (e.g. a movie actually titled "Movie (Part Two)") - both are
+#   stripped, since telling them apart would need an external metadata
+#   lookup this script deliberately doesn't do.
+#
+# Franchise-folder restructuring (movies only):
+#   Target Plex layout: <library>/Franchise Name/Movie Name (YYYY)/Movie
+#   Name (YYYY).mkv. The franchise folder defaults to the bare movie title
+#   (no year) and this script NEVER renames an existing franchise folder -
+#   only ever creates one when none exists, so a franchise folder a user
+#   has manually renamed (e.g. to an actual series name shared by several
+#   movies) is never touched.
+#
+#   Each movie file has two independent possible sources of title/year: its
+#   own name, and its immediate parent folder's name (same year-first/
+#   year-last parsing as everywhere else in this script). The file's own
+#   name wins whenever it has a usable year; the parent folder is only
+#   consulted when the file's own name doesn't have one.
+#
+#   - Parent folder IS movie-shaped (has its own year): the file is renamed
+#     in place, and the folder itself is renamed in place to canonical
+#     form. If that folder sits directly in the scanned target directory
+#     (no franchise folder above it yet), a new franchise folder is created
+#     and the whole movie folder is moved into it. If the folder already
+#     has any other parent, it's assumed to already be sitting inside a
+#     franchise folder (default or custom-named) and nothing above it is
+#     touched.
+#   - Parent folder is NOT movie-shaped, but the file's own name has a
+#     year: the file is relocated into a freshly created "Movie Name
+#     (YYYY)" folder. If the file was sitting loose directly in the
+#     scanned target directory with no per-movie folder at all, a
+#     franchise folder is created too and the movie folder nests inside it.
+#   - Neither the file's own name nor its parent folder has a usable year:
+#     nothing is inferred or moved - same NO_MATCH as always.
+#
+#   This is scoped to movies only - a TV episode's SxxEyy token is always
+#   on the episode file itself in every layout this script targets, and
+#   show-root folders never get a franchise wrapper inserted.
+#   Known limitation: a subtitle sidecar is only relocated this way if ITS
+#   OWN name (after the language tag is stripped) independently carries a
+#   year. A subtitle with no year in its own name, sitting loose next to a
+#   correctly-named video, is not correlated with that video and is left
+#   as NO_MATCH - this script doesn't cross-reference sidecar subtitles
+#   against a video file's resolved title/year.
+#   -F disables all of this: files are only ever renamed in place, and no
+#   folders are created or moved, same as -F always disabled the plain
+#   directory-rename pass.
+#
 # TV episodes:
 #   A name is routed to episode parsing instead of movie parsing if it
 #   contains a standalone SxxEyy token (S + 1-2 digit season, E + 1-3 digit
@@ -95,13 +162,19 @@
 #   the tags begin without either enumerating tag vocabulary (which this
 #   script deliberately avoids elsewhere) or an external episode-title
 #   database - the whole trailing text is kept as-is in that case.
+#   Both the series title and the episode title go through the same
+#   delimited-spec-block stripping as movie titles (see "Delimited spec
+#   blocks" above), so an encoder tag like "Show Name (1080p x264
+#   EncoderName) S01E01.mkv" or "S01E01 - Real Title (1080p x264
+#   EncoderName)" has that block removed rather than folded into the name.
 #   Multi-episode files (S01E01E02) and absolute-numbered releases with no
 #   S/E letters are not recognized; treated as NO_MATCH, not guessed at.
 #   Directory handling differs from movies: an episode's own containing
 #   folder is a "Season NN" folder, not the show itself, so it is never
 #   touched by the directory pass. The show-root folder (one level further
 #   up) is tracked instead and renamed with the same movie-style
-#   title + year logic a standalone movie folder gets.
+#   title + year logic a standalone movie folder gets. Show-root folders
+#   never get a franchise wrapper inserted - that's movie-only.
 
 set -euo pipefail
 
@@ -152,7 +225,7 @@ if [[ ! -d "$TARGET_DIR" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TARGET_DIR_REAL="$(cd "$TARGET_DIR" && pwd)"   # canonicalize so different relative paths to the same directory hash identically
+TARGET_DIR_REAL="$(cd "$TARGET_DIR" && pwd)"   # canonicalize so different relative paths to the same directory hash identically, and so folder-nesting checks below are reliable
 [[ -z "$OPERATIONAL_DIR" ]] && OPERATIONAL_DIR="$SCRIPT_DIR"
 
 # Dependency check
@@ -242,6 +315,55 @@ strip_junk_prefixes() {
     echo "$s"
 }
 
+# Finds the LAST standalone 4-digit year (1900-2099) in a string, per the
+# boundary rule in "Name parsing" above: not immediately preceded or
+# followed by another alphanumeric character, so "2160p" and "x265" never
+# match. Sets YEAR_MATCH and YEAR_OFFSET (byte offset of the match within
+# the input); both empty if no standalone year is present. grep exits 1 on
+# no match; `|| true` stops that from tripping set -e/pipefail (same class
+# of issue encoder_params.sh's own Design Notes document covers for its
+# main-loop return-code handling). Shared by parse_media_name and
+# parse_episode_name's redundant-year stripping - both want the same "last
+# standalone year" detection, just applied to different substrings.
+find_last_year() {
+    local raw="$1"
+    YEAR_MATCH=""; YEAR_OFFSET=""
+    YEAR_MATCH="$(grep -oP '(?<![0-9A-Za-z])(19[0-9]{2}|20[0-9]{2})(?![0-9A-Za-z])' <<< "$raw" | tail -1)" || true
+    [[ -z "$YEAR_MATCH" ]] && return
+    local off
+    off="$(grep -boP '(?<![0-9A-Za-z])'"$YEAR_MATCH"'(?![0-9A-Za-z])' <<< "$raw" | tail -1)" || true
+    [[ -z "$off" ]] && { YEAR_MATCH=""; return; }
+    YEAR_OFFSET="${off%%:*}"
+}
+
+# Cleans a raw title/series-title fragment: dots, underscores, and slashes
+# become spaces, runs of whitespace collapse to one space, and
+# leading/trailing whitespace or hyphens are trimmed. The slash handling
+# specifically guards every title this script produces (PARSED_TITLE,
+# PARSED_SERIES, PARSED_EPTITLE) against ever containing a literal "/" -
+# titles are used directly as directory and file name components
+# (franchise folders, movie-year folders, filenames), and a stray "/"
+# there would otherwise be silently read as an extra path separator by
+# mkdir/mv rather than as part of the name. Shared by every title-shaped
+# fragment this script produces (movie titles both year-last and
+# year-first, series titles, episode titles) so the same cleanup rule
+# applies everywhere.
+clean_fragment() {
+    local s
+    s="$(tr '._/' '   ' <<< "$1" | tr -s ' ')"
+    sed -E 's/^[[:space:]-]+//; s/[[:space:]-]+$//' <<< "$s"
+}
+
+# Removes every COMPLETE (...) or [...] group from a string (both
+# delimiters present in the input; a lone unmatched "(" or ")" left behind
+# by splitting a string at a year is untouched here - that's handled
+# separately, see parse_media_name). Used to strip third-party-encoder spec
+# blocks like "(1080p x264 AAC BluRay EncoderName)" out of a title before
+# it's used, so they never end up as part of a movie's parsed name.
+strip_delimited_groups() {
+    sed -E 's/\([^()]*\)//g; s/\[[^][]*\]//g' <<< "$1"
+}
+
 # Core name parser for MOVIES. Sets PARSED_OK, PARSED_TITLE, PARSED_YEAR,
 # PARSED_EDITION from an already-prefix-stripped name with no extension (a
 # file basename with its extension already stripped, or a directory
@@ -260,23 +382,36 @@ parse_media_name() {
         raw="${raw/${BASH_REMATCH[0]}/}"
     fi
 
-    # Last standalone 4-digit year (1900-2099): not immediately preceded or
-    # followed by another alphanumeric character, so "2160p" and "x265"
-    # never match. grep exits 1 on no match; `|| true` stops that from
-    # tripping set -e/pipefail (same class of issue encoder_params.sh's own
-    # Design Notes document for its main-loop return-code handling).
-    local year_match offset
-    year_match="$(grep -oP '(?<![0-9A-Za-z])(19[0-9]{2}|20[0-9]{2})(?![0-9A-Za-z])' <<< "$raw" | tail -1)" || true
-    [[ -z "$year_match" ]] && return
-
-    offset="$(grep -boP '(?<![0-9A-Za-z])'"$year_match"'(?![0-9A-Za-z])' <<< "$raw" | tail -1)" || true
-    [[ -z "$offset" ]] && return
-    offset="${offset%%:*}"
+    # Year detection always runs on the untouched string, BEFORE any
+    # delimiter stripping below - so a year is found no matter where it
+    # sits, including inside a third-party encoder's spec block (e.g.
+    # "Movie Name (2020 1080p x264 AAC BluRay EncoderName).mkv"). Only the
+    # leftover non-year text within delimiters is discarded, once the
+    # title portion is known - see below.
+    find_last_year "$raw"
+    [[ -z "$YEAR_MATCH" ]] && return
+    local year_match="$YEAR_MATCH" offset="$YEAR_OFFSET"
 
     local title_part="${raw:0:$offset}"
+    title_part="$(strip_delimited_groups "$title_part")"
     title_part="${title_part%(}"   # drop a wrapping "(" left by an already-parenthesized year
-    title_part="$(tr '._' '  ' <<< "$title_part" | tr -s ' ')"
-    title_part="$(sed -E 's/^[[:space:]-]+//; s/[[:space:]-]+$//' <<< "$title_part")"
+    title_part="$(clean_fragment "$title_part")"
+
+    if [[ -z "$title_part" ]]; then
+        # Nothing usable before the year - try year-FIRST instead of
+        # year-last: "(2020) Movie Name" / "2020 Movie Name", the shape a
+        # raw download's own folder is sometimes named. Title becomes
+        # everything AFTER the year instead of before it. A trailing ")"
+        # left by an already-parenthesized year is dropped the same way a
+        # leading "(" is dropped above. This only ever runs when the
+        # year-last interpretation came up empty, so a normal
+        # "Movie Title (2020)" name is unaffected and still parses year-last.
+        local after_offset=$(( offset + ${#year_match} ))
+        title_part="${raw:$after_offset}"
+        title_part="$(strip_delimited_groups "$title_part")"
+        title_part="${title_part#)}"
+        title_part="$(clean_fragment "$title_part")"
+    fi
 
     [[ -z "$title_part" ]] && return
 
@@ -357,23 +492,18 @@ parse_episode_name() {
     # keeps a show actually named after a year (e.g. a show titled "1904")
     # intact, since there the "year" IS the whole title, not a redundant
     # repeat.
-    local series_year_match series_year_offset
-    series_year_match="$(grep -oP '(?<![0-9A-Za-z])(19[0-9]{2}|20[0-9]{2})(?![0-9A-Za-z])' <<< "$series_raw" | tail -1)" || true
-    if [[ -n "$series_year_match" ]]; then
-        series_year_offset="$(grep -boP '(?<![0-9A-Za-z])'"$series_year_match"'(?![0-9A-Za-z])' <<< "$series_raw" | tail -1)" || true
-        if [[ -n "$series_year_offset" ]]; then
-            series_year_offset="${series_year_offset%%:*}"
-            local candidate="${series_raw:0:$series_year_offset}"
-            candidate="${candidate%(}"
-            if [[ -n "$(tr -d '[:space:]._-' <<< "$candidate")" ]]; then
-                series_raw="$candidate"
-            fi
+    find_last_year "$series_raw"
+    if [[ -n "$YEAR_MATCH" ]]; then
+        local candidate="${series_raw:0:$YEAR_OFFSET}"
+        candidate="${candidate%(}"
+        if [[ -n "$(tr -d '[:space:]._-' <<< "$candidate")" ]]; then
+            series_raw="$candidate"
         fi
     fi
 
     local series_part
-    series_part="$(tr '._' '  ' <<< "$series_raw" | tr -s ' ')"
-    series_part="$(sed -E 's/^[[:space:]-]+//; s/[[:space:]-]+$//' <<< "$series_part")"
+    series_raw="$(strip_delimited_groups "$series_raw")"
+    series_part="$(clean_fragment "$series_raw")"
     [[ -z "$series_part" ]] && return
 
     local rest_part="${raw:$(( offset + ${#match} ))}"
@@ -383,9 +513,8 @@ parse_episode_name() {
             PARSED_EDITION="${BASH_REMATCH[1]}"
             ep_title="${ep_title/${BASH_REMATCH[0]}/}"
         fi
-        ep_title="$(tr '._' '  ' <<< "$ep_title" | tr -s ' ')"
-        ep_title="$(sed -E 's/^[[:space:]-]+//; s/[[:space:]-]+$//' <<< "$ep_title")"
-        PARSED_EPTITLE="$ep_title"
+        ep_title="$(strip_delimited_groups "$ep_title")"
+        PARSED_EPTITLE="$(clean_fragment "$ep_title")"
     fi
 
     PARSED_SERIES="$series_part"
@@ -400,10 +529,8 @@ parse_episode_name() {
 # extension, independent of where (or whether, in Plex-parenthesized form)
 # the year appears. This also means a subtitle from a raw scene-release name
 # (no parentheses at all) still gets its language tag recognized and
-# stripped before the name reaches parse_media_name - the old implementation
-# only ran this step at all when the whole-filename year regex had already
-# matched, so a bare-year subtitle filename lost language handling entirely,
-# not just title cleanup.
+# stripped before the name reaches parse_media_name, regardless of whether
+# a year appears anywhere in the filename.
 # Sets three globals (does not return a value via echo/command substitution
 # - that forks a subshell, which would silently discard these same
 # assignments, exactly as parse_media_name's globals are set by direct call
@@ -466,16 +593,21 @@ mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/Rename_$(date '+%Y-%m-%d_%H%M').txt"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
 
-# Rename executor, shared by both the file loop and the directory pass:
-# handles the unchanged-name no-op, collision check, dry-run preview, mv,
-# and counters uniformly so both call sites stay in sync with each other.
+# Rename executor, shared by every call site (file loop, directory pass,
+# franchise-wrapper moves): handles the unchanged-path no-op, collision
+# check, dry-run preview, mv, and counters uniformly so every call site
+# stays in sync. The no-op check compares full PATHS, not just basenames,
+# since a rename target can legitimately share a basename with its source
+# while still needing to move to a different directory (franchise-folder
+# restructuring) - a basename-only comparison would wrongly treat that as
+# "nothing to do".
 attempt_rename() {
     local old="$1" new="$2" label="$3"
     local old_base new_base
     old_base="$(basename "$old")"
     new_base="$(basename "$new")"
 
-    [[ "$old_base" == "$new_base" ]] && return 0
+    [[ "$old" == "$new" ]] && return 0
 
     if [[ -e "$new" ]]; then
         if [[ -d "$new" && -d "$old" ]]; then
@@ -499,33 +631,88 @@ attempt_rename() {
 
     echo "MATCH FOUND (${label}):"
     echo "  Current path:  $old"
-    echo "  New name:      $new_base"
+    echo "  New path:      $new"
 
     if (( DRY_RUN )); then
-        echo "  [DRY RUN] Would rename to: $new"
-        log "PREVIEWED: $old_base -> $new_base"
+        echo "  [DRY RUN] Would rename/move to: $new"
+        log "PREVIEWED: $old -> $new"
         PREVIEWED=$(( PREVIEWED + 1 ))
     else
         if mv -- "$old" "$new"; then
             echo "  [SUCCESS] Renamed."
-            log "RENAMED: $old_base -> $new_base"
+            log "RENAMED: $old -> $new"
             RENAMED=$(( RENAMED + 1 ))
         else
             echo "  [FAILED] mv error" >&2
-            log "FAILED (mv): $old_base -> $new_base"
+            log "FAILED (mv): $old -> $new"
             FAILED=$(( FAILED + 1 ))
         fi
     fi
     echo "----------------------------------------------------------------"
 }
 
+# Creates DIR (and any missing parents) unless in dry-run, where nothing on
+# disk is touched - consistent with attempt_rename's own dry-run philosophy
+# of previewing without mutating. On a real failure, prints/logs it and
+# counts a FAILED the same way attempt_rename's own mv-failure path does.
+# Shared by both franchise-folder restructuring call sites: the new
+# movie-year folder in the file loop, and the new franchise wrapper in the
+# directory pass.
+ensure_dir() {
+    local dir="$1"
+    (( DRY_RUN )) && return 0
+    if ! mkdir -p -- "$dir" 2>/dev/null; then
+        echo "  [FAILED] could not create folder: $dir" >&2
+        log "FAILED (mkdir): $dir"
+        FAILED=$(( FAILED + 1 ))
+        return 1
+    fi
+    return 0
+}
+
+# Tests whether DIR's canonical path is exactly the scanned target root.
+# Used to decide whether a movie needs a brand-new franchise wrapper
+# (sitting directly in the root, nothing above it) or already has one in
+# place (sitting anywhere else) - see "Franchise-folder restructuring" in
+# the header comment.
+# Exit status distinguishes three outcomes, not just true/false: 0 = DIR is
+# the target root, 1 = DIR exists and is not the target root, 2 = DIR could
+# not be statted at all (removed or made inaccessible by something else
+# since this batch started scanning). Callers must check for 2 separately
+# and treat it as a per-item failure (skip + log), not fall through to
+# either the true or false branch - and must never call this as a bare
+# statement, since under `set -e` any non-zero return from a bare command
+# (as opposed to one used in a conditional) would abort the whole script.
+# The `|| result=$?` pattern at each call site keeps this safe.
+is_target_root() {
+    local real
+    real="$(cd "$1" 2>/dev/null && pwd)" || return 2
+    [[ "$real" == "$TARGET_DIR_REAL" ]]
+}
+
+# Wraps is_target_root with the "can't stat it" handling every call site
+# needs: prints/logs and counts a FAILED, the same way ensure_dir's own
+# mkdir-failure path does, so that bookkeeping exists in exactly one place.
+# Returns the same three-way status as is_target_root (0/1/2) - callers
+# still branch on it themselves, but no longer repeat the failure handling.
+check_root() {
+    local dir="$1" rc=0
+    is_target_root "$dir" || rc=$?
+    if [[ $rc -eq 2 ]]; then
+        echo "  [FAILED] could not stat folder: $dir (removed or inaccessible during this run?)" >&2
+        log "FAILED (stat): $dir"
+        FAILED=$(( FAILED + 1 ))
+    fi
+    return $rc
+}
+
 echo "Starting Plex library scan (Videos & Subtitles)..."
 (( DRY_RUN )) && echo "=== RUNNING IN DRY-RUN MODE (No changes will be made) ==="
-(( RENAME_DIRS )) || echo "=== Files only (-F): containing directories will not be renamed ==="
+(( RENAME_DIRS )) || echo "=== Files only (-F): no directories will be renamed, created, or moved ==="
 echo "----------------------------------------------------------------"
 log "Rename pass started: $TARGET_DIR"
 
-declare -A MATCHED_DIRS=()   # unique parent dirs of successfully-parsed files, for the directory pass
+declare -A MATCHED_DIRS=()   # unique parent dirs of successfully-parsed movie/show files, for the directory pass. Value is "movie" or "show" - only "movie" entries are ever eligible for franchise-wrapper insertion.
 
 # Main loop. Null-delimited find + process substitution (not a pipe) so
 # counters set inside the loop are visible after it ends - a
@@ -541,6 +728,12 @@ while IFS= read -r -d '' FILE_PATH; do
 
     IS_SUBTITLE=0
     [[ "$FILE_EXT_LOWER" =~ ^(${SUB_EXTS})$ ]] && IS_SUBTITLE=1
+
+    # Reset per-iteration movie-path state so a stale value from a previous
+    # (possibly episode) iteration can never leak into this one's decisions.
+    IS_EPISODE=0
+    OWN_OK=0; DIR_OK=0; MOVIE_OK=0; USED_PARENT_FALLBACK=0
+    ITEM_OK=0
 
     # 1. SUBTITLE LANGUAGE TAG (decoupled from title/year parsing - see
     #    extract_sub_lang_tag's own comment for why).
@@ -570,35 +763,61 @@ while IFS= read -r -d '' FILE_PATH; do
     #    bare year is never misrouted into movie parsing (see
     #    is_episode_shaped's own comment).
     WORKING_NAME_STRIPPED="$(strip_junk_prefixes "$WORKING_NAME")"
-    IS_EPISODE=0
+
     if is_episode_shaped "$WORKING_NAME_STRIPPED"; then
         IS_EPISODE=1
         parse_episode_name "$WORKING_NAME_STRIPPED"
+        ITEM_OK=$PARSED_OK
     else
+        # MOVIE path: try the file's own name, then (independently) its
+        # immediate parent folder's name. Both attempts are made - not just
+        # one short-circuited fallback - because which one succeeds also
+        # decides how the file gets relocated below; see
+        # "Franchise-folder restructuring" in the header comment.
         parse_media_name "$WORKING_NAME_STRIPPED"
+        OWN_OK=$PARSED_OK; OWN_TITLE="$PARSED_TITLE"; OWN_YEAR="$PARSED_YEAR"; OWN_EDITION="$PARSED_EDITION"
+
+        PARENT_NAME="$(basename "$FILE_DIR")"
+        parse_media_name "$(strip_junk_prefixes "$PARENT_NAME")"
+        DIR_OK=$PARSED_OK; DIR_TITLE="$PARSED_TITLE"; DIR_YEAR="$PARSED_YEAR"; DIR_EDITION="$PARSED_EDITION"
+
+        if (( OWN_OK )); then
+            FINAL_TITLE="$OWN_TITLE"; FINAL_YEAR="$OWN_YEAR"; FINAL_EDITION="$OWN_EDITION"
+            MOVIE_OK=1
+        elif (( DIR_OK )); then
+            FINAL_TITLE="$DIR_TITLE"; FINAL_YEAR="$DIR_YEAR"; FINAL_EDITION="$DIR_EDITION"
+            MOVIE_OK=1
+            USED_PARENT_FALLBACK=1
+        else
+            MOVIE_OK=0
+        fi
+        ITEM_OK=$MOVIE_OK
     fi
 
-    if [[ $PARSED_OK -ne 1 ]]; then
+    if [[ $ITEM_OK -ne 1 ]]; then
         if (( IS_EPISODE )); then
             echo "NO MATCH (episode-shaped but unparseable): $FILE_NAME"
             log "NO MATCH: $FILE_NAME"
         else
-            echo "NO MATCH (no valid year found): $FILE_NAME"
+            echo "NO MATCH (no valid year found in file name or parent folder): $FILE_NAME"
             log "NO MATCH: $FILE_NAME"
         fi
         NO_MATCH=$(( NO_MATCH + 1 ))
         continue
     fi
 
-    # A movie's own directory holds just that movie; an episode's own
+    # A movie's own directory holds just that movie (only when it's itself
+    # movie-shaped - see Case B below for when it isn't); an episode's own
     # directory is a "Season NN" folder, not the show - the show-root
     # folder is one level further up. Track whichever is the actual
-    # title/year-shaped ancestor, so the directory pass (movie-style
-    # parsing) never runs against "Season NN" itself.
+    # title/year-shaped ancestor, so the directory pass never runs against
+    # "Season NN" itself, and never runs against a plain (non-year) folder
+    # that a Case B move will create a NEW correctly-named subfolder inside
+    # of rather than renaming.
     if (( IS_EPISODE )); then
-        MATCHED_DIRS["$(dirname "$FILE_DIR")"]=1
-    else
-        MATCHED_DIRS["$FILE_DIR"]=1
+        MATCHED_DIRS["$(dirname "$FILE_DIR")"]="show"
+    elif (( DIR_OK )); then
+        MATCHED_DIRS["$FILE_DIR"]="movie"
     fi
 
     # 3. REBUILD
@@ -607,21 +826,57 @@ while IFS= read -r -d '' FILE_PATH; do
         [[ -n "$PARSED_EPTITLE" ]] && CLEAN_PLEX_NAME="$CLEAN_PLEX_NAME - $PARSED_EPTITLE"
         [[ -n "$PARSED_EDITION" ]] && CLEAN_PLEX_NAME="$CLEAN_PLEX_NAME {edition-$PARSED_EDITION}"
     else
-        if [[ -n "$PARSED_EDITION" ]]; then
-            CLEAN_PLEX_NAME="$PARSED_TITLE ($PARSED_YEAR) {edition-$PARSED_EDITION}"
+        if [[ -n "$FINAL_EDITION" ]]; then
+            CLEAN_PLEX_NAME="$FINAL_TITLE ($FINAL_YEAR) {edition-$FINAL_EDITION}"
         else
-            CLEAN_PLEX_NAME="$PARSED_TITLE ($PARSED_YEAR)"
+            CLEAN_PLEX_NAME="$FINAL_TITLE ($FINAL_YEAR)"
         fi
     fi
     NEW_FILE_NAME="${CLEAN_PLEX_NAME}${SUB_LANG_TAG}.${FILE_EXT_LOWER}"
-    NEW_FILE_PATH="${FILE_DIR}/${NEW_FILE_NAME}"
 
-    [[ "$FILE_NAME" == "$NEW_FILE_NAME" ]] && continue
+    # Destination directory. Movies whose immediate parent folder is NOT
+    # movie-shaped (Case B) relocate into a freshly created folder instead
+    # of staying in place - everything else renames in place, exactly as
+    # before. Gated on RENAME_DIRS (-F): with -F, nothing is ever created
+    # or moved, only renamed in place.
+    RESTRUCTURED=0
+    if [[ $IS_EPISODE -eq 0 && $DIR_OK -eq 0 ]] && (( RENAME_DIRS )); then
+        ROOT_CHECK=0
+        check_root "$FILE_DIR" || ROOT_CHECK=$?
+        if [[ $ROOT_CHECK -eq 2 ]]; then
+            continue
+        elif [[ $ROOT_CHECK -eq 0 ]]; then
+            # File is sitting loose directly in the scanned root with no
+            # per-movie folder at all - create both the franchise folder
+            # and the movie-year folder.
+            NEW_FILE_DIR="${FILE_DIR}/${FINAL_TITLE}/${CLEAN_PLEX_NAME}"
+        else
+            # File is inside some existing non-year-shaped folder, which
+            # is treated as the franchise folder already in place (default
+            # or custom-named) - only the movie-year folder is created.
+            NEW_FILE_DIR="${FILE_DIR}/${CLEAN_PLEX_NAME}"
+        fi
+        ensure_dir "$NEW_FILE_DIR" || continue
+        NEW_FILE_PATH="${NEW_FILE_DIR}/${NEW_FILE_NAME}"
+        RESTRUCTURED=1
+    else
+        NEW_FILE_PATH="${FILE_DIR}/${NEW_FILE_NAME}"
+    fi
+
+    [[ "$FILE_PATH" == "$NEW_FILE_PATH" ]] && continue
 
     if (( IS_EPISODE )); then
         echo "  Cached Data:   Series: '$PARSED_SERIES' | S${PARSED_SEASON}E${PARSED_EPISODE} | Title: '$PARSED_EPTITLE' | Edition: '$PARSED_EDITION' | Lang: '$SUB_LANG_TAG'"
     else
-        echo "  Cached Data:   Name: '$PARSED_TITLE' | Year: '$PARSED_YEAR' | Edition: '$PARSED_EDITION' | Lang: '$SUB_LANG_TAG'"
+        echo "  Cached Data:   Name: '$FINAL_TITLE' | Year: '$FINAL_YEAR' | Edition: '$FINAL_EDITION' | Lang: '$SUB_LANG_TAG'"
+        if (( USED_PARENT_FALLBACK )); then
+            echo "  Source:        title/year taken from parent folder name (file's own name had none)"
+            log "PARENT FALLBACK USED: $FILE_NAME <- $PARENT_NAME"
+        fi
+        if (( RESTRUCTURED )); then
+            echo "  Restructure:   moving into '${NEW_FILE_DIR#"$TARGET_DIR_REAL"/}/' (no movie folder existed here yet)"
+            log "RESTRUCTURED: $FILE_NAME -> $NEW_FILE_DIR"
+        fi
     fi
     TYPE_LABEL="Video"
     (( IS_SUBTITLE )) && TYPE_LABEL="Subtitle"
@@ -633,16 +888,20 @@ done < <(find "$TARGET_DIR" -type f -regextype posix-extended -iregex ".*\.(${AL
 
 # Directory pass. Runs after all file renames complete, over the set of
 # directories that are the title/year-shaped ancestor of at least one
-# successfully-parsed file: a movie's own folder, or a show's root folder
-# (one level above "Season NN" for episodes - see the main loop's
-# MATCHED_DIRS population). "Season NN" folders themselves are never in
-# this set and are never touched. Always parsed as movie/show-style
-# (title + year), never as episode-style - a directory basename has no
-# extension and isn't itself an episode file.
+# successfully-parsed file: a movie's own folder (only when that folder was
+# already movie-shaped going in - see Case B above for when it wasn't), or
+# a show's root folder (one level above "Season NN" for episodes). "Season
+# NN" folders themselves are never in this set and are never touched.
+# Always parsed as movie/show-style (title + year), never as episode-style
+# - a directory basename has no extension and isn't itself an episode
+# file. Year-first names (e.g. a raw download's "(2020) Movie Name"
+# folder) are handled the same way here as everywhere else, via
+# parse_media_name's year-first fallback.
 if (( RENAME_DIRS )) && [[ ${#MATCHED_DIRS[@]} -gt 0 ]]; then
     echo ""
     echo "=== Directory pass ==="
     for DIR_PATH in "${!MATCHED_DIRS[@]}"; do
+        DIR_TYPE="${MATCHED_DIRS[$DIR_PATH]}"
         DIR_BASE="$(basename "$DIR_PATH")"
         DIR_PARENT="$(dirname "$DIR_PATH")"
 
@@ -658,7 +917,30 @@ if (( RENAME_DIRS )) && [[ ${#MATCHED_DIRS[@]} -gt 0 ]]; then
         fi
         NEW_DIR_PATH="${DIR_PARENT}/${NEW_DIR_NAME}"
 
+        SKIPPED_BEFORE=$SKIPPED
         attempt_rename "$DIR_PATH" "$NEW_DIR_PATH" "Directory"
+        # A collision here means we couldn't safely rename this folder at
+        # all - don't attempt a franchise-wrapper move on top of that.
+        [[ $SKIPPED -gt $SKIPPED_BEFORE ]] && continue
+
+        [[ "$DIR_TYPE" == "movie" ]] || continue   # show-root folders never get a franchise wrapper
+
+        # Franchise-wrapper insertion: only when this movie folder sits
+        # directly in the scanned root with nothing above it - see
+        # "Franchise-folder restructuring" in the header comment. A movie
+        # folder that already has any other parent is assumed to already
+        # be inside a franchise folder (default-named or a user's custom
+        # one) and is left exactly where it is - this script never renames
+        # an existing franchise folder.
+        ROOT_CHECK=0
+        check_root "$DIR_PARENT" || ROOT_CHECK=$?
+        [[ $ROOT_CHECK -eq 0 ]] || continue
+
+        CURRENT_DIR_PATH="${DIR_PARENT}/${NEW_DIR_NAME}"
+        WRAPPER_DIR="${TARGET_DIR_REAL}/${PARSED_TITLE}"
+
+        ensure_dir "$WRAPPER_DIR" || continue
+        attempt_rename "$CURRENT_DIR_PATH" "${WRAPPER_DIR}/${NEW_DIR_NAME}" "Directory (franchise wrapper)"
     done
 fi
 
