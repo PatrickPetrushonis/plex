@@ -1,0 +1,12 @@
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Local secrets, if any script in this repo ever writes one out
+.env
