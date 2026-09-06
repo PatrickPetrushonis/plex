@@ -24,9 +24,11 @@
 #   -O DIR          Operational directory: base for logs (OPDIR/Logs) and the
 #                   lock file (OPDIR/.locks) — never <target_dir> itself.
 #                   Default: this script's own directory. When invoked
-#                   through rename.sh/rename_dry.sh, set to $OUTPUT_DIR
-#                   (config.sh's shared working directory — same place
-#                   encoder_params.sh already keeps its own Logs and lock)
+#                   through rename.sh/rename_dry.sh, set to $DOWNLOADS_BASE
+#                   (config.sh's own base for the rename pipeline's source
+#                   directory, $DOWNLOADS_BASE/Complete — separate from
+#                   $OUTPUT_DIR, which is encoder_params.sh's own
+#                   operational directory for the video-library pipeline)
 #   -L DIR          Log directory, overriding OPDIR/Logs specifically
 #   -h              Show this help
 #
@@ -225,7 +227,7 @@ OPERATIONAL_DIR=""
 
 # Usage
 usage() {
-    grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//'
+    grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//' || true
     exit 0
 }
 
@@ -273,7 +275,7 @@ grep -oP 'x' <<< 'x' &>/dev/null || {
 
 # Concurrency lock: only one run may target a given TARGET_DIR at a time.
 # The lock file itself lives under OPERATIONAL_DIR (default: this script's
-# own directory; -O to route it elsewhere, e.g. $OUTPUT_DIR when invoked
+# own directory; -O to route it elsewhere, e.g. $DOWNLOADS_BASE when invoked
 # through rename.sh/rename_dry.sh), never inside TARGET_DIR — a movie
 # library shouldn't have operational files (lock, logs) scattered into it.
 # The lock is still correctly scoped per-target: its filename is a hash of
@@ -281,7 +283,7 @@ grep -oP 'x' <<< 'x' &>/dev/null || {
 # anywhere, any relative path) still collide, and runs against different
 # directories don't.
 LOCK_DIR="${OPERATIONAL_DIR}/.locks"
-mkdir -p "$LOCK_DIR"
+mkdir -p -- "$LOCK_DIR"
 LOCK_HASH="$(printf '%s' "$TARGET_DIR_REAL" | sha256sum | cut -d' ' -f1)"
 LOCK_FILE="${LOCK_DIR}/${LOCK_HASH}.lock"
 exec 9>"$LOCK_FILE"
@@ -750,7 +752,7 @@ FAILED=0
 # alone on a re-run), so there's no meaningful "interrupted mid-batch" state
 # worth preserving separately.
 [[ -z "$LOG_DIR" ]] && LOG_DIR="${OPERATIONAL_DIR}/Logs"
-mkdir -p "$LOG_DIR"
+mkdir -p -- "$LOG_DIR"
 LOG_FILE="$LOG_DIR/Rename_$(date '+%Y-%m-%d_%H%M').txt"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
 
@@ -870,7 +872,8 @@ is_target_root() {
 # needs: prints/logs and counts a FAILED, the same way ensure_dir's own
 # mkdir-failure path does, so that bookkeeping exists in exactly one place.
 # Returns the same three-way status as is_target_root (0/1/2) - callers
-# still branch on it themselves, but no longer repeat the failure handling.
+# still branch on it themselves, but don't need their own copy of the
+# failure handling.
 check_root() {
     local dir="$1" rc=0
     is_target_root "$dir" || rc=$?
