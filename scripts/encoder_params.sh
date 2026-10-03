@@ -27,8 +27,16 @@
 #   -h              Show this help
 #
 # Notes:
-#   * Requires bash 4.0+, ffmpeg, ffprobe, python3, flock, sed
-#   * Video is copied if already h264 and within MAX_HEIGHT; otherwise re-encoded to x264
+#   * Requires bash 4.0+, ffmpeg (built with the zscale and tonemap filters),
+#     ffprobe, python3, flock, sed
+#   * Video is copied if already h264, SDR (colour transfer not PQ or HLG), and
+#     within MAX_HEIGHT; otherwise re-encoded to x264
+#   * PQ and HLG sources are tone-mapped to SDR BT.709 and tagged bt709, since
+#     libx264 writes the source's colour tags into the output unless they are
+#     set explicitly (see README: HEVC and HDR sources)
+#   * Each encoded file's video stream is probed before it is moved to its final
+#     path; an output that still carries a PQ or HLG transfer is rejected, so
+#     -M and -A never act on it
 #   * Audio streams are copied if their codec is in the copy list; otherwise -> aac
 #   * Subtitles: only target languages included; Signs & Songs tracks excluded
 #   * Subtitle codec is container-aware: srt/ass in MKV; mov_text in MP4 (subtitle_mux.sh)
@@ -45,7 +53,8 @@
 #   * -A uses mv; source is only moved after a successful encode
 #   * Both -M and -A mirror the same relative directory structure as the output
 #   * HEVC sources are always re-encoded to x264 and logged with the source codec label,
-#     since transcoding HEVC -> x264 typically produces a larger file (see hevc sources note)
+#     since transcoding HEVC -> x264 typically produces a larger file (see README:
+#     HEVC and HDR sources)
 #   * Only one run may target a given -o OUTPUT_DIR at a time; a second run against
 #     the same OUTPUT_DIR exits immediately instead of racing on shared .tmp/log files
 
@@ -77,11 +86,20 @@ PROBE_SIZE="10M"    # -P: analyzeduration / probesize passed to ffmpeg
 ARCHIVE_DIR=""      # -M: cp output here after encode (cross-device safe)
 BACKUP_DIR=""       # -A: mv source input here after encode
 
+# Filter chain applied to PQ and HLG sources: linearize, convert primaries to
+# BT.709, tone-map, then convert to the BT.709 transfer and matrix at 8-bit
+# 4:2:0. Tuning this constant changes only the look of converted sources.
+SDR_TONEMAP_CHAIN="zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+
 # -- Counters ----------------------------------------------------------------------
 ENCODE_OK=0
 ENCODE_FAIL=0
 ENCODE_SKIP=0
 ENCODE_DRYRUN=0
+
+# Set by verify_sdr_output(): 1 if the probed file carries a Dolby Vision
+# configuration record, else 0.
+OUTPUT_DOVI=0
 
 # -- Usage -----------------------------------------------------------------------
 usage() {
@@ -172,6 +190,19 @@ require ffprobe
 require python3
 require flock
 require sed
+
+# zscale (libzimg) and tonemap convert HDR sources to SDR; checked here so a
+# batch fails before any work instead of on the first HDR file. The filter
+# list is captured into a variable first: piping ffmpeg into `grep -q` under
+# pipefail can report a false negative when grep exits before ffmpeg finishes
+# writing.
+FFMPEG_FILTERS="$(ffmpeg -hide_banner -filters 2>/dev/null)"
+for _filter in zscale tonemap; do
+    grep -qE " ${_filter} " <<< "$FFMPEG_FILTERS" || {
+        echo "ERROR: ffmpeg lacks the '${_filter}' filter, required for HDR-to-SDR conversion" >&2
+        exit 1
+    }
+done
 
 # -- Directory and log setup -------------------------------------------------------
 mkdir -p -- "$OUTPUT_DIR"
@@ -409,6 +440,13 @@ compute_output_path() {
 }
 
 # -- Stream probe ------------------------------------------------------------------
+# Prints one line per stream group for the caller to parse:
+#   VIDEO <codec> <height> <fps> <label>
+#   VIDEOCOLOR <color_transfer> <has_dovi>   (transfer is "unknown" when untagged;
+#                                             has_dovi is 1 if the video stream
+#                                             carries a Dolby Vision configuration record)
+#   AUDIO ... / SUB ...
+#   ERROR <message>   (on probe failure)
 probe_file() {
     local INPUT="$1"
     python3 - "$INPUT" "$SUB_LANGS" "$LANG_TABLE_TSV" << 'PYEOF'
@@ -508,6 +546,13 @@ else:
     codec_label = VIDEO_CODEC_NAMES.get(codec_raw, codec_raw.upper())
     height      = v.get('height', 0)
     print(f"VIDEO {codec_raw} {height} {fps} {codec_label}")
+
+    # Colour transfer and Dolby Vision presence drive the HDR-to-SDR decision
+    # in build_video_args; an untagged transfer is reported as "unknown".
+    transfer = v.get('color_transfer', 'unknown')
+    has_dovi = int(any(sd.get('side_data_type') == 'DOVI configuration record'
+                       for sd in v.get('side_data_list', [])))
+    print(f"VIDEOCOLOR {transfer} {has_dovi}")
 
 CHANNEL_LAYOUTS = {
     'mono':            'Mono',
@@ -611,8 +656,7 @@ if (( ! DRY_RUN )); then
     # Re-registers the EXIT trap (see the comment at the lock's own trap,
     # above) now that cleanup_stripped_subs is both defined (this module is
     # sourced above) and has real state to clean up (the temp dir this call
-    # just created) - immediately after the action it undoes, per
-    # Bash_Style_Guide.md section 6.
+    # just created) - immediately after the action it undoes.
     trap 'rm -f "$LOCK_FILE" 2>/dev/null || true; cleanup_stripped_subs' EXIT
 fi
 
@@ -759,29 +803,65 @@ backup_sidecar_subs() {
     done
 }
 
+# -- is_hdr_transfer ---------------------------------------------------------------
+# Returns 0 if the given colour transfer name is an HDR curve (PQ or HLG),
+# 1 otherwise. The transfer function, not the primaries, defines HDR: BT.2020
+# primaries describe gamut and can accompany an SDR curve.
+is_hdr_transfer() {
+    [[ "$1" == "smpte2084" || "$1" == "arib-std-b67" ]]
+}
+
 # -- build_video_args ---------------------------------------------------------------
+# Appends the video-stream ffmpeg args to the array named by $1.
+# Args: array name, source codec, source height, source fps, source colour
+# transfer, source Dolby Vision flag (0/1).
+# Copy path: h264, within MAX_HEIGHT, and not PQ/HLG.
+# Encode path: everything else; PQ/HLG sources are tone-mapped to SDR and
+# tagged bt709, because libx264 writes the source's colour tags into the output
+# header unless they are set explicitly.
 build_video_args() {
     # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
     local -n _FF="$1"
-    local VID_CODEC="$2" SRC_HEIGHT="$3" SRC_FPS="$4"
-    local OUT_HEIGHT VID_TITLE
+    local VID_CODEC="$2" SRC_HEIGHT="$3" SRC_FPS="$4" SRC_TRANSFER="$5" SRC_DOVI="$6"
+    local OUT_HEIGHT VID_TITLE ENCODE_DESC
+    local NEEDS_SDR=0
+    local -a VF=()
 
-    if [[ "$VID_CODEC" == "h264" ]] && (( SRC_HEIGHT <= MAX_HEIGHT )); then
-        echo " Video: COPY (already h264, within ${MAX_HEIGHT}p)"
+    if is_hdr_transfer "$SRC_TRANSFER"; then
+        NEEDS_SDR=1
+    fi
+    if (( SRC_DOVI )); then
+        echo " WARNING: source carries a Dolby Vision configuration record" >&2
+    fi
+
+    if [[ "$VID_CODEC" == "h264" ]] && (( SRC_HEIGHT <= MAX_HEIGHT )) && (( ! NEEDS_SDR )); then
+        echo " Video: COPY (already h264, SDR, within ${MAX_HEIGHT}p)"
         _FF+=(-map 0:v:0 -c:v copy)
         VID_TITLE="H.264 ${SRC_HEIGHT}p"
     else
         _FF+=(-map 0:v:0)
         if [[ "$VID_CODEC" == "hevc" ]]; then
-            echo " WARNING: source is HEVC: x264 re-encode will very likely be LARGER and slower than the source (see README: hevc sources)." >&2
+            echo " WARNING: source is HEVC: x264 re-encode will very likely be LARGER and slower than the source (see README: HEVC and HDR sources)." >&2
         fi
         if (( SRC_HEIGHT > MAX_HEIGHT )); then
             OUT_HEIGHT=$MAX_HEIGHT
-            echo " Video: ENCODE -> x264 @ ${OUT_HEIGHT}p (source: ${SRC_HEIGHT}p)"
-            _FF+=(-vf "scale=trunc(iw/2)*2:${OUT_HEIGHT}")
+            ENCODE_DESC="x264 @ ${OUT_HEIGHT}p (source: ${SRC_HEIGHT}p)"
+            # -2 derives an even width from the source aspect ratio.
+            VF+=("scale=-2:${OUT_HEIGHT}")
         else
             OUT_HEIGHT=$SRC_HEIGHT
-            echo " Video: ENCODE -> x264 @ native ${OUT_HEIGHT}p (source codec: $VID_CODEC)"
+            ENCODE_DESC="x264 @ native ${OUT_HEIGHT}p (source codec: $VID_CODEC)"
+        fi
+        if (( NEEDS_SDR )); then
+            ENCODE_DESC+=", HDR ($SRC_TRANSFER) tone-mapped to SDR BT.709"
+            VF+=("$SDR_TONEMAP_CHAIN")
+        fi
+        echo " Video: ENCODE -> $ENCODE_DESC"
+
+        if (( ${#VF[@]} > 0 )); then
+            local VF_JOINED
+            VF_JOINED="$(IFS=,; echo "${VF[*]}")"
+            _FF+=(-vf "$VF_JOINED")
         fi
         _FF+=(
             -c:v libx264
@@ -792,6 +872,10 @@ build_video_args() {
             -profile:v high
             -level:v 4.1
         )
+        # Explicit tags: without them libx264 carries the source's tags over.
+        if (( NEEDS_SDR )); then
+            _FF+=(-color_primaries bt709 -color_trc bt709 -colorspace bt709)
+        fi
         VID_TITLE="H.264 ${OUT_HEIGHT}p"
     fi
     _FF+=(-metadata:s:v:0 "title=${VID_TITLE}")
@@ -929,6 +1013,21 @@ log_ffmpeg_warnings() {
         | sort -u)
 }
 
+# -- verify_sdr_output ----------------------------------------------------------------
+# Probes the video stream of an encoded file. Returns 0 if its colour transfer
+# is not PQ or HLG, 1 if it is (or if ffprobe fails). Sets OUTPUT_DOVI to 1 if
+# the stream carries a Dolby Vision configuration record, else 0.
+verify_sdr_output() {
+    local FILE="$1" STREAM_INFO TRANSFER
+    OUTPUT_DOVI=0
+    STREAM_INFO="$(ffprobe -v error -select_streams v:0 -show_streams "$FILE" 2>/dev/null)" || return 1
+    TRANSFER="$(grep -m1 '^color_transfer=' <<< "$STREAM_INFO" | cut -d= -f2)" || true
+    if grep -q 'side_data_type=DOVI configuration record' <<< "$STREAM_INFO"; then
+        OUTPUT_DOVI=1
+    fi
+    ! is_hdr_transfer "${TRANSFER:-unknown}"
+}
+
 # -- execute_encode ------------------------------------------------------------------
 execute_encode() {
     local INPUT="$1" OUTPUT="$2" OUTPUT_TMP="$3" OUTPUT_DIR_FOR_FILE="$4" ROOT="$5" SRC_CODEC_LABEL="$6"
@@ -1006,6 +1105,22 @@ execute_encode() {
             CURRENT_TMP=""
             CURRENT_STDERR_CAPTURE=""
             return 1
+        fi
+
+        # The probe runs on the .tmp file, before the rename: a rejected file
+        # never reaches OUTPUT_DIR, and -M (copy to the archive, then delete
+        # the output) and -A (move the source to the backup) never act on it.
+        if ! verify_sdr_output "$OUTPUT_TMP"; then
+            echo " ERROR: output carries an HDR transfer function; not promoted to the output directory" >&2
+            log "FAILED (HDR transfer in output): $INPUT"
+            rm -f "$OUTPUT_TMP"; [[ "$STDERR_CAPTURE" != "/dev/null" ]] && rm -f "$STDERR_CAPTURE"
+            CURRENT_TMP=""
+            CURRENT_STDERR_CAPTURE=""
+            return 1
+        fi
+        if (( OUTPUT_DOVI )); then
+            echo " WARNING: output carries a Dolby Vision configuration record" >&2
+            log "DOVI WARNING: $(basename "$INPUT") | output carries a Dolby Vision configuration record"
         fi
 
         mv -- "$OUTPUT_TMP" "$OUTPUT"
@@ -1098,16 +1213,18 @@ process_file() {
     fi
 
     local VID_CODEC="" VID_CODEC_LABEL="" SRC_HEIGHT=0 SRC_FPS="24/1"
+    local SRC_TRANSFER="unknown" SRC_DOVI=0
     local -a AUDIO_LINES=() SUB_LINES=()
     local PROBE_ERROR=""
 
     while IFS= read -r line; do
         local TYPE="${line%% *}"
         case "$TYPE" in
-            VIDEO) read -r _ VID_CODEC SRC_HEIGHT SRC_FPS VID_CODEC_LABEL <<< "$line" ;;
-            AUDIO) AUDIO_LINES+=("$line") ;;
-            SUB)   SUB_LINES+=("$line") ;;
-            ERROR) PROBE_ERROR="${line#ERROR }" ;;
+            VIDEO)      read -r _ VID_CODEC SRC_HEIGHT SRC_FPS VID_CODEC_LABEL <<< "$line" ;;
+            VIDEOCOLOR) read -r _ SRC_TRANSFER SRC_DOVI <<< "$line" ;;
+            AUDIO)      AUDIO_LINES+=("$line") ;;
+            SUB)        SUB_LINES+=("$line") ;;
+            ERROR)      PROBE_ERROR="${line#ERROR }" ;;
         esac
     done < <(probe_file "$INPUT")
 
@@ -1123,7 +1240,7 @@ process_file() {
         return 1
     fi
 
-    echo " Video codec: ${VID_CODEC_LABEL:-$VID_CODEC}  |  Height: ${SRC_HEIGHT}px  |  FPS: $SRC_FPS"
+    echo " Video codec: ${VID_CODEC_LABEL:-$VID_CODEC}  |  Height: ${SRC_HEIGHT}px  |  FPS: $SRC_FPS  |  Transfer: $SRC_TRANSFER"
 
     # Sidecar subtitles (Movie.en.srt / Movie.en.cc.srt / Movie.en.forced.srt).
     # Raw "LANG TYPE PATH" lines, kept as-is (pointing at the ORIGINAL sidecar
@@ -1201,7 +1318,7 @@ process_file() {
     local -a CONTAINER_FLAGS=()
     [[ "$OUT_FORMAT" == "mp4" ]] && CONTAINER_FLAGS+=(-movflags +faststart)
 
-    build_video_args    FF_ARGS "$VID_CODEC" "$SRC_HEIGHT" "$SRC_FPS"
+    build_video_args    FF_ARGS "$VID_CODEC" "$SRC_HEIGHT" "$SRC_FPS" "$SRC_TRANSFER" "$SRC_DOVI"
     build_audio_args    FF_ARGS "${AUDIO_LINES[@]+"${AUDIO_LINES[@]}"}"
 
     local SUB_OUT_IDX=0

@@ -1,16 +1,16 @@
-# video-encoder
+# plex
 
 Batch video encoding and Plex media renaming for a personal media library, with a shared configuration layer, a concurrency lock, a single source of truth for subtitle language codes, and a standalone subtitle-repair toolset for the leftover-ASS-tag problem some sidecar and embedded subtitles carry.
 
 ```
-video-encoder/
+plex/
 ├── .git/
 ├── README.md                     ← this file
 └── scripts/
     ├── config.sh                  Shared paths, flags, and the concurrency lock
     ├── encoder_dry.sh             Preview an encode batch (writes nothing)
     ├── encoder.sh                  Run an encode batch for real
-    ├── encoder_params.sh         Core batch encoder (called by the two above; can also be run standalone)
+    ├── encoder_params.sh         Core batch encoder: copy/transcode decisions, HDR-to-SDR conversion, output verification (called by the two above; can also be run standalone)
     ├── rename_dry.sh               Preview a rename batch (writes nothing)
     ├── rename.sh                     Run a rename batch for real
     ├── rename_params.sh             Plex-convention renamer for movies + TV episodes + subtitles (called by the two above; can also be run standalone)
@@ -40,6 +40,8 @@ cd scripts
 ```
 
 Both wrappers source `config.sh` for paths/flags and call the real work out to `encoder_params.sh`, targeting `$INPUT_DIR`. Never run `encoder_dry.sh` and `encoder.sh` at the same time against the same output directory — see [Concurrency lock](#concurrency-lock).
+
+The dry run prints each file's decision, including whether an HDR source is tone-mapped to SDR (see [HEVC and HDR sources](#hevc-and-hdr-sources)).
 
 To change quality, paths, or run against a different tree without editing any file:
 
@@ -114,7 +116,7 @@ No paths or usernames are hardcoded — everything derives from `$HOME` unless o
 
 The subtitle single-file tools (`subtitle_embed.sh`/`_dry.sh`, `subtitle_extract.sh`/`_dry.sh`) source `config.sh` too, but only ever read `$INPUT_DIR` from it, passed as their `-I` fallback-resolution base — see Workflow step 4.
 
-On the primary machine, `$HOME/Videos` resolves onto `/raid` — an mdadm RAID 1 array (`/dev/md0`, ext4) across two 8TB drives. See `../system/System Architecture.md` for the full storage/hardware/network reference.
+On the primary machine, `$HOME/Videos` resolves onto `/raid` — an mdadm RAID 1 array (`/dev/md0`, ext4) across two 8TB drives.
 
 ## Concurrency lock
 
@@ -140,9 +142,51 @@ Both `lang_table.sh` and `lang_table.tsv` resolve their own file locations relat
 
 ## `encoder_params.sh`
 
-The core encoder is documented in full detail — every flag, the encoding/audio/subtitle decision logic, sidecar handling, logging format, and design rationale — in its own header comment. It can be run directly (bypassing `config.sh` and the lock) for one-off jobs outside the standard `VIDEOS_BASE` layout.
+The core encoder is documented in full detail — every flag, the audio/subtitle decision logic, sidecar handling, and logging format — in its own header comment (`-h`). It can be run directly (bypassing `config.sh` and the lock) for one-off jobs outside the standard `VIDEOS_BASE` layout. It requires an ffmpeg build with the `zscale` and `tonemap` filters and exits before any work if either is missing.
 
-Its container-aware subtitle codec choice, sidecar discovery, and external-subtitle ffmpeg arg building live in the shared `subtitle_mux.sh` (also used by `subtitle_embed_params.sh`), and sidecar tag-stripping lives in the shared `subtitle_tag_strip.sh` (also used by `subtitle_embed_params.sh` and `subtitle_extract_params.sh`) — see those two files and the subtitle-tooling section below. A video whose *embedded* (not sidecar) subtitle track needs tag-stripping isn't handled by `encoder_params.sh` itself; run `subtitle_extract_params.sh` against it first, which turns the embedded track into a sidecar that `encoder_params.sh`'s existing sidecar discovery then picks up on the next encode with no further changes needed.
+### Video decisions
+
+| Source | Result |
+|---|---|
+| h264, SDR, height ≤ `MAX_HEIGHT` | Stream copy (colour tags are unchanged because the stream is not touched) |
+| h264 with a PQ or HLG transfer, height ≤ `MAX_HEIGHT` | Tone-mapped to SDR, re-encoded to x264, tagged bt709 |
+| h264, height > `MAX_HEIGHT` | Scaled to `MAX_HEIGHT` (width derived from the aspect ratio, even-numbered), re-encoded to x264 |
+| Any other codec, SDR | Re-encoded to x264 at native or `MAX_HEIGHT` height |
+| Any other codec, PQ or HLG | Tone-mapped to SDR, re-encoded to x264, tagged bt709 |
+
+An HDR source is identified by its colour *transfer function* (`smpte2084` for PQ, `arib-std-b67` for HLG), read by the probe step. Colour primaries are not used: they describe gamut, and BT.2020 primaries can accompany an SDR curve.
+
+Every encoded file's video stream is probed while it is still the `.tmp` file. A file whose transfer function is still PQ or HLG is rejected: it is deleted, logged as `FAILED (HDR transfer in output)`, and never reaches `OUTPUT_DIR`. This ordering matters because `-M` copies the output to the archive and then deletes it, and `-A` moves the source to the backup directory; both run only after the probe passes.
+
+### HEVC and HDR sources
+
+**HEVC sources** are always re-encoded to x264. The script prints a warning because transcoding HEVC to x264 typically produces a larger file.
+
+**HDR sources are converted to SDR rather than carried through, and tagged explicitly, for these reasons:**
+
+1. **libx264 copies the input's colour tags into the output header unless they are set.** The three tags (colour primaries, transfer characteristics, matrix coefficients) tell a player which gamut, brightness curve and YCbCr conversion to apply. `-pix_fmt yuv420p` changes bit depth only; it does not change the transfer curve. An HDR10 source encoded to 8-bit h264 without tone-mapping therefore yields PQ-coded pixels tagged BT.2020/PQ. Verified with ffmpeg 6.1.1: an encode without colour handling reports `color_transfer=smpte2084`, `color_primaries=bt2020`, `color_space=bt2020nc`.
+
+2. **Roku does not list HDR10 for h264.** Roku's media specification lists HDR support for AVC (H.264) only as Dolby Vision profile 9 (`dvav.09`), with HDR10 listed under HEVC, VP9 and AV1 ([developer.roku.com/dev/docs/media](https://developer.roku.com/dev/docs/media)). Dolby Vision profile 8 is 10-bit HEVC; the 8-bit AVC profile is 9 ([Dolby Vision profiles](https://en.wikipedia.org/wiki/Dolby_Vision)). An 8-bit h264 stream tagged PQ/BT.2020, or carrying a profile 8 configuration record, matches no HDR combination Roku lists for AVC.
+
+3. **Observed behavior on a Roku running the Plex app.** Files of that shape stop within about 0.4 s of the playback start request, before any transcode segment is requested, and play in the Plex app on Android. Rewriting only the h264 colour tags to bt709 (no re-encode) made one such file play on the Roku. The Roku-side reason for rejecting the tags is not documented in any source found. The Plex Roku client's declared decoder capabilities (from the server log) are h264 high profile, 1080p, level 4.1, which is what the encode path targets.
+
+4. **Tone-mapping, rather than retagging, makes the tags true.** Tags describe pixels. If the pixels are PQ-coded and the tags say BT.709, a player displays them as SDR and the picture is flat or dim. The tone-map converts the pixels to BT.709 before libx264 sees them, so the explicit bt709 tags describe the actual content.
+
+5. **The output is probed before it is promoted** because the encode can exit 0 with wrong tags, and the steps after it (`-M`, `-A`) are destructive.
+
+The conversion filter chain lives in one constant, `SDR_TONEMAP_CHAIN`, near the top of the script. Its values (`hable`, `npl=100`) are verified to run and to produce bt709 tags on a synthetic PQ clip; they are not tuned on real footage, and changing them changes only the look of converted sources.
+
+### Known limitations
+
+- **Missing primaries or matrix tags.** A PQ source whose colour primaries and matrix tags are unspecified fails in `zscale` with `no path between colorspaces`. The file is logged `FAILED`, no output is written, and the source is untouched. Reproduced with a PQ-tagged clip that carries no primaries or matrix tag.
+- **HLG.** HLG sources take the same chain; it is verified with PQ input only.
+- **Dolby Vision configuration record.** A source's Dolby Vision record is carried onto an encoded output by ffmpeg 6.1.1 (a libx264 output with one was observed), and no verified method strips it at encode time. The script warns when a source or an output carries one. Whether the record alone prevents Roku playback is untested.
+- **Mislabelled SDR.** A source with SDR pixels wrongly tagged PQ is tone-mapped like an HDR source, because the tag is the only machine-readable signal.
+- **Existing HDR-sourced outputs.** An output encoded without tone-mapping from an HDR source holds PQ-coded pixels. Re-encode it from the source; a tag rewrite makes it play but leaves the picture misdescribed.
+
+### Subtitles
+
+The container-aware subtitle codec choice, sidecar discovery, and external-subtitle ffmpeg arg building live in the shared `subtitle_mux.sh` (also used by `subtitle_embed_params.sh`), and sidecar tag-stripping lives in the shared `subtitle_tag_strip.sh` (also used by `subtitle_embed_params.sh` and `subtitle_extract_params.sh`) — see those two files and the subtitle-tooling sections below. A video whose *embedded* (not sidecar) subtitle track needs tag-stripping isn't handled by `encoder_params.sh` itself; run `subtitle_extract_params.sh` against it first, which turns the embedded track into a sidecar that `encoder_params.sh`'s existing sidecar discovery then picks up on the next encode with no further changes needed.
 
 ## `rename_params.sh`
 
