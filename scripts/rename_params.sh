@@ -133,7 +133,10 @@
 #   own name, and its immediate parent folder's name (same year-first/
 #   year-last parsing as everywhere else in this script). The file's own
 #   name wins whenever it has a usable year; the parent folder is only
-#   consulted when the file's own name doesn't have one.
+#   consulted when the file's own name doesn't have one, and only when that
+#   folder holds exactly one video file - several videos in one folder
+#   would all resolve to the same movie name, so a year-less file in a
+#   folder with other videos is NO_MATCH instead.
 #
 #   - Parent folder IS movie-shaped (has its own year): the file is renamed
 #     in place, and the folder itself is renamed in place to canonical
@@ -201,14 +204,37 @@
 #   blocks" above), so an encoder tag like "Show Name (1080p x264
 #   EncoderName) S01E01.mkv" or "S01E01 - Real Title (1080p x264
 #   EncoderName)" has that block removed rather than folded into the name.
-#   Multi-episode files (S01E01E02) and absolute-numbered releases with no
-#   S/E letters are not recognized; treated as NO_MATCH, not guessed at.
-#   Directory handling differs from movies: an episode's own containing
-#   folder is a "Season NN" folder, not the show itself, so it is never
-#   touched by the directory pass. The show-root folder (one level further
-#   up) is tracked instead and renamed with the same movie-style
-#   title + year logic a standalone movie folder gets. Show-root folders
-#   never get a franchise wrapper inserted - that's movie-only.
+#   Multi-episode files (S01E01E02) are not recognized; treated as
+#   NO_MATCH, not guessed at.
+#
+#   Inferred episode numbering: a name with no SxxEyy token is still read as
+#   an episode when it carries an "Episode N" / "Ep N" token (optionally
+#   preceded by "Season N") or ends in " - NN", AND at least two videos in
+#   the same folder share the same name apart from that number (see
+#   build_episode_stems; counted once before any rename, so the whole
+#   series stays confirmed as its earlier files are renamed). A lone
+#   numbered file is never inferred to be an
+#   episode, since a bare number is equally a sequel or part number in a
+#   movie title and nothing in a single name distinguishes the two. A
+#   confirmed name is rewritten to "Title SxxEyy" form and then handled by
+#   the normal episode parser, so every episode rule here applies to it
+#   unchanged. Season comes from a "Season N" token in the name, else a
+#   "Season NN" parent folder, else 1. When nothing precedes the number, the
+#   title is the show folder's name (the parent of a "Season NN" folder,
+#   otherwise the folder holding the file). Known limitations: the season
+#   default of 1 is a guess when no "Season" token or folder exists; two
+#   movie sequels sharing a folder ("Title - 1", "Title - 2") have the same
+#   structure as episodes and are read as episodes; a series left partly
+#   renamed by an earlier run (one unrenamed file remaining) is no longer
+#   confirmed and is NO_MATCH.
+#
+#   Directory handling differs from movies: an episode in a "Season NN"
+#   folder never has that folder touched by the directory pass; the
+#   show-root folder (one level further up) is tracked instead. An episode
+#   directly in its show folder (no "Season NN" folder) tracks that folder.
+#   Either is renamed with the same movie-style title + year logic a
+#   standalone movie folder gets. Show-root folders never get a franchise
+#   wrapper inserted - that's movie-only.
 
 set -euo pipefail
 
@@ -582,13 +608,102 @@ parse_media_name() {
 # does). Checked BEFORE year-based movie parsing runs at all, not as a
 # fallback after it - so a show whose title happens to be a bare year
 # (e.g. a show titled "1904") is still routed to the episode parser, never
-# misparsed as a movie. Multi-episode files (S01E01E02) and absolute-
-# numbered releases with no S/E letters (common in some long-running
-# anime) are NOT recognized - deliberately, consistent with this script's
-# "skip rather than guess" philosophy elsewhere: treated as NO_MATCH, not
-# force-fit.
+# misparsed as a movie. Multi-episode files (S01E01E02) are NOT recognized -
+# deliberately, consistent with this script's "skip rather than guess"
+# philosophy elsewhere: treated as NO_MATCH, not force-fit. Episode numbering
+# without an SxxEyy token is handled one step earlier, by
+# normalize_absolute_episode, which rewrites it into SxxEyy form first.
 is_episode_shaped() {
     grep -qP '(?<![0-9A-Za-z])[Ss][0-9]{1,2}[Ee][0-9]{1,3}(?![0-9A-Za-z])' <<< "$1"
+}
+
+# PCRE for an inferred episode token: "Episode N" or "Ep N", optionally
+# preceded by "Season N". Used only by abs_locate.
+ABS_EP_PATTERN='(?<![0-9A-Za-z])(?:season[ ._-]*[0-9]{1,2}[ ._-]*)?(?:episode|ep)[ ._-]*[0-9]{1,3}(?![0-9A-Za-z])'
+
+# Locates an inferred episode token in NAME: "Episode N" / "Ep N"
+# (optionally preceded by "Season N"), or a trailing " - NN". Sets
+# ABS_FOUND (0/1), ABS_PRE (text before the token), ABS_REST (text after it),
+# ABS_EP (episode digits), and ABS_SEASON (empty when no "Season N" token is
+# present). Always returns 0, so it is safe to call as a bare statement
+# under set -e.
+abs_locate() {
+    local name="$1" hit off match
+    ABS_FOUND=0; ABS_PRE=""; ABS_REST=""; ABS_EP=""; ABS_SEASON=""
+    hit="$(grep -boiP "$ABS_EP_PATTERN" <<< "$name" | head -1)" || true
+    if [[ -n "$hit" ]]; then
+        off="${hit%%:*}"; match="${hit#*:}"
+        [[ "$match" =~ ([0-9]{1,3})$ ]] || return 0
+        ABS_EP="${BASH_REMATCH[1]}"
+        if [[ "$match" =~ ^[Ss][Ee][Aa][Ss][Oo][Nn][\ ._-]*([0-9]{1,2}) ]]; then
+            ABS_SEASON="${BASH_REMATCH[1]}"
+        fi
+        ABS_PRE="${name:0:$off}"
+        ABS_REST="${name:$(( off + ${#match} ))}"
+        ABS_FOUND=1
+    elif [[ "$name" =~ ^(.*[^\ ._-])[\ ._-]+-[\ ._-]*([0-9]{1,3})$ ]]; then
+        ABS_PRE="${BASH_REMATCH[1]}"
+        ABS_EP="${BASH_REMATCH[2]}"
+        ABS_FOUND=1
+    fi
+    return 0
+}
+
+# Counts, per folder, the videos that carry an inferred episode token and
+# share a stem (the name minus the token), into EPISODE_STEMS keyed
+# "<dir>|<pre>|<rest>". A bare number alone is not evidence of a series - it
+# is equally a sequel or part number in a movie title - so two or more videos
+# with the same stem in one folder is what confirms it. Built once from the
+# full file list BEFORE any rename, because each rename removes a sibling
+# from the folder: counting live would stop confirming the last files of a
+# series partway through the batch. Takes the NUL-delimited file list on
+# stdin. Clobbers ABS_*.
+declare -A EPISODE_STEMS=()
+build_episode_stems() {
+    local f base dir
+    while IFS= read -r -d '' f; do
+        base="$(basename "$f")"
+        [[ "${base##*.}" =~ ^(${VIDEO_EXTS})$ ]] || continue
+        dir="$(dirname "$f")"
+        base="${base%.*}"
+        abs_locate "$(strip_junk_prefixes "$base")"
+        (( ABS_FOUND )) || continue
+        EPISODE_STEMS["$dir|$ABS_PRE|$ABS_REST"]=$(( ${EPISODE_STEMS["$dir|$ABS_PRE|$ABS_REST"]:-0} + 1 ))
+    done
+}
+
+# Rewrites an inferred-episode name into "Title SxxEyy<rest>" so the normal
+# episode parser handles it, but only when EPISODE_STEMS (built by
+# build_episode_stems) confirms a series. Season: "Season N" in the name,
+# else a "Season NN" parent folder, else 1. When nothing precedes the
+# token, the title is the show folder's name (the parent of a "Season NN"
+# folder, otherwise the folder itself).
+# Sets ABS_NAME; unchanged from the input when the name already has an
+# SxxEyy token, carries no inferred token, or has no confirming siblings.
+# Clobbers ABS_* and PARSED_*.
+normalize_absolute_episode() {
+    local name="$1" dir="$2" pre rest ep season show_dir
+    ABS_NAME="$name"
+    is_episode_shaped "$name" && return 0
+    abs_locate "$name"
+    (( ABS_FOUND )) || return 0
+    pre="$ABS_PRE"; rest="$ABS_REST"; ep="$ABS_EP"; season="$ABS_SEASON"
+    (( ${EPISODE_STEMS["$dir|$pre|$rest"]:-0} >= 2 )) || return 0
+    if [[ -z "$season" && "$(basename "$dir")" =~ ^[Ss]eason[\ ._-]*([0-9]{1,2})$ ]]; then
+        season="${BASH_REMATCH[1]}"
+    fi
+    [[ -z "$season" ]] && season=1
+    if [[ -z "$(clean_fragment "$(strip_delimited_groups "$pre")")" ]]; then
+        show_dir="$dir"
+        [[ "$(basename "$dir")" =~ ^[Ss]eason[\ ._-]*[0-9]+$ ]] && show_dir="$(dirname "$dir")"
+        parse_media_name "$(strip_junk_prefixes "$(basename "$show_dir")")"
+        if (( PARSED_OK )); then
+            pre="$PARSED_TITLE"
+        else
+            pre="$(basename "$show_dir")"
+        fi
+    fi
+    ABS_NAME="$pre S$(printf '%02d' "$((10#$season))")E$(printf '%02d' "$((10#$ep))")${rest}"
 }
 
 # Core name parser for TV EPISODES. Sets PARSED_OK, PARSED_SERIES,
@@ -885,13 +1000,24 @@ check_root() {
     return $rc
 }
 
+# Counts the video files directly inside DIR (not recursive). Sets nothing;
+# prints the count. Used to decide whether a folder name can stand in for a
+# year-less file's own name: only a folder holding exactly one video can.
+count_videos_in() {
+    find "$1" -maxdepth 1 -type f -regextype posix-extended \
+        -iregex ".*\.(${VIDEO_EXTS})$" | wc -l
+}
+
 echo "Starting Plex library scan (Videos & Subtitles)..."
 (( DRY_RUN )) && echo "=== RUNNING IN DRY-RUN MODE (No changes will be made) ==="
 (( RENAME_DIRS )) || echo "=== Files only (-F): no directories will be renamed, created, or moved ==="
 echo "----------------------------------------------------------------"
 log "Rename pass started: $TARGET_DIR"
 
-declare -A MATCHED_DIRS=()   # unique parent dirs of successfully-parsed movie/show files, for the directory pass. Value is "movie" or "show" - only "movie" entries are ever eligible for franchise-wrapper insertion.
+list_media_files() { find "$TARGET_DIR" -type f -regextype posix-extended -iregex ".*\.(${ALL_EXTS})$" -print0 | sort -z; }
+build_episode_stems < <(list_media_files)
+
+declare -A MATCHED_DIRS=()   # unique ancestor dirs of successfully-parsed movie/show files, for the directory pass. Value is "movie" or "show" - only "movie" entries are ever eligible for franchise-wrapper insertion.
 
 # Main loop. Null-delimited find + process substitution (not a pipe) so
 # counters set inside the loop are visible after it ends - a
@@ -908,10 +1034,10 @@ while IFS= read -r -d '' FILE_PATH; do
     IS_SUBTITLE=0
     [[ "$FILE_EXT_LOWER" =~ ^(${SUB_EXTS})$ ]] && IS_SUBTITLE=1
 
-    # Reset per-iteration movie-path state so a stale value from a previous
-    # (possibly episode) iteration can never leak into this one's decisions.
+    # Reset per-iteration state so a stale value from a previous iteration
+    # can never leak into this one's decisions.
     IS_EPISODE=0
-    OWN_OK=0; DIR_OK=0; MOVIE_OK=0; USED_PARENT_FALLBACK=0
+    OWN_OK=0; DIR_OK=0; MOVIE_OK=0; USED_PARENT_FALLBACK=0; AMBIGUOUS_PARENT=0
     ITEM_OK=0
 
     # 1. SUBTITLE LANGUAGE TAG (decoupled from title/year parsing - see
@@ -937,11 +1063,13 @@ while IFS= read -r -d '' FILE_PATH; do
         WORKING_NAME="$SUB_TAG_STRIPPED_NAME"
     fi
 
-    # 2. STRIP SHARED JUNK (brackets, site-prefix), THEN BRANCH: episode
-    #    detection runs first and unconditionally, so a title containing a
-    #    bare year is never misrouted into movie parsing (see
-    #    is_episode_shaped's own comment).
+    # 2. STRIP SHARED JUNK (brackets, site-prefix), INFER EPISODE NUMBERING
+    #    FROM SIBLINGS, THEN BRANCH: episode detection runs first and
+    #    unconditionally, so a title containing a bare year is never
+    #    misrouted into movie parsing (see is_episode_shaped's own comment).
     WORKING_NAME_STRIPPED="$(strip_junk_prefixes "$WORKING_NAME")"
+    normalize_absolute_episode "$WORKING_NAME_STRIPPED" "$FILE_DIR"
+    WORKING_NAME_STRIPPED="$ABS_NAME"
 
     if is_episode_shaped "$WORKING_NAME_STRIPPED"; then
         IS_EPISODE=1
@@ -964,9 +1092,17 @@ while IFS= read -r -d '' FILE_PATH; do
             FINAL_TITLE="$OWN_TITLE"; FINAL_YEAR="$OWN_YEAR"; FINAL_EDITION="$OWN_EDITION"
             MOVIE_OK=1
         elif (( DIR_OK )); then
-            FINAL_TITLE="$DIR_TITLE"; FINAL_YEAR="$DIR_YEAR"; FINAL_EDITION="$DIR_EDITION"
-            MOVIE_OK=1
-            USED_PARENT_FALLBACK=1
+            # The parent folder's name can only stand in for a file's own
+            # name when the folder holds a single video; several videos
+            # would all resolve to the same target name and collide.
+            if (( $(count_videos_in "$FILE_DIR") > 1 )); then
+                AMBIGUOUS_PARENT=1
+                MOVIE_OK=0
+            else
+                FINAL_TITLE="$DIR_TITLE"; FINAL_YEAR="$DIR_YEAR"; FINAL_EDITION="$DIR_EDITION"
+                MOVIE_OK=1
+                USED_PARENT_FALLBACK=1
+            fi
         else
             MOVIE_OK=0
         fi
@@ -977,6 +1113,9 @@ while IFS= read -r -d '' FILE_PATH; do
         if (( IS_EPISODE )); then
             echo "NO MATCH (episode-shaped but unparseable): $FILE_NAME"
             log "NO MATCH: $FILE_NAME"
+        elif (( AMBIGUOUS_PARENT )); then
+            echo "NO MATCH (parent folder has multiple videos; its name can't name them all): $FILE_NAME"
+            log "NO MATCH (ambiguous parent): $FILE_NAME"
         else
             echo "NO MATCH (no valid year found in file name or parent folder): $FILE_NAME"
             log "NO MATCH: $FILE_NAME"
@@ -990,12 +1129,16 @@ while IFS= read -r -d '' FILE_PATH; do
     # file instead relocates into a freshly created subfolder below, and
     # this plain (non-year) folder is deliberately left out of MATCHED_DIRS
     # so the directory pass never tries to rename it into a match for the
-    # movie itself. An episode's own directory is a "Season NN" folder, not
-    # the show - the show-root folder is one level further up. Track
-    # whichever is the actual title/year-shaped ancestor, so the directory
-    # pass never runs against "Season NN" itself either.
+    # movie itself. An episode inside a "Season NN" folder tracks the show
+    # root one level further up, so the directory pass never runs against
+    # "Season NN" itself; an episode directly in its show folder tracks
+    # that folder.
     if (( IS_EPISODE )); then
-        MATCHED_DIRS["$(dirname "$FILE_DIR")"]="show"
+        if [[ "$(basename "$FILE_DIR")" =~ ^[Ss]eason[\ ._-]*[0-9]+$ ]]; then
+            MATCHED_DIRS["$(dirname "$FILE_DIR")"]="show"
+        else
+            MATCHED_DIRS["$FILE_DIR"]="show"
+        fi
     elif (( DIR_OK )); then
         MATCHED_DIRS["$FILE_DIR"]="movie"
     fi
@@ -1060,15 +1203,16 @@ while IFS= read -r -d '' FILE_PATH; do
     # 4. EXECUTE
     attempt_rename "$FILE_PATH" "$NEW_FILE_PATH" "$TYPE_LABEL"
 
-done < <(find "$TARGET_DIR" -type f -regextype posix-extended -iregex ".*\.(${ALL_EXTS})$" -print0 | sort -z)
+done < <(list_media_files)
 
 # Directory pass. Runs after all file renames complete, over the set of
 # directories that are the title/year-shaped ancestor of at least one
 # successfully-parsed file: a movie's own folder (only when that folder was
 # already movie-shaped going in - see the MATCHED_DIRS note in the main
 # loop above for when it wasn't), or a show's root folder (one level above
-# "Season NN" for episodes). "Season NN" folders themselves are never in
-# this set and are never touched.
+# "Season NN" for episodes, or the folder itself for episodes sitting
+# directly in it). "Season NN" folders themselves are never in this set and
+# are never touched.
 # Always parsed as movie/show-style (title + year), never as episode-style
 # - a directory basename has no extension and isn't itself an episode
 # file. Year-first names (e.g. a raw download's "(2020) Movie Name"
@@ -1138,7 +1282,7 @@ echo " Batch complete"
 echo "  Renamed:    $RENAMED"
 (( DRY_RUN )) && echo "  Previewed:  $PREVIEWED  (dry run: nothing written; re-run without -n to rename)"
 echo "  Skipped:    $SKIPPED  (collisions or unrecognized language/modifier - review manually)"
-echo "  No match:   $NO_MATCH  (no usable year found; left untouched)"
+echo "  No match:   $NO_MATCH  (no usable year found, or no confirmed series; left untouched)"
 echo "  Failed:     $FAILED"
 echo "------------------------------------------"
 log "Batch complete: Renamed=$RENAMED Previewed=$PREVIEWED Skipped=$SKIPPED NoMatch=$NO_MATCH Failed=$FAILED"
