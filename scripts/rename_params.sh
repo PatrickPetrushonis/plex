@@ -116,16 +116,21 @@
 #   over a freeform match, and is kept exactly as written.
 #   Several markers in one name are all kept, joined by spaces into one
 #   label - "Movie Name 2010 Remastered Extended Edition" becomes
-#   "Movie Name (2010) {edition-Extended Edition Remastered}". Labels are
+#   "Movie Name (2010) {edition-Extended Remastered}". Labels are
 #   sorted alphabetically (case-insensitive), except Remastered, which is
 #   always last; a label found twice (e.g. "DC" and "Director's Cut") is kept
-#   once. Each label is the one EDITION_PATTERNS maps its marker to, so
-#   "Extended" alone is recorded as "Extended Edition". Known limitation: a handful of bare fallback
+#   once. Labels leave out the words "Edition" and "Cut" - "Extended
+#   Edition" and "Extended Cut" are both "Extended", "Special Edition" is
+#   "Special", "25th Anniversary Edition" is "25th Anniversary" - except for
+#   possessive names, which keep theirs: "Director's Cut" and "Collector's
+#   Edition". Each label is the one EDITION_PATTERNS maps its marker to.
+#   Known limitation: a handful of bare fallback
 #   words (Extended, Theatrical, DC) also match inside a related but
 #   distinct label that doesn't have its own dedicated entry - "Extended
 #   Version" isn't listed explicitly, so it falls through to the bare
-#   "Extended" pattern and is recorded as "Extended Edition" rather than
-#   kept verbatim. Because every marker in the name is now collected, a
+#   "Extended" pattern and is recorded as "Extended" rather than kept
+#   verbatim. An "{edition-X}" tag already on a name is kept as written, so a
+#   file renamed before labels dropped "Edition"/"Cut" keeps its old label. Because every marker in the name is now collected, a
 #   title word that happens to be one of these keywords (e.g. "Redux") is
 #   also pulled into the edition rather than left in the title, as it
 #   already was when it was the only marker. See EDITION_PATTERNS itself
@@ -466,49 +471,52 @@ strip_and_clean() {
 
 # Recognized edition/cut markers, checked as freeform text anywhere in a
 # name - not just the "{edition-X}" bracket syntax, which won't already
-# exist on a file before this script runs. Ordered most-specific
-# phrase first, so e.g. "Ultimate Extended Edition" is matched as that
-# exact three-word phrase before "Extended Edition" or "Ultimate Edition"
-# below it ever get a chance to claim part of it, and "Extended Edition" is
-# matched before the bare "Extended" fallback. Each pattern is PCRE, matched
-# case-insensitively; "[ ._-]" between words tolerates plain spaces as well
-# as the dot/underscore/hyphen-separated scene-naming style (e.g.
+# exist on a file before this script runs. Each entry is "<PCRE>::<label>",
+# matched case-insensitively; one entry per label, with every spelling of
+# that marker folded into its pattern - e.g. "extended" alone, "extended
+# cut" and "extended edition" are all the one "Extended" entry. Labels
+# leave out "Edition"/"Cut"/"Version", so every marker that can be followed
+# by one of those words swallows it as an optional suffix; otherwise the
+# word would be left behind in the title. "[ ._-]" between words tolerates plain spaces as
+# well as the dot/underscore/hyphen-separated scene-naming style (e.g.
 # "Directors.Cut" or "Open_Matte"). Ordinal-numbered anniversary editions
 # ("25th Anniversary Edition") are handled separately, in
 # check_anniversary_edition below, since the number itself has to be
 # captured and reproduced rather than mapped to one fixed label.
+#
+# Entries are alphabetical by label with ONE exception: "Ultimate Extended
+# Edition" contains the "Extended" marker, and extract_known_edition removes
+# each match from the text before running the next entry, so it has to come
+# first or "Extended" would claim part of it and the word "Ultimate" would
+# be lost. Nothing else in the list is a fragment of another entry; when
+# adding one, check that before placing it alphabetically.
 # Known limitation, an accepted tradeoff of matching by keyword at all: the
-# bare fallback words at the bottom (Theatrical, Extended, DC) match inside
-# a related but distinct label that doesn't have its own dedicated entry
-# above them - "Extended Version" isn't listed explicitly, so it falls
-# through to the bare "Extended" pattern and is recorded as "Extended
-# Edition" rather than kept verbatim.
+# bare words (Extended, Theatrical, DC) match inside a related but distinct
+# label that doesn't have its own dedicated entry, and are recorded under
+# the shorter label rather than kept verbatim.
 EDITION_PATTERNS=(
-    "ultimate[ ._-]extended[ ._-]edition::Ultimate Extended Edition"
-    "director'?s[ ._-]cut::Director's Cut"
-    "extended[ ._-]edition::Extended Edition"
-    "extended[ ._-]cut::Extended Cut"
-    "theatrical[ ._-](?:cut|edition|release|version)::Theatrical"
-    "open[ ._-]matte::Open Matte"
+    "ultimate[ ._-]extended(?:[ ._-](?:cut|edition))?::Ultimate Extended"   # pinned first, see above
+
+    "anniversary[ ._-](?:edition|collection)::Anniversary"
+    "assembly[ ._-]cut::Assembly"
     "collector'?s[ ._-]edition::Collector's Edition"
-    "special[ ._-]edition::Special Edition"
-    "ultimate[ ._-]edition::Ultimate Edition"
-    "diamond[ ._-]edition::Diamond Edition"
-    "platinum[ ._-](?:edition|series)::Platinum Edition"
-    "definitive[ ._-](?:cut|edition)::Definitive Edition"
-    "anniversary[ ._-](?:edition|collection)::Anniversary Edition"
-    "final[ ._-]cut::Final Cut"
-    "assembly[ ._-]cut::Assembly Cut"
-    "international[ ._-](?:cut|version)::International Cut"
-    "criterion(?:[ ._-]collection)?::Criterion"
-    "remaster(?:ed)?::Remastered"
-    "unrated::Unrated"
-    "uncensored::Uncensored"
-    "uncut::Uncut"
-    "redux::Redux"
-    "theatrical::Theatrical"
-    "extended::Extended Edition"
-    "(?<![0-9A-Za-z])dc(?![0-9A-Za-z])::Director's Cut"
+    "criterion(?:[ ._-](?:collection|edition))?::Criterion"
+    "definitive[ ._-](?:cut|edition)::Definitive"
+    "diamond[ ._-]edition::Diamond"
+    "(?:director'?s[ ._-]cut|(?<![0-9A-Za-z])dc(?![0-9A-Za-z]))::Director's Cut"
+    "extended(?:[ ._-](?:cut|edition|version))?::Extended"
+    "final[ ._-]cut::Final"
+    "international[ ._-](?:cut|edition|version)::International"
+    "open[ ._-]matte(?:[ ._-](?:edition|version))?::Open Matte"
+    "platinum[ ._-](?:edition|series)::Platinum"
+    "redux(?:[ ._-](?:cut|edition|version))?::Redux"
+    "remaster(?:ed)?(?:[ ._-](?:edition|version))?::Remastered"
+    "special[ ._-]edition::Special"
+    "theatrical(?:[ ._-](?:cut|edition|release|version))?::Theatrical"
+    "ultimate[ ._-]edition::Ultimate"
+    "uncensored(?:[ ._-](?:edition|version))?::Uncensored"
+    "uncut(?:[ ._-](?:edition|version))?::Uncut"
+    "unrated(?:[ ._-](?:cut|edition|version))?::Unrated"
 )
 
 # Ordinal-numbered anniversary editions ("25th Anniversary Edition", "40th
@@ -517,7 +525,7 @@ EDITION_PATTERNS=(
 # in circulation to enumerate, so the ordinal itself is captured out of the
 # match and reproduced in the label. A trailing "Edition"/"Collection" word
 # is matched (and removed along with the rest) but not reproduced - the
-# label is always normalized to "<N><suffix> Anniversary Edition"
+# label is always normalized to "<N><suffix> Anniversary"
 # regardless of what, if anything, followed "Anniversary" in the source
 # text. Checked before EDITION_PATTERNS since it needs this different
 # handling; sets EDITION_LABEL only when it actually matches, leaving it
@@ -527,7 +535,7 @@ check_anniversary_edition() {
     EDITION_LABEL=""
     match="$(grep -ioP '[0-9]+(?:st|nd|rd|th)[ ._-]anniversary(?:[ ._-](?:edition|collection))?' <<< "$raw" | head -1)" || true
     if [[ -n "$match" ]] && [[ "$match" =~ ^([0-9]+)(st|nd|rd|th) ]]; then
-        EDITION_LABEL="${BASH_REMATCH[1]}${BASH_REMATCH[2]} Anniversary Edition"
+        EDITION_LABEL="${BASH_REMATCH[1]}${BASH_REMATCH[2]} Anniversary"
         raw="${raw/$match/}"
     fi
     EDITION_RAW="$raw"
@@ -576,11 +584,15 @@ extract_known_edition() {
     for entry in "${EDITION_PATTERNS[@]}"; do
         pattern="${entry%%::*}"
         label="${entry#*::}"
-        match="$(grep -ioP "$pattern" <<< "$raw" | head -1)" || true
-        if [[ -n "$match" ]]; then
+        # Strip every occurrence, not just the first: with one entry per
+        # label, a name that repeats a marker ("Extended Cut ... Extended
+        # Edition") must not leave the second one behind in the title.
+        while :; do
+            match="$(grep -ioP "$pattern" <<< "$raw" | head -1)" || true
+            [[ -n "$match" ]] || break
             found+=("$label")
-            raw="${raw/$match/}"
-        fi
+            raw="${raw/"$match"/}"
+        done
     done
 
     EDITION_LABEL=""
