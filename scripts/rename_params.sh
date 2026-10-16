@@ -113,13 +113,23 @@
 #   and "Movie Name (2000) Uncut (1080p...)" have their edition
 #   recognized and removed before the title or year is ever touched.
 #   "{edition-X}" is still checked first when present and takes precedence
-#   over a freeform match. Known limitation: a handful of bare fallback
+#   over a freeform match, and is kept exactly as written.
+#   Several markers in one name are all kept, joined by spaces into one
+#   label - "Movie Name 2010 Remastered Extended Edition" becomes
+#   "Movie Name (2010) {edition-Extended Edition Remastered}". Labels are
+#   sorted alphabetically (case-insensitive), except Remastered, which is
+#   always last; a label found twice (e.g. "DC" and "Director's Cut") is kept
+#   once. Each label is the one EDITION_PATTERNS maps its marker to, so
+#   "Extended" alone is recorded as "Extended Edition". Known limitation: a handful of bare fallback
 #   words (Extended, Theatrical, DC) also match inside a related but
 #   distinct label that doesn't have its own dedicated entry - "Extended
 #   Version" isn't listed explicitly, so it falls through to the bare
 #   "Extended" pattern and is recorded as "Extended Edition" rather than
-#   kept verbatim. See EDITION_PATTERNS itself for the exact list and
-#   ordering.
+#   kept verbatim. Because every marker in the name is now collected, a
+#   title word that happens to be one of these keywords (e.g. "Redux") is
+#   also pulled into the edition rather than left in the title, as it
+#   already was when it was the only marker. See EDITION_PATTERNS itself
+#   for the exact list and ordering.
 #
 # Franchise-folder restructuring (movies only):
 #   Target Plex layout: <library>/Franchise Name/Movie Name (YYYY)/Movie
@@ -523,35 +533,60 @@ check_anniversary_edition() {
     EDITION_RAW="$raw"
 }
 
-# Scans RAW for the first recognized edition marker - an ordinal-numbered
-# anniversary edition first (see check_anniversary_edition above), then
-# EDITION_PATTERNS in order, stopping at the first hit anywhere in the
-# string (not necessarily the first hit by position - see the ordering
-# note above). Sets EDITION_LABEL (empty if nothing matched) and
-# EDITION_RAW (the input with the matched text removed, unchanged if
-# nothing matched). Called before year detection or any title stripping in
-# both parse_media_name and parse_episode_name, so an edition marker is
-# recognized regardless of where it sits relative to the year, and never
-# ends up folded into the title or discarded as an undifferentiated
+# Joins edition labels (arguments) into one string: duplicates removed,
+# sorted alphabetically case-insensitively (C locale, so the sort doesn't
+# depend on the host's collation), with "Remastered" always last. Prints
+# nothing for no arguments.
+join_editions() {
+    local label out="" remastered=0
+    (( $# )) || return 0
+    while IFS= read -r label; do
+        [[ -z "$label" ]] && continue
+        if [[ "${label,,}" == "remastered" ]]; then
+            remastered=1
+        else
+            out="${out:+$out }$label"
+        fi
+    done < <(printf '%s\n' "$@" | LC_ALL=C sort -fu)
+    (( remastered )) && out="${out:+$out }Remastered"
+    printf '%s' "$out"
+}
+
+# Scans RAW for every recognized edition marker - an ordinal-numbered
+# anniversary edition first (see check_anniversary_edition above), then each
+# entry of EDITION_PATTERNS in order. Each match is removed from the text
+# before the next pattern runs, so a specific phrase (e.g. "Ultimate
+# Extended Edition") claims its words and the shorter entries below it can't
+# match inside it again. Matches are collected rather than stopping at the
+# first, and combined by join_editions. Sets EDITION_LABEL (empty if nothing
+# matched) and EDITION_RAW (the input with all matched text removed,
+# unchanged if nothing matched). Called before year detection or any title
+# stripping in both parse_media_name and parse_episode_name, so an edition
+# marker is recognized regardless of where it sits relative to the year, and
+# never ends up folded into the title or discarded as an undifferentiated
 # release tag.
 extract_known_edition() {
     local raw="$1" entry pattern label match
+    local -a found=()
 
     check_anniversary_edition "$raw"
-    [[ -n "$EDITION_LABEL" ]] && return
+    [[ -n "$EDITION_LABEL" ]] && found+=("$EDITION_LABEL")
     raw="$EDITION_RAW"
 
-    EDITION_LABEL=""
     for entry in "${EDITION_PATTERNS[@]}"; do
         pattern="${entry%%::*}"
         label="${entry#*::}"
         match="$(grep -ioP "$pattern" <<< "$raw" | head -1)" || true
         if [[ -n "$match" ]]; then
-            EDITION_LABEL="$label"
+            found+=("$label")
             raw="${raw/$match/}"
-            break
         fi
     done
+
+    EDITION_LABEL=""
+    if (( ${#found[@]} )); then
+        EDITION_LABEL="$(join_editions "${found[@]}")"
+    fi
     EDITION_RAW="$raw"
 }
 
