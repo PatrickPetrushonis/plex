@@ -129,12 +129,11 @@
 #   distinct label that doesn't have its own dedicated entry - "Extended
 #   Version" isn't listed explicitly, so it falls through to the bare
 #   "Extended" pattern and is recorded as "Extended" rather than kept
-#   verbatim. An "{edition-X}" tag already on a name is kept as written, so a
-#   file renamed before labels dropped "Edition"/"Cut" keeps its old label. Because every marker in the name is now collected, a
-#   title word that happens to be one of these keywords (e.g. "Redux") is
-#   also pulled into the edition rather than left in the title, as it
-#   already was when it was the only marker. See EDITION_PATTERNS itself
-#   for the exact list and ordering.
+#   verbatim. An "{edition-X}" tag already on a name is kept exactly as
+#   written. Every marker in the name is collected, so a title word that
+#   happens to be one of these keywords (e.g. "Redux") is pulled into the
+#   edition rather than left in the title. See EDITION_PATTERNS itself for
+#   the exact list and ordering.
 #
 # Franchise-folder restructuring (movies only):
 #   Target Plex layout: <library>/Franchise Name/Movie Name (YYYY)/Movie
@@ -195,7 +194,7 @@
 #   A name is routed to episode parsing instead of movie parsing if it
 #   contains a standalone SxxEyy token (S + 1-2 digit season, E + 1-3 digit
 #   episode), checked BEFORE year-based movie parsing runs at all - so a
-#   show whose title itself is a bare year (e.g. a show titled "1904") is
+#   show whose title itself is a bare year (e.g. a show titled "2000") is
 #   never misparsed as a movie. Everything before SxxEyy is the series title
 #   (junk-stripped like a movie title); season/episode are zero-padded from
 #   the token itself. Output: "Series - SxxEyy - Episode Title.ext", or just
@@ -239,9 +238,9 @@
 #   otherwise the folder holding the file). Known limitations: the season
 #   default of 1 is a guess when no "Season" token or folder exists; two
 #   movie sequels sharing a folder ("Title - 1", "Title - 2") have the same
-#   structure as episodes and are read as episodes; a series left partly
-#   renamed by an earlier run (one unrenamed file remaining) is no longer
-#   confirmed and is NO_MATCH.
+#   structure as episodes and are read as episodes; a series with a single
+#   unrenamed file remaining (the rest already named) has too few siblings
+#   to confirm and is NO_MATCH.
 #
 #   Episode folder layout: every episode video and subtitle is placed at
 #   <Series Name (YYYY)>/Season XX/<Series Name - SxxEyy>.<ext>. The season
@@ -371,6 +370,8 @@ ALL_EXTS="${VIDEO_EXTS}|${SUB_EXTS}"
 # shellcheck source=./lang_table.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lang_table.sh"
 
+# Prints the canonical language code for a raw subtitle language tag, or
+# nothing when the tag isn't in LANG_ALIASES (lang_table.sh).
 normalize_lang() {
     local raw="${1,,}"
     echo "${LANG_ALIASES[$raw]:-}"
@@ -389,8 +390,8 @@ normalize_modifier() {
 
 # Shared preprocessing for both parse_media_name and parse_episode_name.
 # Strips bracketed release-tracker tags anywhere (e.g. "[TRACKER]" -
-# movie/show titles essentially never contain literal square brackets, so
-# this is safe unconditionally) and a leading site-announcement prefix (e.g.
+# movie/show titles are treated as never containing literal square
+# brackets, so this is safe unconditionally) and a leading site-announcement prefix (e.g.
 # "www.example.org    -    " - requires a domain-like token followed by
 # whitespace-hyphen-whitespace, so it won't eat a legitimate title that
 # happens to start with a hyphenated phrase). Run once by the caller before
@@ -403,10 +404,24 @@ strip_junk_prefixes() {
     echo "$s"
 }
 
+# Converts a byte offset (as grep -b reports) into a character offset for
+# bash substring expansion. In a UTF-8 locale ${s:0:N} counts characters,
+# not bytes, so grep's byte offset used directly on a name with accented or
+# other multi-byte characters before the match slices too far - for
+# "Café Show (2016)" the title would end "(2" instead of "Café Show". The
+# prefix is cut by bytes (LC_ALL=C in a subshell), then measured in the
+# caller's locale. Offsets always land on an ASCII match start, so the cut
+# never splits a character. Prints the character offset.
+byte_to_char_offset() {
+    local s="$1" bytes="$2" prefix
+    prefix="$(LC_ALL=C; printf '%s' "${s:0:$bytes}")"
+    printf '%s' "${#prefix}"
+}
+
 # Finds the LAST standalone 4-digit year (1900-2099) in a string, per the
 # boundary rule in "Name parsing" above: not immediately preceded or
 # followed by another alphanumeric character, so "2160p" and "x265" never
-# match. Sets YEAR_MATCH and YEAR_OFFSET (byte offset of the match within
+# match. Sets YEAR_MATCH and YEAR_OFFSET (character offset of the match within
 # the input); both empty if no standalone year is present. grep exits 1 on
 # no match; `|| true` stops that from tripping set -e/pipefail (same class
 # of issue encoder_params.sh's own Design Notes document covers for its
@@ -421,7 +436,7 @@ find_last_year() {
     local off
     off="$(grep -boP '(?<![0-9A-Za-z])'"$YEAR_MATCH"'(?![0-9A-Za-z])' <<< "$raw" | tail -1)" || true
     [[ -z "$off" ]] && { YEAR_MATCH=""; return; }
-    YEAR_OFFSET="${off%%:*}"
+    YEAR_OFFSET="$(byte_to_char_offset "$raw" "${off%%:*}")"
 }
 
 # Cleans a raw title/series-title fragment: dots, underscores, and slashes
@@ -661,20 +676,38 @@ parse_media_name() {
     PARSED_OK=1
 }
 
+# PCRE for a standalone SxxEyy token without its trailing boundary check
+# (callers append what may follow it): S + 1-2 digit season, E + 1-3 digit
+# episode, not preceded by an alphanumeric character.
+EPISODE_TOKEN_PATTERN='(?<![0-9A-Za-z])[Ss][0-9]{1,2}[Ee][0-9]{1,3}'
+
+# Zero-pads a number to at least two digits, forcing base 10 so "08" and
+# "09" aren't read as invalid octal. Prints the result.
+pad2() { printf '%02d' "$((10#$1))"; }
+
+# Returns 0 when NAME (a folder's basename) is a "Season NN" folder -
+# "Season", an optional separator, then digits ("Season 1", "Season.02").
+# Sets SEASON_FOLDER_NUMBER to the digits, empty when it isn't one.
+is_season_folder_name() {
+    SEASON_FOLDER_NUMBER=""
+    [[ "$1" =~ ^[Ss]eason[\ ._-]*([0-9]+)$ ]] || return 1
+    SEASON_FOLDER_NUMBER="${BASH_REMATCH[1]}"
+}
+
 # Detects whether an already-prefix-stripped name is TV-episode-shaped:
 # looks for a standalone SxxEyy token (S, 1-2 digit season, E, 1-3 digit
 # episode; bounded by non-alphanumeric the same way the movie parser
 # bounds years, so "S03E01" matches but nothing inside a longer alnum run
 # does). Checked BEFORE year-based movie parsing runs at all, not as a
 # fallback after it - so a show whose title happens to be a bare year
-# (e.g. a show titled "1904") is still routed to the episode parser, never
+# (e.g. a show titled "2000") is still routed to the episode parser, never
 # misparsed as a movie. Multi-episode files (S01E01E02) are NOT recognized -
 # deliberately, consistent with this script's "skip rather than guess"
 # philosophy elsewhere: treated as NO_MATCH, not force-fit. Episode numbering
 # without an SxxEyy token is handled one step earlier, by
 # normalize_absolute_episode, which rewrites it into SxxEyy form first.
 is_episode_shaped() {
-    grep -qP '(?<![0-9A-Za-z])[Ss][0-9]{1,2}[Ee][0-9]{1,3}(?![0-9A-Za-z])' <<< "$1"
+    grep -qP "${EPISODE_TOKEN_PATTERN}(?![0-9A-Za-z])" <<< "$1"
 }
 
 # Detects an SxxEyy token immediately followed by more episode numbering -
@@ -686,7 +719,7 @@ is_episode_shaped() {
 # consistent with multi-episode files (S01E01E02): the script can't know what
 # number a special should take.
 is_unsupported_episode_numbering() {
-    grep -qP '(?<![0-9A-Za-z])[Ss][0-9]{1,2}[Ee][0-9]{1,3}(?:\.[0-9]{1,2}(?![0-9A-Za-z])|-[Ee][0-9]{1,3}(?![0-9A-Za-z]))' <<< "$1"
+    grep -qP "${EPISODE_TOKEN_PATTERN}(?:\.[0-9]{1,2}(?![0-9A-Za-z])|-[Ee][0-9]{1,3}(?![0-9A-Za-z]))" <<< "$1"
 }
 
 # PCRE for an inferred episode token: "Episode N" or "Ep N", optionally
@@ -704,7 +737,7 @@ abs_locate() {
     ABS_FOUND=0; ABS_PRE=""; ABS_REST=""; ABS_EP=""; ABS_SEASON=""
     hit="$(grep -boiP "$ABS_EP_PATTERN" <<< "$name" | head -1)" || true
     if [[ -n "$hit" ]]; then
-        off="${hit%%:*}"; match="${hit#*:}"
+        off="$(byte_to_char_offset "$name" "${hit%%:*}")"; match="${hit#*:}"
         [[ "$match" =~ ([0-9]{1,3})$ ]] || return 0
         ABS_EP="${BASH_REMATCH[1]}"
         if [[ "$match" =~ ^[Ss][Ee][Aa][Ss][Oo][Nn][\ ._-]*([0-9]{1,2}) ]]; then
@@ -761,13 +794,13 @@ normalize_absolute_episode() {
     (( ABS_FOUND )) || return 0
     pre="$ABS_PRE"; rest="$ABS_REST"; ep="$ABS_EP"; season="$ABS_SEASON"
     (( ${EPISODE_STEMS["$dir|$pre|$rest"]:-0} >= 2 )) || return 0
-    if [[ -z "$season" && "$(basename "$dir")" =~ ^[Ss]eason[\ ._-]*([0-9]{1,2})$ ]]; then
-        season="${BASH_REMATCH[1]}"
+    if [[ -z "$season" ]] && is_season_folder_name "$(basename "$dir")"; then
+        season="$SEASON_FOLDER_NUMBER"
     fi
     [[ -z "$season" ]] && season=1
     if [[ -z "$(clean_fragment "$(strip_delimited_groups "$pre")")" ]]; then
         show_dir="$dir"
-        [[ "$(basename "$dir")" =~ ^[Ss]eason[\ ._-]*[0-9]+$ ]] && show_dir="$(dirname "$dir")"
+        is_season_folder_name "$(basename "$dir")" && show_dir="$(dirname "$dir")"
         parse_media_name "$(strip_junk_prefixes "$(basename "$show_dir")")"
         if (( PARSED_OK )); then
             pre="$PARSED_TITLE"
@@ -775,7 +808,7 @@ normalize_absolute_episode() {
             pre="$(basename "$show_dir")"
         fi
     fi
-    ABS_NAME="$pre S$(printf '%02d' "$((10#$season))")E$(printf '%02d' "$((10#$ep))")${rest}"
+    ABS_NAME="$pre S$(pad2 "$season")E$(pad2 "$ep")${rest}"
 }
 
 # Core name parser for TV EPISODES. Sets PARSED_OK, PARSED_SERIES,
@@ -787,7 +820,7 @@ normalize_absolute_episode() {
 # way movie titles are, plus a redundant trailing year stripped out - Plex
 # episode filenames never carry the year, unlike movie filenames; see the
 # guard against stripping a show that's actually just named after a year,
-# e.g. a show titled "1904", in the code below). Season/episode = the
+# e.g. a show titled "2000", in the code below). Season/episode = the
 # digits inside the token, zero-padded to at least 2 digits each (avoiding
 # bash's octal trap on inputs like "08"/"09" via the 10# base-10 forcing
 # prefix).
@@ -823,12 +856,12 @@ parse_episode_name() {
     raw="$EDITION_RAW"
 
     local match offset
-    match="$(grep -oP '(?<![0-9A-Za-z])[Ss][0-9]{1,2}[Ee][0-9]{1,3}(?![0-9A-Za-z])' <<< "$raw" | head -1)" || true
+    match="$(grep -oP "${EPISODE_TOKEN_PATTERN}(?![0-9A-Za-z])" <<< "$raw" | head -1)" || true
     [[ -z "$match" ]] && return
 
     offset="$(grep -boP '(?<![0-9A-Za-z])'"$match"'(?![0-9A-Za-z])' <<< "$raw" | head -1)" || true
     [[ -z "$offset" ]] && return
-    offset="${offset%%:*}"
+    offset="$(byte_to_char_offset "$raw" "${offset%%:*}")"
 
     [[ "$match" =~ ^[Ss]([0-9]{1,2})[Ee]([0-9]{1,3})$ ]] || return
     local season="${BASH_REMATCH[1]}" episode="${BASH_REMATCH[2]}"
@@ -842,7 +875,7 @@ parse_episode_name() {
     # Uses the same last-standalone-year detection as the movie parser.
     # Guarded: if stripping would leave nothing meaningful behind, the
     # strip is discarded and the year stays in the title - this is what
-    # keeps a show actually named after a year (e.g. a show titled "1904")
+    # keeps a show actually named after a year (e.g. a show titled "2000")
     # intact, since there the "year" IS the whole title, not a redundant
     # repeat.
     find_last_year "$series_raw"
@@ -870,8 +903,8 @@ parse_episode_name() {
     fi
 
     PARSED_SERIES="$series_part"
-    PARSED_SEASON="$(printf '%02d' "$((10#$season))")"
-    PARSED_EPISODE="$(printf '%02d' "$((10#$episode))")"
+    PARSED_SEASON="$(pad2 "$season")"
+    PARSED_EPISODE="$(pad2 "$episode")"
     PARSED_OK=1
 }
 
@@ -944,6 +977,15 @@ mkdir -p -- "$LOG_DIR"
 LOG_FILE="$LOG_DIR/Rename_$(date '+%Y-%m-%d_%H%M').txt"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
 
+# Reports a file that was left untouched because no name could be derived
+# for it: prints and logs the reason, and counts it. Centralized so every
+# NO_MATCH outcome is recorded identically. Arguments: reason, file name.
+report_no_match() {
+    echo "NO MATCH ($1): $2"
+    log "NO MATCH ($1): $2"
+    NO_MATCH=$(( NO_MATCH + 1 ))
+}
+
 # Rename executor, shared by every call site (file loop, directory pass,
 # franchise-wrapper moves): handles the unchanged-path no-op, collision
 # check, dry-run preview, mv, and counters uniformly so every call site
@@ -960,6 +1002,9 @@ attempt_rename() {
 
     [[ "$old" == "$new" ]] && return 0
 
+    # The two collision outcomes below differ in message, log tag and the
+    # path shown, so they stay separate rather than sharing a helper whose
+    # signature would be longer than either block.
     if [[ -e "$new" ]]; then
         if [[ -d "$new" ]]; then
             # mv onto an existing directory target nests the source inside
@@ -1112,7 +1157,7 @@ _plan_episode_destination() {
     [[ $rc -eq 2 ]] && return 2
     if [[ $rc -eq 0 ]]; then
         container="$fdir"
-    elif [[ "$base" =~ ^[Ss]eason[\ ._-]*[0-9]+$ ]]; then
+    elif is_season_folder_name "$base"; then
         parent="$(dirname "$fdir")"; rc=0
         check_root "$parent" || rc=$?
         [[ $rc -eq 2 ]] && return 2
@@ -1143,11 +1188,31 @@ _plan_episode_destination() {
     fi
     return 0
 }
+# Calls _plan_episode_destination with the same arguments and return status,
+# but restores PARSED_EDITION afterward, since the helper's folder-name
+# parsing overwrites it and the caller still needs the episode's own
+# edition. Sets the same EP_* outputs.
 plan_episode_destination() {
     local saved_edition="$PARSED_EDITION" rc=0
     _plan_episode_destination "$@" || rc=$?
     PARSED_EDITION="$saved_edition"
     return $rc
+}
+
+# Removes DIR if it is empty and leaves it alone otherwise (rmdir only ever
+# removes an empty folder). Never removes the scanned root. Checks the
+# dry-run flag itself, so nothing is removed in dry-run. Always returns 0: a
+# folder that still holds files is the expected, silent outcome, not a
+# failure.
+prune_empty_dir() {
+    local dir="$1"
+    (( DRY_RUN )) && return 0
+    [[ -d "$dir" && ! "$dir" -ef "$TARGET_DIR_REAL" ]] || return 0
+    if rmdir -- "$dir" 2>/dev/null; then
+        echo "Removed empty folder: $dir"
+        log "REMOVED (empty folder): $dir"
+    fi
+    return 0
 }
 
 echo "Starting Plex library scan (Videos & Subtitles)..."
@@ -1156,6 +1221,9 @@ echo "Starting Plex library scan (Videos & Subtitles)..."
 echo "----------------------------------------------------------------"
 log "Rename pass started: $TARGET_DIR"
 
+# Prints every video and subtitle file under the target directory,
+# NUL-delimited and sorted, so callers can read the complete list before
+# any rename changes the tree.
 list_media_files() { find "$TARGET_DIR" -type f -regextype posix-extended -iregex ".*\.(${ALL_EXTS})$" -print0 | sort -z; }
 build_episode_stems < <(list_media_files)
 
@@ -1191,16 +1259,10 @@ while IFS= read -r -d '' FILE_PATH; do
     if (( IS_SUBTITLE )); then
         extract_sub_lang_tag "$FILE_BASE"
         if [[ -n "$SUB_TAG_UNRECOGNIZED" ]]; then
-            case "$SUB_TAG_UNRECOGNIZED" in
-                lang:*)
-                    echo "SKIPPING (unrecognized subtitle language '${SUB_TAG_UNRECOGNIZED#lang:}'): $FILE_NAME"
-                    log "SKIPPED (unrecognized language '${SUB_TAG_UNRECOGNIZED#lang:}'): $FILE_NAME"
-                    ;;
-                modifier:*)
-                    echo "SKIPPING (unrecognized subtitle modifier '${SUB_TAG_UNRECOGNIZED#modifier:}'): $FILE_NAME"
-                    log "SKIPPED (unrecognized modifier '${SUB_TAG_UNRECOGNIZED#modifier:}'): $FILE_NAME"
-                    ;;
-            esac
+            SKIP_KIND="${SUB_TAG_UNRECOGNIZED%%:*}"
+            [[ "$SKIP_KIND" == "lang" ]] && SKIP_KIND="language"
+            echo "SKIPPING (unrecognized subtitle ${SKIP_KIND} '${SUB_TAG_UNRECOGNIZED#*:}'): $FILE_NAME"
+            log "SKIPPED (unrecognized ${SKIP_KIND} '${SUB_TAG_UNRECOGNIZED#*:}'): $FILE_NAME"
             SKIPPED=$(( SKIPPED + 1 ))
             continue
         fi
@@ -1259,19 +1321,14 @@ while IFS= read -r -d '' FILE_PATH; do
 
     if [[ $ITEM_OK -ne 1 ]]; then
         if (( UNSUPPORTED_EP )); then
-            echo "NO MATCH (fractional or ranged episode number; not renamed): $FILE_NAME"
-            log "NO MATCH (unsupported episode numbering): $FILE_NAME"
+            report_no_match "fractional or ranged episode number; not renamed" "$FILE_NAME"
         elif (( IS_EPISODE )); then
-            echo "NO MATCH (episode-shaped but unparseable): $FILE_NAME"
-            log "NO MATCH: $FILE_NAME"
+            report_no_match "episode-shaped but unparseable" "$FILE_NAME"
         elif (( AMBIGUOUS_PARENT )); then
-            echo "NO MATCH (parent folder has multiple videos; its name can't name them all): $FILE_NAME"
-            log "NO MATCH (ambiguous parent): $FILE_NAME"
+            report_no_match "parent folder has multiple videos; its name can't name them all" "$FILE_NAME"
         else
-            echo "NO MATCH (no valid year found in file name or parent folder): $FILE_NAME"
-            log "NO MATCH: $FILE_NAME"
+            report_no_match "no valid year found in file name or parent folder" "$FILE_NAME"
         fi
-        NO_MATCH=$(( NO_MATCH + 1 ))
         continue
     fi
 
@@ -1369,17 +1426,11 @@ while IFS= read -r -d '' FILE_PATH; do
 
 done < <(list_media_files)
 
-# Prune pass: remove folders an episode was moved out of (e.g. an old
-# "Season 1" next to the new "Season 01") if that left them empty. rmdir only
-# ever removes an empty folder, so anything still holding files is untouched.
-# Never the scanned root. Skipped in dry-run, where nothing was moved.
-if (( RENAME_DIRS && ! DRY_RUN )); then
+# Prune pass: remove folders an episode was moved out of (e.g. "Season 1"
+# after its files move to "Season 01") if that left them empty.
+if (( RENAME_DIRS && ${#PRUNE_DIRS[@]} > 0 )); then
     for PRUNE_PATH in "${!PRUNE_DIRS[@]}"; do
-        [[ -d "$PRUNE_PATH" && ! "$PRUNE_PATH" -ef "$TARGET_DIR_REAL" ]] || continue
-        if rmdir -- "$PRUNE_PATH" 2>/dev/null; then
-            echo "Removed empty folder: $PRUNE_PATH"
-            log "REMOVED (empty folder): $PRUNE_PATH"
-        fi
+        prune_empty_dir "$PRUNE_PATH"
     done
 fi
 
