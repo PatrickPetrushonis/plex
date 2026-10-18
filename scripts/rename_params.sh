@@ -55,8 +55,9 @@
 #   release group) is dropped. (2) "(S01E01)" and "{S01E01}" are unwrapped
 #   and other "{...}" groups dropped, except Plex's own "{edition-X}".
 #   (3) A leading site-announcement prefix (e.g. "www.example.org    -    ")
-#   is removed. (4) Tabs and non-breaking spaces become spaces, runs of
-#   spaces collapse, and both ends are trimmed.
+#   is removed. (4) A release-version suffix on an episode number
+#   ("S01E01v3", " - 05v2") is dropped. (5) Tabs and non-breaking spaces
+#   become spaces, runs of spaces collapse, and both ends are trimmed.
 #   A name with no whitespace, dots or underscores is hyphen-delimited
 #   ("Movie-Name-2010-1080p") and its title hyphens are word separators; in
 #   any other style hyphens stay in the title ("Spider-Man.2002.1080p").
@@ -158,17 +159,22 @@
 #   a move is removed. The show folder is found as follows:
 #     - file in a "Season NN" folder: that folder's parent;
 #     - file flat in a folder whose title matches the series: that folder;
+#     - file flat in a release folder that names the series in its own
+#       "(...)" group ("Native Title (Series Title) (Season 02)"): the series
+#       folder beside it, so every season's release folder merges into one
+#       show folder, and the release folder is removed once empty;
 #     - otherwise (loose in the scanned root, a "Season NN" folder directly
 #       in the root, or a folder holding unrelated things): a new
-#       "Series (YYYY)" folder is created inside it.
+#       "Series (YYYY)" folder is created inside it ("Series" when no year
+#       is known, reusing a matching series folder already there).
 #   The show folder is renamed with the same title + year logic as a movie
 #   folder. Its year comes from its own name, else from a year in the
 #   episode's file name, which also names a new folder. With no year
-#   anywhere, nothing is guessed: an existing show folder keeps its name and
-#   still gets its "Season XX" subfolder, and a file with no show folder is
-#   renamed in place. A "Season NN" folder whose number differs from the
-#   file's token is not trusted; the file moves to the folder its token
-#   names.
+#   anywhere, an existing show folder keeps its name and a new one is named
+#   "Series"; either way the files move into "Season XX", and the year is
+#   added to that one folder name by hand. A "Season NN" folder whose number
+#   differs from the file's token is not trusted; the file moves to the
+#   folder its token names.
 
 set -euo pipefail
 
@@ -368,7 +374,9 @@ promote_bracket_tokens() {
 #      is removed; it requires a domain-like token followed by
 #      whitespace-hyphen-whitespace, so a legitimate title that starts with
 #      a hyphenated phrase is untouched.
-#   4. Whitespace is normalized: tabs and non-breaking spaces become spaces,
+#   4. A release-version suffix on an episode number ("S01E01v3", " - 05v2")
+#      is dropped.
+#   5. Whitespace is normalized: tabs and non-breaking spaces become spaces,
 #      runs collapse to one space, and both ends are trimmed.
 # Run once by the caller before branching on movie vs. episode, so the
 # episode-detection check itself also sees the cleaned name, not just
@@ -377,6 +385,7 @@ strip_junk_prefixes() {
     local s="$1"
     s="$(promote_bracket_tokens "$s")"
     s="$(sed -E 's/[({][[:space:]]*([Ss][0-9]{1,2}[Ee][0-9]{1,3})[[:space:]]*[)}]/ \1 /g' <<< "$s")"
+    s="$(sed -E 's/([Ss][0-9]{1,2}[Ee][0-9]{1,3})[Vv][0-9]{1,2}\b/\1/g; s/([ ._-]-[ ._-]*[0-9]{1,3})[Vv][0-9]{1,2}\b/\1/g' <<< "$s")"
     s="$(sed -E 's/\{edition-/\x03/g; s/\{[^}]*\}//g; s/\x03/{edition-/g' <<< "$s")"
     s="$(sed -E 's/^(www\.)?[A-Za-z0-9-]+\.[A-Za-z]{2,}[[:space:]]*-[[:space:]]*//' <<< "$s")"
     s="${s//$'\t'/ }"
@@ -1066,13 +1075,53 @@ count_videos_in() {
 # with an episode's series title regardless of punctuation or spacing.
 norm_title() { tr -cd '[:alnum:]' <<< "${1,,}"; }
 
+# Returns 0 when one of BASE's own "(...)" groups is the series title, the
+# alternate-title convention of release folders ("Native Title (Series Title)
+# (Season 02)"). Such a folder holds one season of the series but is not the
+# show folder: its files move to the series folder beside it.
+folder_names_series() {
+    local base="$1" series="$2" want group
+    want="$(norm_title "$series")"
+    [[ -n "$want" ]] || return 1
+    while IFS= read -r group; do
+        [[ "$(norm_title "$group")" == "$want" ]] && return 0
+    done < <(strip_junk_prefixes "$base" | grep -oP '(?<=\()[^()]*(?=\))' || true)
+    return 1
+}
+
+# Prints the first folder directly inside PARENT whose title matches SERIES
+# (a "Series" or "Series (YYYY)" folder, never a "Season NN" folder), or
+# nothing when there is none. Used when no year is known, so a new season
+# joins the series folder that already exists instead of creating a second
+# one beside it.
+find_series_dir() {
+    local parent="$1" series="$2" want dir base title
+    want="$(norm_title "$series")"
+    [[ -n "$want" ]] || return 0
+    while IFS= read -r -d '' dir; do
+        base="$(basename "$dir")"
+        is_season_folder_name "$base" && continue
+        parse_media_name "$(strip_junk_prefixes "$base")"
+        if (( PARSED_OK )); then
+            title="$PARSED_TITLE"
+        else
+            title="$(clean_fragment "$(strip_delimited_groups "$(strip_junk_prefixes "$base")")")"
+        fi
+        if [[ "$(norm_title "$title")" == "$want" ]]; then
+            printf '%s' "$dir"
+            return 0
+        fi
+    done < <(find "$parent" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+    return 0
+}
+
 # Plans where an episode file belongs: <show folder>/Season XX/ (the rules are
 # in the header's "Episode folder layout"). Sets EP_DEST_DIR (empty = rename in
 # place), EP_TRACK_DIR (the show folder for the directory pass, or empty) and
 # EP_SHOW_NAME (the "Series (YYYY)" name for a show folder whose own name has
 # no year). Arguments: the file's directory, series title, zero-padded season,
 # and the year from the file's own name (may be empty). With no show folder
-# and no year, nothing is guessed and the file is renamed in place. Returns 2
+# and no year, the new show folder is named without a year. Returns 2
 # if a folder can't be statted, else 0. Clobbers PARSED_OK, PARSED_TITLE and
 # PARSED_YEAR; plan_episode_destination below restores the episode fields.
 _plan_episode_destination() {
@@ -1099,6 +1148,8 @@ _plan_episode_destination() {
         fi
         if [[ "$(norm_title "$ftitle")" == "$(norm_title "$series")" ]]; then
             show_dir="$fdir"
+        elif folder_names_series "$base" "$series"; then
+            container="$(dirname "$fdir")"
         else
             container="$fdir"
         fi
@@ -1111,8 +1162,11 @@ _plan_episode_destination() {
         fi
         EP_DEST_DIR="${show_dir}/Season ${season}"
         EP_TRACK_DIR="$show_dir"
-    elif [[ -n "$file_year" ]]; then
-        EP_DEST_DIR="${container}/${series} (${file_year})/Season ${season}"
+    else
+        local series_dir=""
+        [[ -z "$file_year" ]] && series_dir="$(find_series_dir "$container" "$series")"
+        : "${series_dir:=${container}/${series}${file_year:+ (${file_year})}}"
+        EP_DEST_DIR="${series_dir}/Season ${season}"
     fi
     return 0
 }
