@@ -10,25 +10,16 @@
 #   -n              Dry run: print decisions, do not rename (default: off)
 #   -f              Force: overwrite destination if a rename target already
 #                   exists (default: off — collisions are skipped and logged).
-#                   Applies to files only — a directory-rename collision
-#                   is always skipped regardless of -f, since mv nests a
-#                   directory inside an existing target rather than
-#                   replacing it; forcing that would risk silently merging
-#                   or shadowing files already in the destination
-#   -F              Files only: skip renaming containing directories AND
-#                   skip all franchise-folder and Season-folder restructuring (default: off —
-#                   directories are renamed alongside their matched files,
-#                   and folders are created/moved as described in
-#                   "Franchise-folder restructuring" below). With -F, a
-#                   file is only ever renamed in place, never moved.
+#                   Applies to files only: a directory-rename collision is
+#                   always skipped, since mv nests a directory inside an
+#                   existing target rather than replacing it
+#   -F              Files only: rename in place; skip renaming containing
+#                   directories and all franchise-folder and Season-folder
+#                   restructuring (default: off — see "Franchise-folder
+#                   restructuring" and "Episode folder layout" below)
 #   -O DIR          Operational directory: base for logs (OPDIR/Logs) and the
-#                   lock file (OPDIR/.locks) — never <target_dir> itself.
-#                   Default: this script's own directory. When invoked
-#                   through rename.sh/rename_dry.sh, set to $DOWNLOADS_BASE
-#                   (config.sh's own base for the rename pipeline's source
-#                   directory, $DOWNLOADS_BASE/Complete — separate from
-#                   $OUTPUT_DIR, which is encoder_params.sh's own
-#                   operational directory for the video-library pipeline)
+#                   lock file (OPDIR/.locks), never <target_dir> itself.
+#                   Default: this script's own directory
 #   -L DIR          Log directory, overriding OPDIR/Logs specifically
 #   -h              Show this help
 #
@@ -37,245 +28,147 @@
 #     Ubuntu/Debian has this by default), and sha256sum
 #   • Only one run may target a given <target_dir> at a time; a second run
 #     against the same directory exits immediately instead of racing on
-#     shared rename targets. Unlike encoder_params.sh, the lock file itself
-#     lives in this script's own directory (hashed from <target_dir>'s
-#     canonical path), not inside <target_dir> — see "Concurrency lock" note
-#     near LOCK_DIR below
-#   • Subtitle language tags are normalized against lang_table.sh (shared
-#     with encoder_params.sh's -l flag and sidecar lookup, same directory)
-#     — e.g. .eng.srt and .fre.srt become .en.srt and .fr.srt
-#   • Requires lang_table.sh and lang_table.tsv alongside this script
-#   • Subtitle modifiers are only ever written as cc, sdh, or forced — the
-#     exact three literal forms encoder_params.sh's discover_sidecar_subs()
-#     matches. Anything else (unrecognized language, unrecognized modifier)
-#     is skipped rather than guessed, since a wrong guess here means the
-#     encoder silently drops that subtitle later with no error of its own.
+#     shared rename targets (see "Concurrency lock" below)
+#   • Requires lang_table.sh and lang_table.tsv alongside this script.
+#     Subtitle language tags are normalized against them: .eng.srt and
+#     .fre.srt become .en.srt and .fr.srt
+#   • Subtitle modifiers are only ever written as cc, sdh, or forced, the
+#     three forms the encoder's sidecar-subtitle lookup matches. Anything
+#     else (unrecognized language or modifier) is skipped rather than
+#     guessed, since a wrong guess makes the encoder silently drop that
+#     subtitle later with no error of its own.
 #
 # Name parsing:
 #   A name is split at its LAST standalone 4-digit year (1900-2099), bounded
-#   on both sides by a non-alphanumeric character or string edge - so 2160p
-#   (resolution) and x265 (codec) never match, but a bare year like "2015"
-#   in "Movie Title 2015 1080p BluRay x265-GROUP" does. Everything before
-#   the year is the title; everything after is release-tag junk (resolution,
-#   source, codec, release group) and is discarded rather than parsed, since
-#   discarding doesn't require knowing every tag vocabulary in use. This also
-#   handles the already-Plex-formatted case ("Title (2020)") unchanged, since
-#   parentheses are non-alphanumeric boundaries too.
-#   Order of operations, before year detection: (1) "[...]" groups are read
-#   first. A group whose whole content is a year, an edition marker, an
-#   SxxEyy token or an episode number is promoted into the name ("[2010]"
-#   becomes "(2010)", "[Extended Cut]" becomes "(Extended Cut)", "[01]"
-#   becomes " - 01"); every other group (resolution, hash, release group) is
-#   dropped. (2) "(S01E01)" and "{S01E01}" are unwrapped and other "{...}"
-#   groups dropped, except Plex's own "{edition-X}". (3) A leading
-#   site-announcement prefix (e.g. "www.example.org    -    ") is removed.
-#   (4) Tabs and non-breaking spaces become spaces, runs of spaces collapse,
-#   and both ends are trimmed. Only then are edition, year and episode read
-#   from what is left. A name with no whitespace, dots or underscores is
-#   hyphen-delimited ("Movie-Name-2010-1080p"), and its title hyphens are
-#   read as word separators; in any other style hyphens stay in the title
-#   ("Spider-Man.2002.1080p" keeps its hyphen).
-#   Known limitation: if a title itself contains a 4-digit number that looks
-#   like a year (e.g. a title such as "Movie 2049"), the LAST standalone
-#   year in the string wins, which is correct as long as the real release
-#   year appears after the title (true for every case tested, including
-#   that one - the in-title number stays in the title, the actual later
-#   release year is the year used).
-#   A title ending in a real year with nothing after it (e.g. a file already
-#   named exactly "Movie 2049.mkv" for a movie actually titled "Movie") is
-#   the one case this can't disambiguate; that's not distinguishable from a
-#   correct match without an external metadata lookup, which this script
-#   deliberately doesn't do.
+#   by non-alphanumeric characters or the string edge, so 2160p and x265
+#   never match but "2015" in "Movie Title 2015 1080p BluRay x265-GROUP"
+#   does. Everything before the year is the title; everything after is
+#   release-tag junk and is discarded unparsed, which avoids having to know
+#   every tag vocabulary in use. "Title (2020)" parses the same way, since
+#   parentheses are non-alphanumeric boundaries.
 #
-#   Year-FIRST names: if nothing usable is left before the year (e.g.
-#   "(2020) Movie Name" or "2020 Movie Name"), the title is taken from
-#   everything AFTER the year instead. This is tried only as a fallback
-#   when the year-last interpretation comes up empty, so it never competes
-#   with or overrides the normal year-last case - a name like
-#   "Movie Title (2020)" still parses as year-last exactly as before.
+#   Cleaning order, before any year, edition or episode is read:
+#   (1) "[...]" groups are read first. A group whose whole content is a year,
+#   an edition marker, an SxxEyy token or an episode number is promoted into
+#   the name ("[2010]" becomes "(2010)", "[Extended Cut]" becomes "(Extended
+#   Cut)", "[01]" becomes " - 01"); every other group (resolution, hash,
+#   release group) is dropped. (2) "(S01E01)" and "{S01E01}" are unwrapped
+#   and other "{...}" groups dropped, except Plex's own "{edition-X}".
+#   (3) A leading site-announcement prefix (e.g. "www.example.org    -    ")
+#   is removed. (4) Tabs and non-breaking spaces become spaces, runs of
+#   spaces collapse, and both ends are trimmed.
+#   A name with no whitespace, dots or underscores is hyphen-delimited
+#   ("Movie-Name-2010-1080p") and its title hyphens are word separators; in
+#   any other style hyphens stay in the title ("Spider-Man.2002.1080p").
 #
-#   Delimited spec blocks: any COMPLETE "(...)" or "[...]" group within the
-#   title portion is stripped entirely, not just trimmed - this handles
-#   third-party encoders that tack on a spec block instead of (or in
-#   addition to) a plain year, e.g. "Movie Name (1080p x264 AAC BluRay
-#   EncoderName).mkv" or "Movie Name (1080p x264 AAC BluRay EncoderName)
-#   (2020).mkv". Year detection always runs on the untouched name first, so
-#   a year sitting inside such a block (e.g. "Movie Name (2020 1080p x264
-#   AAC BluRay EncoderName).mkv") is still found regardless of where it
-#   appears - this stripping only removes the leftover non-year text once
-#   the title portion is known. Known limitation: this can't distinguish an
-#   encoder's spec parentheses from parentheses that are genuinely part of
-#   a title (e.g. a movie actually titled "Movie (Part Two)") - both are
-#   stripped, since telling them apart would need an external metadata
-#   lookup this script deliberately doesn't do.
+#   Known limitation: a 4-digit number inside a title ("Movie 2049 (2017)")
+#   stays in the title because the last year wins. A name that ends in such a
+#   number with nothing after it ("Movie 2049.mkv") cannot be told from a
+#   real year without a metadata lookup, which this script does not do.
 #
-#   Edition/cut markers: the "{edition-X}" bracket syntax is Plex's own
-#   convention and won't already exist on a file before this script runs -
-#   relying on it alone would mean editions are silently dropped on every
-#   real-world input. Instead, a comprehensive list of recognized freeform
-#   markers (Director's Cut/DC, Extended Edition/Cut, Theatrical, Uncut,
-#   Uncensored, Unrated, Open Matte, Special/Ultimate/Collector's/
-#   Diamond/Platinum/Definitive Edition, Final/Assembly Cut, International
-#   Cut, Criterion, Remastered, Redux, and ordinal-numbered Anniversary
-#   Editions - see EDITION_PATTERNS and check_anniversary_edition near
-#   parse_media_name) is scanned for BEFORE year detection or any title
-#   stripping, on either side of the year and whether or not it sits
-#   inside a delimited spec block - e.g. both "Movie Name 1979 DC (1080p...)"
-#   and "Movie Name (2000) Uncut (1080p...)" have their edition
-#   recognized and removed before the title or year is ever touched.
-#   "{edition-X}" is still checked first when present and takes precedence
-#   over a freeform match, and is kept exactly as written.
-#   Several markers in one name are all kept, joined by spaces into one
-#   label - "Movie Name 2010 Remastered Extended Edition" becomes
-#   "Movie Name (2010) {edition-Extended Remastered}". Labels are
-#   sorted alphabetically (case-insensitive), except Remastered, which is
-#   always last; a label found twice (e.g. "DC" and "Director's Cut") is kept
-#   once. Labels leave out the words "Edition" and "Cut" - "Extended
-#   Edition" and "Extended Cut" are both "Extended", "Special Edition" is
-#   "Special", "25th Anniversary Edition" is "25th Anniversary" - except for
-#   possessive names, which keep theirs: "Director's Cut" and "Collector's
-#   Edition". Each label is the one EDITION_PATTERNS maps its marker to.
-#   Known limitation: a handful of bare fallback
-#   words (Extended, Theatrical, DC) also match inside a related but
-#   distinct label that doesn't have its own dedicated entry - "Extended
-#   Version" isn't listed explicitly, so it falls through to the bare
-#   "Extended" pattern and is recorded as "Extended" rather than kept
-#   verbatim. An "{edition-X}" tag already on a name is kept exactly as
-#   written. Every marker in the name is collected, so a title word that
-#   happens to be one of these keywords (e.g. "Redux") is pulled into the
-#   edition rather than left in the title. See EDITION_PATTERNS itself for
-#   the exact list and ordering.
+#   Year-first names ("(2020) Movie Name", "2020 Movie Name") take the title
+#   from the text after the year, only when nothing usable precedes it.
+#
+#   Delimited spec blocks: complete "(...)" groups in the title portion are
+#   removed, which drops encoder spec blocks such as "(1080p x264 AAC BluRay
+#   EncoderName)". The year is found first, so one inside such a block
+#   ("(2020 1080p x264)") still counts. Known limitation: a title's own
+#   parentheses ("Movie (Part Two)") are removed too, since telling them
+#   apart needs the same metadata lookup.
+#
+#   Edition markers are matched as freeform keywords anywhere in the name,
+#   before the year or title is touched, and written as one "{edition-X}"
+#   label: "Movie Name 2010 Remastered Extended Edition" becomes "Movie Name
+#   (2010) {edition-Extended Remastered}". An "{edition-X}" tag already on a
+#   name takes precedence and is kept as written. EDITION_PATTERNS holds the
+#   marker list, the label rules and the known limitations.
 #
 # Franchise-folder restructuring (movies only):
-#   Target Plex layout: <library>/Franchise Name/Movie Name (YYYY)/Movie
-#   Name (YYYY).mkv. The franchise folder defaults to the bare movie title
-#   (no year) and this script NEVER renames an existing franchise folder -
-#   only ever creates one when none exists, so a franchise folder a user
-#   has manually renamed (e.g. to an actual series name shared by several
-#   movies) is never touched.
+#   Target layout: <library>/Franchise Name/Movie Name (YYYY)/Movie Name
+#   (YYYY).mkv. The franchise folder defaults to the bare movie title. An
+#   existing franchise folder is never renamed, only created when absent, so
+#   one renamed by hand (e.g. to a series name shared by several movies) is
+#   safe.
 #
-#   Each movie file has two independent possible sources of title/year: its
-#   own name, and its immediate parent folder's name (same year-first/
-#   year-last parsing as everywhere else in this script). The file's own
-#   name wins whenever it has a usable year; the parent folder is only
-#   consulted when the file's own name doesn't have one, and only when that
-#   folder holds exactly one video file - several videos in one folder
-#   would all resolve to the same movie name, so a year-less file in a
-#   folder with other videos is NO_MATCH instead.
+#   A movie's title and year come from its own name, else from its immediate
+#   parent folder's name. The parent is consulted only when the file's own
+#   name has no year and the folder holds exactly one video, because several
+#   videos would resolve to the same movie name; otherwise the file is
+#   NO_MATCH.
+#   - Parent folder has a year: the file and the folder are renamed in
+#     place. If the folder sits directly in the scanned directory, a
+#     franchise folder is created and the movie folder moved into it. With
+#     any other parent, it is assumed to be in a franchise folder already and
+#     nothing above it is touched.
+#   - Parent folder has no year, the file's name does: the file moves into a
+#     new "Movie Name (YYYY)" folder. A file loose in the scanned directory
+#     also gets a new franchise folder around that.
+#   - Neither has a year: NO_MATCH; nothing is inferred or moved.
+#   Episodes never get a franchise wrapper. -F disables all restructuring.
 #
-#   - Parent folder IS movie-shaped (has its own year): the file is renamed
-#     in place, and the folder itself is renamed in place to canonical
-#     form. If that folder sits directly in the scanned target directory
-#     (no franchise folder above it yet), a new franchise folder is created
-#     and the whole movie folder is moved into it. If the folder already
-#     has any other parent, it's assumed to already be sitting inside a
-#     franchise folder (default or custom-named) and nothing above it is
-#     touched.
-#   - Parent folder is NOT movie-shaped, but the file's own name has a
-#     year: the file is relocated into a freshly created "Movie Name
-#     (YYYY)" folder. If the file was sitting loose directly in the
-#     scanned target directory with no per-movie folder at all, a
-#     franchise folder is created too and the movie folder nests inside it.
-#   - Neither the file's own name nor its parent folder has a usable year:
-#     nothing is inferred or moved - same NO_MATCH as always.
-#
-#   This is scoped to movies only - a TV episode's SxxEyy token is always
-#   on the episode file itself in every layout this script targets, and
-#   show-root folders never get a franchise wrapper inserted.
-#   Known limitation: a subtitle sidecar is only relocated this way if ITS
-#   OWN name (after the language tag is stripped) independently carries a
-#   year. A subtitle with no year in its own name, sitting loose next to a
-#   correctly-named video, is not correlated with that video and is left
-#   as NO_MATCH - this script doesn't cross-reference sidecar subtitles
-#   against a video file's resolved title/year.
-#   -F disables all of this: files are only ever renamed in place, and no
-#   folders are renamed, created, or moved.
-#   The directory the script was invoked against is never itself a rename
-#   target, even if it ends up in the directory pass's candidate set -
-#   which can only happen if a loose file directly inside it has no year
-#   of its own and falls back to the root's own folder name (only possible
-#   if that name happens to look movie/show-shaped, e.g. a root literally
-#   named "Downloads (2020)"). Known limitation: that guard protects the
-#   directory itself, but not the file - in that same narrow scenario the
-#   loose file's own name can still end up derived from the root folder's
-#   name rather than being left as NO_MATCH, since the file-naming fallback
-#   and the directory-rename safeguard are deliberately independent checks.
+#   Known limitations: a subtitle sidecar is relocated only if its own name
+#   (after the language tag) has a year, because sidecars are not matched to
+#   a video's resolved title; a year-less subtitle next to a correctly named
+#   video is NO_MATCH. The scanned directory is never a rename target, but a
+#   loose year-less file in a root named like a movie ("Downloads (2020)")
+#   can still take its name from the root, since the file-naming fallback and
+#   the directory guard are independent checks.
 #
 # TV episodes:
-#   A name is routed to episode parsing instead of movie parsing if it
-#   contains a standalone SxxEyy token (S + 1-2 digit season, E + 1-3 digit
-#   episode), checked BEFORE year-based movie parsing runs at all - so a
-#   show whose title itself is a bare year (e.g. a show titled "2000") is
-#   never misparsed as a movie. Everything before SxxEyy is the series title
-#   (junk-stripped like a movie title); season/episode are zero-padded from
-#   the token itself. Output: "Series - SxxEyy - Episode Title.ext", or just
-#   "Series - SxxEyy.ext" with no title segment - see below for why.
-#   Episode title is genuinely harder than a movie's year: there's no
-#   structural anchor marking where a title ends and release-tag junk
-#   begins, since scene-release TV naming almost always omits the episode
-#   title entirely and goes straight from SxxEyy to quality tags. This uses
-#   the presence of a literal hyphen in the separator immediately after
-#   SxxEyy as that anchor: "S03E01 - Real Title" keeps everything after as
-#   the title; "S03E01.1080p.WEB-DL.x264-GROUP" (no hyphen right after the
-#   token) discards everything after, same as movie junk. Known limitation:
-#   a raw release that includes BOTH a real episode title AND trailing
-#   quality tags, hyphen-delimited from SxxEyy (e.g. "S03E01 - Title
-#   1080p WEB-DL x264-GROUP"), has no way to tell where the title ends and
-#   the tags begin without either enumerating tag vocabulary (which this
-#   script deliberately avoids elsewhere) or an external episode-title
-#   database - the whole trailing text is kept as-is in that case.
-#   Both the series title and the episode title go through the same
-#   delimited-spec-block stripping as movie titles (see "Delimited spec
-#   blocks" above), so an encoder tag like "Show Name (1080p x264
-#   EncoderName) S01E01.mkv" or "S01E01 - Real Title (1080p x264
-#   EncoderName)" has that block removed rather than folded into the name.
-#   Multi-episode files (S01E01E02, S01E01-E02) and fractional episodes
-#   (S01E17.5) are not recognized; treated as NO_MATCH, not guessed at.
+#   A name with a standalone SxxEyy token (S + 1-2 digit season, E + 1-3
+#   digit episode) is parsed as an episode before any year-based movie
+#   parsing, so a show titled with a bare year ("2000") is never read as a
+#   movie. Everything before the token is the series title; season and
+#   episode are zero-padded from the token. Output: "Series - SxxEyy -
+#   Episode Title.ext", or "Series - SxxEyy.ext" with no title.
+#   A hyphen in the separator right after SxxEyy marks an episode title
+#   ("S03E01 - Real Title" keeps everything after it); without one,
+#   everything after is discarded as junk ("S03E01.1080p.WEB-DL.x264-GROUP").
+#   Known limitation: a hyphen-delimited title followed by quality tags
+#   ("S03E01 - Title 1080p WEB-DL x264-GROUP") is kept whole, since telling
+#   them apart needs tag vocabulary or an episode-title database.
+#   Spec blocks are stripped from series and episode titles as for movies.
+#   Multi-episode (S01E01E02, S01E01-E02) and fractional (S01E17.5) numbering
+#   is NO_MATCH, not guessed at.
 #
-#   Inferred episode numbering: a name with no SxxEyy token is still read as
-#   an episode when it carries an "Episode N" / "Ep N" token (optionally
-#   preceded by "Season N") or ends in " - NN" (optionally followed by "(...)"
-#   groups such as "(BD 1080p)"; a year there marks a movie, not an episode),
-#   or, for a name with no whitespace, ends in a dot, underscore or hyphen
-#   plus two or three digits ("Show.Name.01", "Show-Name-01"), AND at least
-#   two videos in the same folder share the same name apart from that number
-#   (see build_episode_stems; counted once before any rename, so the whole
-#   series stays confirmed as its earlier files are renamed). A lone
-#   numbered file is never inferred to be an episode, since a bare number is
-#   equally a sequel or part number in a
-#   movie title and nothing in a single name distinguishes the two. A
-#   confirmed name is rewritten to "Title SxxEyy" form and then handled by
-#   the normal episode parser, so every episode rule here applies to it
-#   unchanged. Season comes from a "Season N" token in the name, else a
-#   "Season NN" parent folder, else 1. When nothing precedes the number, the
-#   title is the show folder's name (the parent of a "Season NN" folder,
-#   otherwise the folder holding the file). Known limitations: the season
-#   default of 1 is a guess when no "Season" token or folder exists; two
-#   movie sequels sharing a folder ("Title - 1", "Title - 2") have the same
-#   structure as episodes and are read as episodes; a series with a single
-#   unrenamed file remaining (the rest already named) has too few siblings
-#   to confirm and is NO_MATCH.
+#   Inferred episode numbering: a name with no SxxEyy token is read as an
+#   episode when it ends in one of the following AND at least two videos in
+#   the same folder share the rest of the name:
+#   - "Episode N" or "Ep N", optionally preceded by "Season N";
+#   - " - NN", optionally followed by "(...)" groups such as "(BD 1080p)"
+#     (a year there marks a movie, not an episode);
+#   - a dot, underscore or hyphen plus two or three digits, in a name with
+#     no whitespace ("Show.Name.01", "Show-Name-01").
+#   Siblings are counted once before any rename (build_episode_stems), so the
+#   whole series stays confirmed as its files are renamed. A lone numbered
+#   file is never inferred to be an episode, since a bare number is equally a
+#   sequel or part number. A confirmed name is rewritten to "Title SxxEyy"
+#   and parsed like any episode. Season comes from a "Season N" token, else a
+#   "Season NN" parent folder, else 1. With no title before the number, the
+#   show folder's name is the title.
+#   Known limitations: season 1 is a guess when nothing names a season; movie
+#   sequels sharing a folder ("Title - 1", "Title - 2") look like episodes; a
+#   series with one unrenamed file left has too few siblings to confirm and
+#   is NO_MATCH.
 #
 #   Episode folder layout: every episode video and subtitle is placed at
 #   <Series Name (YYYY)>/Season XX/<Series Name - SxxEyy>.<ext>. The season
 #   folder always comes from the file's own SxxEyy token (zero-padded, so a
-#   file in "Season 1" moves to "Season 01"), and a folder left empty by
-#   such a move is removed. The show folder is found as follows:
+#   file in "Season 1" moves to "Season 01"), and a folder left empty by such
+#   a move is removed. The show folder is found as follows:
 #     - file in a "Season NN" folder: that folder's parent;
 #     - file flat in a folder whose title matches the series: that folder;
 #     - otherwise (loose in the scanned root, a "Season NN" folder directly
 #       in the root, or a folder holding unrelated things): a new
 #       "Series (YYYY)" folder is created inside it.
-#   The show folder is renamed with the same movie-style title + year logic a
-#   standalone movie folder gets, and never gets a franchise wrapper (that's
-#   movie-only). The year comes from the show folder's name, or - when the
-#   folder has none - from a year in the episode's own file name, which also
-#   names the folder. A new show folder needs the file name's year. With no
-#   year anywhere, nothing is guessed: an existing show folder keeps its
-#   name and still gets its "Season XX" subfolder, and a file with no show
-#   folder is renamed in place. A "Season NN" folder whose number differs
-#   from the file's token is not trusted; the file moves to the folder its
-#   token names. -F disables all of this and renames in place only.
+#   The show folder is renamed with the same title + year logic as a movie
+#   folder. Its year comes from its own name, else from a year in the
+#   episode's file name, which also names a new folder. With no year
+#   anywhere, nothing is guessed: an existing show folder keeps its name and
+#   still gets its "Season XX" subfolder, and a file with no show folder is
+#   renamed in place. A "Season NN" folder whose number differs from the
+#   file's token is not trusted; the file moves to the folder its token
+#   names.
 
 set -euo pipefail
 
@@ -340,15 +233,11 @@ grep -oP 'x' <<< 'x' &>/dev/null || {
     exit 1
 }
 
-# Concurrency lock: only one run may target a given TARGET_DIR at a time.
-# The lock file itself lives under OPERATIONAL_DIR (default: this script's
-# own directory; -O to route it elsewhere, e.g. $DOWNLOADS_BASE when invoked
-# through rename.sh/rename_dry.sh), never inside TARGET_DIR — a movie
-# library shouldn't have operational files (lock, logs) scattered into it.
-# The lock is still correctly scoped per-target: its filename is a hash of
-# TARGET_DIR's canonical path, so two runs against the same directory (from
-# anywhere, any relative path) still collide, and runs against different
-# directories don't.
+# Concurrency lock: only one run may target a given TARGET_DIR at a time. The
+# lock file lives under OPERATIONAL_DIR, never inside TARGET_DIR, so a library
+# holds no operational files. Its name is a hash of TARGET_DIR's canonical
+# path, so any spelling of the same directory collides and different
+# directories do not.
 LOCK_DIR="${OPERATIONAL_DIR}/.locks"
 mkdir -p -- "$LOCK_DIR"
 LOCK_HASH="$(printf '%s' "$TARGET_DIR_REAL" | sha256sum | cut -d' ' -f1)"
@@ -358,21 +247,12 @@ if ! flock -n 9; then
     echo "ERROR: another run is already active against $TARGET_DIR (lock: $LOCK_FILE)" >&2
     exit 1
 fi
-# Registered only after successfully acquiring the lock (a failed acquisition
-# above exits before this line, so it never deletes another process's active
-# lock file). Removes the now-empty .lock file on any exit - normal, error,
-# or signal (bash runs EXIT traps even on SIGINT/SIGTERM; only SIGKILL skips
-# them, which nothing here can protect against anyway). Releasing the fd
-# alone (which happens automatically at process exit regardless) frees the
-# advisory lock; this additionally deletes the file itself so .locks/ doesn't
-# accumulate a permanent empty file per target directory ever rename-batched.
-# Small accepted race: if another process opens+locks this exact path in the
-# instant between this process's last real work and this trap firing, the
-# unlink here would remove the path out from under it, and a third process
-# could then create a fresh file at the same path and lock that too. For a
-# single-user batch tool where runs are seconds apart at minimum, this window
-# is negligible - the same tradeoff most lock-file cleanup implementations
-# accept in exchange for not leaving permanent clutter behind.
+# Registered only after the lock is acquired, so a failed acquisition never
+# deletes another process's lock file. Removes the lock file on any exit,
+# including SIGINT and SIGTERM (EXIT traps run on both; SIGKILL skips them).
+# Accepted race: a process that locks this path between the last real work
+# and this trap can have the file unlinked from under it; for a single-user
+# batch tool that window is negligible.
 trap 'rm -f "$LOCK_FILE" 2>/dev/null || true' EXIT
 
 # Extensions
@@ -380,7 +260,7 @@ VIDEO_EXTS="mkv|mp4|avi|mov|m4v"
 SUB_EXTS="srt|vtt|ass|idx|sub"
 ALL_EXTS="${VIDEO_EXTS}|${SUB_EXTS}"
 
-# Language alias table - shared with encoder_params.sh, same directory.
+# Language alias table (lang_table.sh, alongside this script).
 # shellcheck source=./lang_table.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lang_table.sh"
 
@@ -519,16 +399,12 @@ byte_to_char_offset() {
     printf '%s' "${#prefix}"
 }
 
-# Finds the LAST standalone 4-digit year (1900-2099) in a string, per the
-# boundary rule in "Name parsing" above: not immediately preceded or
-# followed by another alphanumeric character, so "2160p" and "x265" never
-# match. Sets YEAR_MATCH and YEAR_OFFSET (character offset of the match within
-# the input); both empty if no standalone year is present. grep exits 1 on
-# no match; `|| true` stops that from tripping set -e/pipefail (same class
-# of issue encoder_params.sh's own Design Notes document covers for its
-# main-loop return-code handling). Shared by parse_media_name and
-# parse_episode_name's redundant-year stripping - both want the same "last
-# standalone year" detection, just applied to different substrings.
+# Finds the LAST standalone 4-digit year (1900-2099) in a string: not
+# immediately preceded or followed by another alphanumeric character, so
+# "2160p" and "x265" never match. Sets YEAR_MATCH and YEAR_OFFSET (character
+# offset within the input); both are empty when there is none. `|| true`
+# keeps grep's exit 1 on no match from tripping set -e/pipefail. Shared by
+# the movie parser, the episode parser and the bare-number episode check.
 find_last_year() {
     local raw="$1"
     YEAR_MATCH=""; YEAR_OFFSET=""
@@ -540,41 +416,28 @@ find_last_year() {
     YEAR_OFFSET="$(byte_to_char_offset "$raw" "${off%%:*}")"
 }
 
-# Cleans a raw title/series-title fragment: dots, underscores, and slashes
-# become spaces, runs of whitespace collapse to one space, and
-# leading/trailing whitespace or hyphens are trimmed. The slash handling
-# specifically guards every title this script produces (PARSED_TITLE,
-# PARSED_SERIES, PARSED_EPTITLE) against ever containing a literal "/" -
-# titles are used directly as directory and file name components
-# (franchise folders, movie-year folders, filenames), and a stray "/"
-# there would otherwise be silently read as an extra path separator by
-# mkdir/mv rather than as part of the name. Shared by every title-shaped
-# fragment this script produces (movie titles both year-last and
-# year-first, series titles, episode titles) so the same cleanup rule
-# applies everywhere.
+# Cleans a title fragment: dots, underscores and slashes become spaces, runs
+# of whitespace collapse, and leading/trailing whitespace and hyphens are
+# trimmed. Slashes are replaced because titles become directory and file name
+# components, where a literal "/" would be read as a path separator.
 clean_fragment() {
     local s
     s="$(tr '._/' '   ' <<< "$1" | tr -s ' ')"
     sed -E 's/^[[:space:]-]+//; s/[[:space:]-]+$//' <<< "$s"
 }
 
-# Removes every COMPLETE (...) or [...] group from a string (both
-# delimiters present in the input; a lone unmatched "(" or ")" left behind
-# by splitting a string at a year is untouched here - that's handled
-# separately, see parse_media_name). Used to strip third-party-encoder spec
-# blocks like "(1080p x264 AAC BluRay EncoderName)" out of a title before
-# it's used, so they never end up as part of a movie's parsed name.
+# Removes every complete (...) or [...] group, which drops encoder spec
+# blocks like "(1080p x264 AAC BluRay EncoderName)" from a title. A lone
+# "(" or ")" left by splitting at a year is untouched here; see
+# parse_media_name.
 strip_delimited_groups() {
     sed -E 's/\([^()]*\)//g; s/\[[^][]*\]//g' <<< "$1"
 }
 
-# Runs strip_delimited_groups then clean_fragment in sequence - the pairing
-# used everywhere a parsed title/series-title/episode-title fragment is
-# finalized. TRIM_CHAR/TRIM_SIDE ("leading" or "trailing") optionally strip
-# one character in between the two steps: the lone "(" or ")" left behind
-# when a movie title is split right at an already-parenthesized year (see
-# parse_media_name) - unused by series and episode titles, which never have
-# this to trim.
+# Runs strip_delimited_groups then clean_fragment, the pairing used wherever a
+# title fragment is finalized. TRIM_CHAR and TRIM_SIDE ("leading" or
+# "trailing") optionally remove one character in between: the lone "(" or ")"
+# left when a movie title is split right at an already-parenthesized year.
 strip_and_clean() {
     local s="$1" trim_char="${2:-}" trim_side="${3:-}"
     s="$(strip_delimited_groups "$s")"
@@ -585,31 +448,33 @@ strip_and_clean() {
     clean_fragment "$s"
 }
 
-# Recognized edition/cut markers, checked as freeform text anywhere in a
-# name - not just the "{edition-X}" bracket syntax, which won't already
-# exist on a file before this script runs. Each entry is "<PCRE>::<label>",
-# matched case-insensitively; one entry per label, with every spelling of
-# that marker folded into its pattern - e.g. "extended" alone, "extended
-# cut" and "extended edition" are all the one "Extended" entry. Labels
-# leave out "Edition"/"Cut"/"Version", so every marker that can be followed
-# by one of those words swallows it as an optional suffix; otherwise the
-# word would be left behind in the title. "[ ._-]" between words tolerates plain spaces as
-# well as the dot/underscore/hyphen-separated scene-naming style (e.g.
-# "Directors.Cut" or "Open_Matte"). Ordinal-numbered anniversary editions
-# ("25th Anniversary Edition") are handled separately, in
-# check_anniversary_edition below, since the number itself has to be
-# captured and reproduced rather than mapped to one fixed label.
-#
-# Entries are alphabetical by label with ONE exception: "Ultimate Extended
-# Edition" contains the "Extended" marker, and extract_known_edition removes
-# each match from the text before running the next entry, so it has to come
-# first or "Extended" would claim part of it and the word "Ultimate" would
-# be lost. Nothing else in the list is a fragment of another entry; when
-# adding one, check that before placing it alphabetically.
-# Known limitation, an accepted tradeoff of matching by keyword at all: the
-# bare words (Extended, Theatrical, DC) match inside a related but distinct
-# label that doesn't have its own dedicated entry, and are recorded under
-# the shorter label rather than kept verbatim.
+# Recognized edition/cut markers, matched as freeform text anywhere in a name
+# (the "{edition-X}" syntax is Plex's own and is not on a file before this
+# script runs). Each entry is "<PCRE>::<label>", matched case-insensitively,
+# one entry per label with every spelling of that marker folded into its
+# pattern.
+#   - Labels omit "Edition", "Cut" and "Version" ("Extended Cut" and
+#     "Extended Edition" are both "Extended"), except possessive names, which
+#     keep theirs: "Director's Cut", "Collector's Edition". A marker that can
+#     be followed by one of those words swallows it as an optional suffix, or
+#     the word would stay behind in the title.
+#   - Several markers in a name are all kept, joined alphabetically
+#     (case-insensitive) with Remastered last; a label found twice ("DC" and
+#     "Director's Cut") is kept once.
+#   - "[ ._-]" between words accepts spaces and scene-style dot, underscore
+#     or hyphen separators.
+#   - Ordinal anniversary editions ("25th Anniversary Edition") are handled
+#     in check_anniversary_edition, since the number is reproduced in the
+#     label.
+#   - Entries are alphabetical by label, except "Ultimate Extended Edition",
+#     which contains the "Extended" marker: extract_known_edition removes each
+#     match before running the next entry, so it must come first or
+#     "Extended" would claim part of it and "Ultimate" would be lost. Nothing
+#     else is a fragment of another entry; check that before adding one.
+# Known limitations: the bare words (Extended, Theatrical, DC) also match
+# inside a related but distinct label with no entry of its own ("Extended
+# Dance Mix"), which is recorded under the shorter label; and a title word
+# that is one of these keywords ("Redux") is pulled into the edition.
 EDITION_PATTERNS=(
     "ultimate[ ._-]extended(?:[ ._-](?:cut|edition))?::Ultimate Extended"   # pinned first, see above
 
@@ -635,17 +500,12 @@ EDITION_PATTERNS=(
     "unrated(?:[ ._-](?:cut|edition|version))?::Unrated"
 )
 
-# Ordinal-numbered anniversary editions ("25th Anniversary Edition", "40th
-# Anniversary Collector's Edition") can't be handled as a fixed pattern-to-
-# label entry in EDITION_PATTERNS above - there are too many real numbers
-# in circulation to enumerate, so the ordinal itself is captured out of the
-# match and reproduced in the label. A trailing "Edition"/"Collection" word
-# is matched (and removed along with the rest) but not reproduced - the
-# label is always normalized to "<N><suffix> Anniversary"
-# regardless of what, if anything, followed "Anniversary" in the source
-# text. Checked before EDITION_PATTERNS since it needs this different
-# handling; sets EDITION_LABEL only when it actually matches, leaving it
-# for the caller to fall through to the static list otherwise.
+# Matches an ordinal anniversary edition ("25th Anniversary Edition", "40th
+# Anniversary Collector's Edition") and reproduces the ordinal in the label as
+# "<N><suffix> Anniversary"; a trailing Edition/Collection word is removed
+# with the match but not reproduced. Ordinals can't be enumerated as
+# EDITION_PATTERNS entries, so this runs before the static list. Sets
+# EDITION_LABEL (empty without a match) and EDITION_RAW.
 check_anniversary_edition() {
     local raw="$1" match
     EDITION_LABEL=""
@@ -676,19 +536,14 @@ join_editions() {
     printf '%s' "$out"
 }
 
-# Scans RAW for every recognized edition marker - an ordinal-numbered
-# anniversary edition first (see check_anniversary_edition above), then each
-# entry of EDITION_PATTERNS in order. Each match is removed from the text
-# before the next pattern runs, so a specific phrase (e.g. "Ultimate
-# Extended Edition") claims its words and the shorter entries below it can't
-# match inside it again. Matches are collected rather than stopping at the
-# first, and combined by join_editions. Sets EDITION_LABEL (empty if nothing
-# matched) and EDITION_RAW (the input with all matched text removed,
-# unchanged if nothing matched). Called before year detection or any title
-# stripping in both parse_media_name and parse_episode_name, so an edition
-# marker is recognized regardless of where it sits relative to the year, and
-# never ends up folded into the title or discarded as an undifferentiated
-# release tag.
+# Scans RAW for every recognized edition marker: an ordinal anniversary
+# edition first, then each EDITION_PATTERNS entry in order. Each match is
+# removed before the next entry runs, so a specific phrase claims its words,
+# and every occurrence of a marker is removed, so a repeated marker leaves
+# nothing behind. Matches are combined by join_editions. Sets EDITION_LABEL
+# (empty if nothing matched) and EDITION_RAW (the input minus the matched
+# text). Called before year detection or title stripping in both parsers, so
+# a marker is found wherever it sits and never ends up in a title.
 extract_known_edition() {
     local raw="$1" entry pattern label match
     local -a found=()
@@ -728,13 +583,8 @@ parse_media_name() {
     local raw="$1"
     PARSED_OK=0; PARSED_TITLE=""; PARSED_YEAR=""; PARSED_EDITION=""
 
-    # The explicit "{edition-X}" bracket syntax takes precedence when
-    # present (unambiguous, already in final Plex form), and is checked
-    # first so a freeform match below never fires redundantly against
-    # text that's already been claimed as the edition. Falls back to
-    # freeform keyword matching (see EDITION_PATTERNS above) otherwise -
-    # the normal case, since raw downloads don't already carry
-    # "{edition-X}".
+    # An explicit "{edition-X}" tag wins and is kept as written; otherwise
+    # freeform markers are matched (see EDITION_PATTERNS).
     if [[ "$raw" =~ \{edition-([^}]+)\} ]]; then
         PARSED_EDITION="${BASH_REMATCH[1]}"
         raw="${raw/${BASH_REMATCH[0]}/}"
@@ -744,12 +594,9 @@ parse_media_name() {
         raw="$EDITION_RAW"
     fi
 
-    # Year detection always runs on the untouched string, BEFORE any
-    # delimiter stripping below - so a year is found no matter where it
-    # sits, including inside a third-party encoder's spec block (e.g.
-    # "Movie Name (2020 1080p x264 AAC BluRay EncoderName).mkv"). Only the
-    # leftover non-year text within delimiters is discarded, once the
-    # title portion is known - see below.
+    # Year detection runs with groups intact, so a year inside an encoder spec
+    # block ("Movie Name (2020 1080p x264)") is found. Non-year text inside
+    # groups is discarded once the title is known.
     find_last_year "$raw"
     [[ -z "$YEAR_MATCH" ]] && return
     local year_match="$YEAR_MATCH" offset="$YEAR_OFFSET"
@@ -760,14 +607,9 @@ parse_media_name() {
     title_part="$(strip_and_clean "$title_part" "(" trailing)"   # drop a wrapping "(" left by an already-parenthesized year
 
     if [[ -z "$title_part" ]]; then
-        # Nothing usable before the year - try year-FIRST instead of
-        # year-last: "(2020) Movie Name" / "2020 Movie Name", the shape a
-        # raw download's own folder is sometimes named. Title becomes
-        # everything AFTER the year instead of before it. A trailing ")"
-        # left by an already-parenthesized year is dropped the same way a
-        # leading "(" is dropped above. This only ever runs when the
-        # year-last interpretation came up empty, so a normal
-        # "Movie Title (2020)" name is unaffected and still parses year-last.
+        # Nothing usable before the year: take the title from the text after
+        # it ("(2020) Movie Name"). Only reached when year-last came up
+        # empty, so "Movie Title (2020)" always parses year-last.
         local after_offset=$(( offset + ${#year_match} ))
         title_part="${raw:$after_offset}"
         (( hyphens )) && title_part="${title_part//-/ }"
@@ -947,45 +789,25 @@ normalize_absolute_episode() {
 }
 
 # Core name parser for TV EPISODES. Sets PARSED_OK, PARSED_SERIES,
-# PARSED_SEASON, PARSED_EPISODE, PARSED_EPTITLE, PARSED_EDITION from an
-# already-prefix-stripped name with no extension. Only call this after
-# is_episode_shaped has confirmed an SxxEyy token is present.
-#
-# Series title = everything before the SxxEyy token (junk-stripped the same
-# way movie titles are, plus a redundant trailing year stripped out - Plex
-# episode filenames never carry the year, unlike movie filenames; see the
-# guard against stripping a show that's actually just named after a year,
-# e.g. a show titled "2000", in the code below). Season/episode = the
-# digits inside the token, zero-padded to at least 2 digits each (avoiding
-# bash's octal trap on inputs like "08"/"09" via the 10# base-10 forcing
-# prefix).
-#
-# Episode title is the hard part: unlike a movie's year, SxxEyy has no
-# structural signal marking where a real trailing episode title ends and
-# release-tag junk (resolution/source/codec/group) begins - scene-release
-# TV naming almost always omits the episode title entirely and goes
-# straight from SxxEyy to quality tags, while an already-Plex-formatted
-# name puts " - Episode Title" right after it with nothing further. This
-# uses that distinction as its own anchor: if what immediately follows
-# SxxEyy is a run of separators (space/dot/underscore) THAT INCLUDES A
-# LITERAL HYPHEN, everything after is treated as the episode title;
-# otherwise everything after is discarded as junk, same as a movie's
-# trailing tags. This mirrors the movie parser's approach of using a
-# structural anchor instead of enumerating junk vocabulary, but it is a
-# heuristic, not a guarantee - see the known limitation this creates,
-# noted in the header comment.
+# PARSED_SEASON, PARSED_EPISODE, PARSED_EPTITLE, PARSED_EDITION and
+# PARSED_YEAR from a cleaned name with no extension. Call only after
+# is_episode_shaped has confirmed an SxxEyy token.
+# The series title is everything before the token, cleaned like a movie
+# title, minus a redundant year (Plex episode names never carry one; a guard
+# below keeps a show titled with a year). Season and episode are zero-padded;
+# the 10# prefix forces base 10 so "08" and "09" are not read as octal.
+# The episode title is whatever follows a separator run containing a literal
+# hyphen; without one, everything after the token is discarded as junk.
+# SxxEyy gives no structural signal for where a title ends and release tags
+# begin, so this is a heuristic (see the header's known limitation).
 parse_episode_name() {
     local raw="$1"
     PARSED_OK=0; PARSED_SERIES=""; PARSED_SEASON=""; PARSED_EPISODE=""
     PARSED_EPTITLE=""; PARSED_EDITION=""; PARSED_YEAR=""
 
-    # Same freeform edition-marker recognition as the movie parser (see
-    # EDITION_PATTERNS above), checked first so a marker on either side of
-    # SxxEyy - "Show Name Director's Cut S01E01" or
-    # "Show Name S01E01 - Uncut" - is captured rather than becoming part of
-    # the series title or being discarded as junk. The literal "{edition-X}"
-    # bracket syntax is still also checked further below, scoped to just
-    # the trailing episode-title segment where it can appear.
+    # Edition markers on either side of SxxEyy ("Show Name Director's Cut
+    # S01E01", "Show Name S01E01 - Uncut") are captured here; a literal
+    # "{edition-X}" in the episode title is read further below.
     extract_known_edition "$raw"
     PARSED_EDITION="$EDITION_LABEL"
     raw="$EDITION_RAW"
@@ -1004,16 +826,9 @@ parse_episode_name() {
     local series_raw="${raw:0:$offset}"
     hyphen_delimited "$raw" && series_raw="${series_raw//-/ }"
 
-    # Strip a redundant year from the series-title segment: Plex episode
-    # filenames don't carry the year (only the show-root folder does), but
-    # raw releases commonly repeat it right before SxxEyy anyway (e.g.
-    # "Show Title (2019) S03E13..." or "Show.Title.2019.S03E13...").
-    # Uses the same last-standalone-year detection as the movie parser.
-    # Guarded: if stripping would leave nothing meaningful behind, the
-    # strip is discarded and the year stays in the title - this is what
-    # keeps a show actually named after a year (e.g. a show titled "2000")
-    # intact, since there the "year" IS the whole title, not a redundant
-    # repeat.
+    # Strip a redundant year from the series title ("Show Title (2019) S03E13"):
+    # only the show folder carries the year. Discarded when nothing meaningful
+    # would remain, which keeps a show titled with a year ("2000") intact.
     find_last_year "$series_raw"
     if [[ -n "$YEAR_MATCH" ]]; then
         local candidate="${series_raw:0:$YEAR_OFFSET}"
@@ -1122,14 +937,10 @@ report_no_match() {
     NO_MATCH=$(( NO_MATCH + 1 ))
 }
 
-# Rename executor, shared by every call site (file loop, directory pass,
-# franchise-wrapper moves): handles the unchanged-path no-op, collision
-# check, dry-run preview, mv, and counters uniformly so every call site
-# stays in sync. The no-op check compares full PATHS, not just basenames,
-# since a rename target can legitimately share a basename with its source
-# while still needing to move to a different directory (franchise-folder
-# restructuring) - a basename-only comparison would wrongly treat that as
-# "nothing to do".
+# Rename executor shared by every call site: handles the unchanged-path no-op,
+# collision check, dry-run preview, mv and counters in one place. The no-op
+# check compares full paths, since a target can share a basename with its
+# source while moving to a different directory.
 attempt_rename() {
     local old="$1" new="$2" label="$3"
     local old_base new_base
@@ -1143,13 +954,9 @@ attempt_rename() {
     # signature would be longer than either block.
     if [[ -e "$new" ]]; then
         if [[ -d "$new" ]]; then
-            # mv onto an existing directory target nests the source inside
-            # it (new/old/...) rather than replacing or merging it - never
-            # safe to force automatically, since it could silently orphan
-            # or shadow files already in the destination, or (if old is a
-            # file, not a directory) produce a nested result that doesn't
-            # match what -f's "overwrite" promises at all. Always skipped,
-            # regardless of -f or what old is.
+            # mv onto an existing directory nests the source inside it
+            # (new/old/...) instead of replacing it, so this is never forced,
+            # whatever -f says or the source type.
             echo "SKIPPING (rename target directory already exists — merge manually): $new_base"
             log "SKIPPED (directory collision): $old_base -> $new_base"
             SKIPPED=$(( SKIPPED + 1 ))
@@ -1217,20 +1024,13 @@ ensure_dir() {
     return 0
 }
 
-# Tests whether DIR's canonical path is exactly the scanned target root.
-# Used to decide whether a movie needs a brand-new franchise wrapper
-# (sitting directly in the root, nothing above it) or already has one in
-# place (sitting anywhere else) - see "Franchise-folder restructuring" in
-# the header comment.
-# Exit status distinguishes three outcomes, not just true/false: 0 = DIR is
-# the target root, 1 = DIR exists and is not the target root, 2 = DIR could
-# not be statted at all (removed or made inaccessible by something else
-# since this batch started scanning). Callers must check for 2 separately
-# and treat it as a per-item failure (skip + log), not fall through to
-# either the true or false branch - and must never call this as a bare
-# statement, since under `set -e` any non-zero return from a bare command
-# (as opposed to one used in a conditional) would abort the whole script.
-# The `|| result=$?` pattern at each call site keeps this safe.
+# Tests whether DIR's canonical path is exactly the scanned target root, to
+# decide whether a movie needs a new franchise wrapper (it sits in the root)
+# or already has one (it sits anywhere else). Exit status: 0 = DIR is the
+# root, 1 = DIR exists and is not the root, 2 = DIR could not be statted
+# (removed or made inaccessible since the scan began). Callers handle 2 as a
+# per-item failure and call this with `|| rc=$?`, never as a bare statement,
+# which set -e would turn into an abort.
 is_target_root() {
     local real
     real="$(cd "$1" 2>/dev/null && pwd)" || return 2
@@ -1266,23 +1066,15 @@ count_videos_in() {
 # with an episode's series title regardless of punctuation or spacing.
 norm_title() { tr -cd '[:alnum:]' <<< "${1,,}"; }
 
-# Plans where an episode file belongs: <show folder>/Season XX/. Sets
-# EP_DEST_DIR (empty = rename in place, no move), EP_TRACK_DIR (the show
-# folder to pass to the directory pass, or empty), and EP_SHOW_NAME (the
-# "Series (YYYY)" name to give that folder when its own name carries no
-# year). Arguments: the file's current directory, series title, zero-padded
-# season, and the year parsed from the file's own name (may be empty).
-#   - File in a "Season NN" folder: the show folder is its parent.
-#   - File flat in a folder whose title matches the series: that folder is
-#     the show folder.
-#   - Otherwise (loose in the scanned root, a "Season NN" folder sitting in
-#     the root, or a folder holding other things - a library category
-#     folder) there is no show folder yet, so "Series (YYYY)/Season XX" is
-#     created inside it. That needs a year from the file's own name; with
-#     none, nothing is guessed and the file is renamed in place.
-# Returns 2 if a folder can't be statted, 0 otherwise. Clobbers PARSED_OK,
-# PARSED_TITLE and PARSED_YEAR; plan_episode_destination below restores
-# the episode fields.
+# Plans where an episode file belongs: <show folder>/Season XX/ (the rules are
+# in the header's "Episode folder layout"). Sets EP_DEST_DIR (empty = rename in
+# place), EP_TRACK_DIR (the show folder for the directory pass, or empty) and
+# EP_SHOW_NAME (the "Series (YYYY)" name for a show folder whose own name has
+# no year). Arguments: the file's directory, series title, zero-padded season,
+# and the year from the file's own name (may be empty). With no show folder
+# and no year, nothing is guessed and the file is renamed in place. Returns 2
+# if a folder can't be statted, else 0. Clobbers PARSED_OK, PARSED_TITLE and
+# PARSED_YEAR; plan_episode_destination below restores the episode fields.
 _plan_episode_destination() {
     local fdir="$1" series="$2" season="$3" file_year="$4"
     local base parent show_dir="" container="" rc=0 ftitle
@@ -1570,34 +1362,22 @@ if (( RENAME_DIRS && ${#PRUNE_DIRS[@]} > 0 )); then
     done
 fi
 
-# Directory pass. Runs after all file renames complete, over the set of
-# directories that are the title/year-shaped ancestor of at least one
-# successfully-parsed file: a movie's own folder (only when that folder was
-# already movie-shaped going in - see the MATCHED_DIRS note in the main
-# loop above for when it wasn't), or a show's root folder (one level above
-# "Season NN" for episodes, or the folder itself for episodes sitting
-# directly in it). "Season NN" folders themselves are never in this set and
-# are never touched.
-# Always parsed as movie/show-style (title + year), never as episode-style
-# - a directory basename has no extension and isn't itself an episode
-# file. Year-first names (e.g. a raw download's "(2020) Movie Name"
-# folder) are handled the same way here as everywhere else, via
-# parse_media_name's year-first fallback.
+# Directory pass. Runs after all file renames, over the directories that are
+# the title/year-shaped ancestor of a parsed file: a movie's own folder (when
+# already movie-shaped; see MATCHED_DIRS in the main loop) or a show's root
+# folder. "Season NN" folders are never touched. Names are parsed as
+# movie/show-style (title + year), never episode-style, including year-first
+# names.
 if (( RENAME_DIRS )) && [[ ${#MATCHED_DIRS[@]} -gt 0 ]]; then
     echo ""
     echo "=== Directory pass ==="
     for DIR_PATH in "${!MATCHED_DIRS[@]}"; do
         DIR_TYPE="${MATCHED_DIRS[$DIR_PATH]}"
 
-        # The directory the script was invoked against is never itself a
-        # rename target, even if it ended up in MATCHED_DIRS - which can
-        # only happen if a loose file directly inside it had no year of
-        # its own and fell back to the root's own folder name (only
-        # possible when that name happens to look movie/show-shaped, e.g.
-        # a root literally named "Downloads (2020)"). Renaming the actual
-        # target the caller passed in, out from under the run, would be
-        # far more disruptive than leaving one file's fallback-derived
-        # name as-is.
+        # The scanned directory is never a rename target, even if a loose
+        # year-less file's fallback put it in MATCHED_DIRS (a root named like
+        # "Downloads (2020)"): renaming it mid-run would be far more
+        # disruptive than leaving one derived name as-is.
         ROOT_CHECK=0
         check_root "$DIR_PATH" || ROOT_CHECK=$?
         [[ $ROOT_CHECK -eq 0 ]] && continue
