@@ -61,9 +61,20 @@
 #   discarding doesn't require knowing every tag vocabulary in use. This also
 #   handles the already-Plex-formatted case ("Title (2020)") unchanged, since
 #   parentheses are non-alphanumeric boundaries too.
-#   Before year detection: bracketed tags anywhere (e.g. "[TRACKER]") are
-#   stripped, and a leading site-announcement prefix (e.g.
-#   "www.example.org    -    ") is stripped from the start of the name.
+#   Order of operations, before year detection: (1) "[...]" groups are read
+#   first. A group whose whole content is a year, an edition marker, an
+#   SxxEyy token or an episode number is promoted into the name ("[2010]"
+#   becomes "(2010)", "[Extended Cut]" becomes "(Extended Cut)", "[01]"
+#   becomes " - 01"); every other group (resolution, hash, release group) is
+#   dropped. (2) "(S01E01)" and "{S01E01}" are unwrapped and other "{...}"
+#   groups dropped, except Plex's own "{edition-X}". (3) A leading
+#   site-announcement prefix (e.g. "www.example.org    -    ") is removed.
+#   (4) Tabs and non-breaking spaces become spaces, runs of spaces collapse,
+#   and both ends are trimmed. Only then are edition, year and episode read
+#   from what is left. A name with no whitespace, dots or underscores is
+#   hyphen-delimited ("Movie-Name-2010-1080p"), and its title hyphens are
+#   read as word separators; in any other style hyphens stay in the title
+#   ("Spider-Man.2002.1080p" keeps its hyphen).
 #   Known limitation: if a title itself contains a 4-digit number that looks
 #   like a year (e.g. a title such as "Movie 2049"), the LAST standalone
 #   year in the string wins, which is correct as long as the real release
@@ -223,12 +234,15 @@
 #
 #   Inferred episode numbering: a name with no SxxEyy token is still read as
 #   an episode when it carries an "Episode N" / "Ep N" token (optionally
-#   preceded by "Season N") or ends in " - NN", AND at least two videos in
-#   the same folder share the same name apart from that number (see
-#   build_episode_stems; counted once before any rename, so the whole
+#   preceded by "Season N") or ends in " - NN" (optionally followed by "(...)"
+#   groups such as "(BD 1080p)"; a year there marks a movie, not an episode),
+#   or, for a name with no whitespace, ends in a dot, underscore or hyphen
+#   plus two or three digits ("Show.Name.01", "Show-Name-01"), AND at least
+#   two videos in the same folder share the same name apart from that number
+#   (see build_episode_stems; counted once before any rename, so the whole
 #   series stays confirmed as its earlier files are renamed). A lone
-#   numbered file is never inferred to be an
-#   episode, since a bare number is equally a sequel or part number in a
+#   numbered file is never inferred to be an episode, since a bare number is
+#   equally a sequel or part number in a
 #   movie title and nothing in a single name distinguishes the two. A
 #   confirmed name is rewritten to "Title SxxEyy" form and then handled by
 #   the normal episode parser, so every episode rule here applies to it
@@ -388,20 +402,107 @@ normalize_modifier() {
     esac
 }
 
-# Shared preprocessing for both parse_media_name and parse_episode_name.
-# Strips bracketed release-tracker tags anywhere (e.g. "[TRACKER]" -
-# movie/show titles are treated as never containing literal square
-# brackets, so this is safe unconditionally) and a leading site-announcement prefix (e.g.
-# "www.example.org    -    " - requires a domain-like token followed by
-# whitespace-hyphen-whitespace, so it won't eat a legitimate title that
-# happens to start with a hyphenated phrase). Run once by the caller before
-# branching on movie vs. episode, so the episode-detection check itself
-# also sees the cleaned name, not just whichever parser runs after it.
+# Returns 0 when TEXT is, in its entirety, one recognized edition marker
+# ("Extended Cut", "Director's Cut", "25th Anniversary Edition"), so a bracket
+# group holding only that is an edition and not release-tag noise. Uses
+# extract_known_edition, so it clobbers EDITION_LABEL and EDITION_RAW.
+is_whole_edition() {
+    extract_known_edition "$1"
+    [[ -n "$EDITION_LABEL" && -z "$(clean_fragment "$EDITION_RAW")" ]]
+}
+
+# Returns 0 when NAME is delimited by hyphens alone: no whitespace, dots or
+# underscores, at least one hyphen ("Movie-Name-2010-1080p"). In that style
+# the hyphens are word separators. In any other style a hyphen is part of a
+# title ("Spider-Man.2002.1080p") and is left alone.
+hyphen_delimited() {
+    [[ "$1" != *[[:space:]._]* && "$1" == *-* ]]
+}
+
+# Reads the information carried by "[...]" groups before they are discarded.
+# A group is read only when its WHOLE content is one recognized token, so
+# resolution, codec, hash and release-group tags ("[1080p]", "[ABCD1234]",
+# "[Grp]") stay noise:
+#   [2010]            a year; becomes "(2010)", the form the parser already reads
+#   [Extended Cut]    an edition marker; becomes "(Extended Cut)"
+#   [S01E01]          an episode token; becomes a bare " S01E01 "
+#   [01]              an episode number; becomes " - 01 " (see below)
+# Any other "[...]" group is dropped. An episode number is promoted only when
+# it is the one numeric group in the name, nothing else in the name already
+# carries an episode number, text precedes it, and no year follows it, so
+# "Movie [2] (2010)" is never turned into an episode. Prints the result.
+promote_bracket_tokens() {
+    local rest="$1" out="" head content before after plain num
+    local mark=$'\x01' endmark=$'\x02' nums=0
+    local group_re='^([^][]*)\[([^][]*)\](.*)$'
+
+    while [[ "$rest" =~ $group_re ]]; do
+        head="${BASH_REMATCH[1]}"; content="${BASH_REMATCH[2]}"; rest="${BASH_REMATCH[3]}"
+        content="${content#"${content%%[![:space:]]*}"}"
+        content="${content%"${content##*[![:space:]]}"}"
+        if [[ "$content" =~ ^(19|20)[0-9]{2}$ ]]; then
+            out+="$head ($content) "
+        elif [[ "$content" =~ ^[Ss][0-9]{1,2}[Ee][0-9]{1,3}$ ]]; then
+            out+="$head $content "
+        elif [[ "$content" =~ ^[0-9]{1,3}$ ]]; then
+            nums=$(( nums + 1 ))
+            out+="$head $mark$content$endmark "
+        elif [[ -n "$content" ]] && is_whole_edition "$content"; then
+            out+="$head ($content) "
+        else
+            out+="$head "
+        fi
+    done
+    out+="$rest"
+
+    if [[ "$out" == *"$mark"* ]]; then
+        before="${out%%"$mark"*}"
+        num="${out#*"$mark"}"; num="${num%%"$endmark"*}"
+        after="${out#*"$endmark"}"
+        plain="$before $after"
+        if (( nums == 1 )) && [[ "$before" =~ [[:alnum:]] ]] && ! is_episode_shaped "$plain"; then
+            abs_locate "$plain"
+            find_last_year "$after"
+            if (( ! ABS_FOUND )) && [[ -z "$YEAR_MATCH" ]]; then
+                out="$before - $num $after"
+            else
+                out="$plain"
+            fi
+        else
+            out="$plain"
+            while [[ "$out" == *"$mark"* ]]; do
+                out="${out%%"$mark"*} ${out#*"$endmark"}"
+            done
+        fi
+    fi
+    printf '%s' "$out"
+}
+
+# Shared preprocessing for both parse_media_name and parse_episode_name,
+# applied in this order:
+#   1. promote_bracket_tokens reads the whole-content tokens out of "[...]"
+#      groups (year, edition, episode); every other "[...]" group is dropped.
+#   2. Episode tokens wrapped in "(...)" or "{...}" are unwrapped, and every
+#      other "{...}" group is dropped, except Plex's own "{edition-X}".
+#   3. A leading site-announcement prefix (e.g. "www.example.org    -    ")
+#      is removed; it requires a domain-like token followed by
+#      whitespace-hyphen-whitespace, so a legitimate title that starts with
+#      a hyphenated phrase is untouched.
+#   4. Whitespace is normalized: tabs and non-breaking spaces become spaces,
+#      runs collapse to one space, and both ends are trimmed.
+# Run once by the caller before branching on movie vs. episode, so the
+# episode-detection check itself also sees the cleaned name, not just
+# whichever parser runs after it.
 strip_junk_prefixes() {
     local s="$1"
-    s="$(sed -E 's/\[[^][]*\]//g' <<< "$s")"
+    s="$(promote_bracket_tokens "$s")"
+    s="$(sed -E 's/[({][[:space:]]*([Ss][0-9]{1,2}[Ee][0-9]{1,3})[[:space:]]*[)}]/ \1 /g' <<< "$s")"
+    s="$(sed -E 's/\{edition-/\x03/g; s/\{[^}]*\}//g; s/\x03/{edition-/g' <<< "$s")"
     s="$(sed -E 's/^(www\.)?[A-Za-z0-9-]+\.[A-Za-z]{2,}[[:space:]]*-[[:space:]]*//' <<< "$s")"
-    echo "$s"
+    s="${s//$'\t'/ }"
+    s="${s//$'\xc2\xa0'/ }"
+    s="$(sed -E 's/ +/ /g; s/^ //; s/ $//' <<< "$s")"
+    printf '%s\n' "$s"
 }
 
 # Converts a byte offset (as grep -b reports) into a character offset for
@@ -653,7 +754,9 @@ parse_media_name() {
     [[ -z "$YEAR_MATCH" ]] && return
     local year_match="$YEAR_MATCH" offset="$YEAR_OFFSET"
 
-    local title_part="${raw:0:$offset}"
+    local hyphens=0 title_part="${raw:0:$offset}"
+    hyphen_delimited "$raw" && hyphens=1
+    (( hyphens )) && title_part="${title_part//-/ }"
     title_part="$(strip_and_clean "$title_part" "(" trailing)"   # drop a wrapping "(" left by an already-parenthesized year
 
     if [[ -z "$title_part" ]]; then
@@ -666,7 +769,9 @@ parse_media_name() {
         # year-last interpretation came up empty, so a normal
         # "Movie Title (2020)" name is unaffected and still parses year-last.
         local after_offset=$(( offset + ${#year_match} ))
-        title_part="$(strip_and_clean "${raw:$after_offset}" ")" leading)"
+        title_part="${raw:$after_offset}"
+        (( hyphens )) && title_part="${title_part//-/ }"
+        title_part="$(strip_and_clean "$title_part" ")" leading)"
     fi
 
     [[ -z "$title_part" ]] && return
@@ -726,15 +831,33 @@ is_unsupported_episode_numbering() {
 # preceded by "Season N". Used only by abs_locate.
 ABS_EP_PATTERN='(?<![0-9A-Za-z])(?:season[ ._-]*[0-9]{1,2}[ ._-]*)?(?:episode|ep)[ ._-]*[0-9]{1,3}(?![0-9A-Za-z])'
 
+# Bare trailing episode number: "<title> - NN", then optionally any
+# whitespace and "(...)" groups ("Title - 01 (BD 1080p)") - the "[...]"
+# groups were already read or removed by strip_junk_prefixes (a "[01]" group
+# arrives here as " - 01"), which leaves the space that preceded them.
+# Captures: 1 = title, 2 = number, 3 = the trailing text.
+ABS_BARE_PATTERN='^(.*[^ ._-])[ ._-]+-[ ._-]*([0-9]{1,3})(([[:space:]]*[(][^()]*[)])*[[:space:]]*)$'
+
+# Delimiter-only trailing episode number, for a name with no whitespace at
+# all: "<title><delim><NN>" where the delimiter is a dot, underscore or
+# hyphen ("Show.Name.01", "Show_Name_01", "Show-Name-01"). Two or three digits
+# only: a single digit is too often a sequel number, and four digits is a
+# year. Captures: 1 = title, 2 = number.
+ABS_DELIM_PATTERN='^([^[:space:]]*[A-Za-z][^[:space:]]*[^[:space:]._-])[._-]([0-9]{2,3})$'
+
 # Locates an inferred episode token in NAME: "Episode N" / "Ep N"
-# (optionally preceded by "Season N"), or a trailing " - NN". Sets
-# ABS_FOUND (0/1), ABS_PRE (text before the token), ABS_REST (text after it),
-# ABS_EP (episode digits), and ABS_SEASON (empty when no "Season N" token is
-# present). Always returns 0, so it is safe to call as a bare statement
-# under set -e.
+# (optionally preceded by "Season N"), a trailing " - NN" that may be
+# followed by "(...)" groups, or, for a name with no whitespace, a trailing
+# delimiter plus two or three digits. Sets ABS_FOUND (0/1), ABS_PRE (text before the
+# token), ABS_REST (text after the token, for the "Episode N" form), ABS_TAIL
+# (the trailing "(...)" groups, for the " - NN" form; kept out of ABS_REST so
+# siblings with different tags still share a stem), ABS_EP (episode digits),
+# and ABS_SEASON (empty when no "Season N" token is present). Clobbers
+# YEAR_MATCH and YEAR_OFFSET. Always returns 0, so it is safe to call as a
+# bare statement under set -e.
 abs_locate() {
-    local name="$1" hit off match
-    ABS_FOUND=0; ABS_PRE=""; ABS_REST=""; ABS_EP=""; ABS_SEASON=""
+    local name="$1" hit off match trailing
+    ABS_FOUND=0; ABS_PRE=""; ABS_REST=""; ABS_TAIL=""; ABS_EP=""; ABS_SEASON=""
     hit="$(grep -boiP "$ABS_EP_PATTERN" <<< "$name" | head -1)" || true
     if [[ -n "$hit" ]]; then
         off="$(byte_to_char_offset "$name" "${hit%%:*}")"; match="${hit#*:}"
@@ -746,9 +869,21 @@ abs_locate() {
         ABS_PRE="${name:0:$off}"
         ABS_REST="${name:$(( off + ${#match} ))}"
         ABS_FOUND=1
-    elif [[ "$name" =~ ^(.*[^\ ._-])[\ ._-]+-[\ ._-]*([0-9]{1,3})$ ]]; then
+    elif [[ "$name" =~ $ABS_BARE_PATTERN ]]; then
         ABS_PRE="${BASH_REMATCH[1]}"
         ABS_EP="${BASH_REMATCH[2]}"
+        trailing="${BASH_REMATCH[3]}"
+        # A year in the trailing group ("Title - 2 (2010)") marks a movie,
+        # not an episode.
+        find_last_year "$trailing"
+        if [[ -z "$YEAR_MATCH" ]]; then
+            [[ -n "$(tr -d '[:space:]' <<< "$trailing")" ]] && ABS_TAIL="$trailing"
+            ABS_FOUND=1
+        fi
+    elif [[ "$name" != *[[:space:]]* && "$name" =~ $ABS_DELIM_PATTERN ]]; then
+        ABS_PRE="${BASH_REMATCH[1]}"
+        ABS_EP="${BASH_REMATCH[2]}"
+        [[ "$ABS_PRE" != *[._]* ]] && ABS_PRE="${ABS_PRE//-/ }"
         ABS_FOUND=1
     fi
     return 0
@@ -787,12 +922,12 @@ build_episode_stems() {
 # SxxEyy token, carries no inferred token, or has no confirming siblings.
 # Clobbers ABS_* and PARSED_*.
 normalize_absolute_episode() {
-    local name="$1" dir="$2" pre rest ep season show_dir
+    local name="$1" dir="$2" pre rest trailing ep season show_dir
     ABS_NAME="$name"
     is_episode_shaped "$name" && return 0
     abs_locate "$name"
     (( ABS_FOUND )) || return 0
-    pre="$ABS_PRE"; rest="$ABS_REST"; ep="$ABS_EP"; season="$ABS_SEASON"
+    pre="$ABS_PRE"; rest="$ABS_REST"; trailing="$ABS_TAIL"; ep="$ABS_EP"; season="$ABS_SEASON"
     (( ${EPISODE_STEMS["$dir|$pre|$rest"]:-0} >= 2 )) || return 0
     if [[ -z "$season" ]] && is_season_folder_name "$(basename "$dir")"; then
         season="$SEASON_FOLDER_NUMBER"
@@ -808,7 +943,7 @@ normalize_absolute_episode() {
             pre="$(basename "$show_dir")"
         fi
     fi
-    ABS_NAME="$pre S$(pad2 "$season")E$(pad2 "$ep")${rest}"
+    ABS_NAME="$pre S$(pad2 "$season")E$(pad2 "$ep")${rest}${trailing}"
 }
 
 # Core name parser for TV EPISODES. Sets PARSED_OK, PARSED_SERIES,
@@ -867,6 +1002,7 @@ parse_episode_name() {
     local season="${BASH_REMATCH[1]}" episode="${BASH_REMATCH[2]}"
 
     local series_raw="${raw:0:$offset}"
+    hyphen_delimited "$raw" && series_raw="${series_raw//-/ }"
 
     # Strip a redundant year from the series-title segment: Plex episode
     # filenames don't carry the year (only the show-root folder does), but
