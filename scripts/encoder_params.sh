@@ -41,12 +41,9 @@
 #   * Subtitles: only target languages included; Signs & Songs tracks excluded
 #   * Subtitle codec is container-aware: srt/ass in MKV; mov_text in MP4 (subtitle_mux.sh)
 #   * Sidecar subtitle files have leftover ASS override tags (e.g. {\an8}) stripped
-#     before muxing; see subtitle_tag_strip.sh. A video whose embedded (not
-#     sidecar) track needs the same treatment isn't handled here - run
-#     subtitle_extract_params.sh against it first; see that script and
-#     subtitle_embed_params.sh for the two standalone companion tools this
-#     script's sidecar-handling logic (subtitle_mux.sh, subtitle_tag_strip.sh)
-#     is shared with
+#     before muxing (subtitle_tag_strip.sh). An embedded track that needs the same
+#     treatment is not handled here: run subtitle_extract_params.sh first, and the
+#     sidecar it writes is picked up on the next encode
 #   * Output is written atomically (.tmp -> rename) so interrupted runs are retry-safe
 #   * On SIGINT/SIGTERM: partial .tmp file is removed, summary written to log
 #   * -M uses cp + size verify + rm (safe for cross-device/NAS destinations)
@@ -219,25 +216,16 @@ if ! flock -n 9; then
     echo "ERROR: another run is already active against $OUTPUT_DIR (lock: $LOCK_FILE)" >&2
     exit 1
 fi
-# Registered only after successfully acquiring the lock (a failed acquisition
-# above exits before this line, so it never deletes another process's active
-# lock file). Removes the now-empty .lock file on any exit - normal
-# completion, a `set -e` error, or SIGINT/SIGTERM (the cleanup() handler
-# below calls `exit 1`, which still fires this EXIT trap; only SIGKILL skips
-# it, same limitation cleanup()'s own partial-output removal already has).
-# Releasing the fd alone (which happens automatically at process exit
-# regardless) frees the advisory lock; this additionally deletes the file so
-# OUTPUT_DIR doesn't accumulate a permanent empty lock file. Small accepted
-# race: if another process opens+locks this exact path in the instant
-# between this process finishing and this trap firing, the unlink here
-# would remove the path out from under it, and a third process could then
-# create a fresh file at the same path and lock that too. Negligible at the
-# scale of a single-user batch tool where runs are seconds apart at minimum.
+# Registered only after the lock is acquired, so a failed acquisition never
+# deletes another process's lock file. Removes the lock file on any exit:
+# normal completion, a `set -e` error, or SIGINT/SIGTERM (cleanup() calls
+# `exit 1`, which still fires this trap; only SIGKILL skips it). Accepted
+# race: a process that locks this path between this process finishing and
+# this trap firing can have the file unlinked from under it; negligible for a
+# single-user batch tool.
 #
-# This trap is re-registered below, right after init_subtitle_tag_strip
-# creates its temp directory, to add that directory's cleanup - kept as two
-# registrations rather than one combined one here so each trap is added
-# immediately after the state it undoes, not before that state exists yet.
+# Re-registered below, right after init_subtitle_tag_strip creates its temp
+# directory, so each trap is added immediately after the state it undoes.
 trap 'rm -f "$LOCK_FILE" 2>/dev/null || true' EXIT
 
 LOG_FILE_TEMP="$OUTPUT_DIR/Log_InProgress.txt"
@@ -626,23 +614,17 @@ PYEOF
 # shellcheck source=./lang_table.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lang_table.sh"
 
-# subtitle_output_codec(), discover_sidecar_subs(), and
+# subtitle_output_codec(), discover_sidecar_subs() and
 # build_external_subtitle_args() come from the shared subtitle_mux.sh (same
-# directory) - also used by subtitle_embed_params.sh, so the container-aware
-# codec decision and the sidecar-mux ffmpeg-arg logic exist in exactly one
-# place rather than two.
+# directory), also used by subtitle_embed_params.sh, so the container-aware
+# codec decision and the sidecar-mux ffmpeg-arg logic exist in one place.
 # shellcheck source=./subtitle_mux.sh
 source "$(dirname "${BASH_SOURCE[0]}")/subtitle_mux.sh"
 
-# TAG_STRIP_PATTERN, init_subtitle_tag_strip, cleanup_stripped_subs, and
+# TAG_STRIP_PATTERN, init_subtitle_tag_strip, cleanup_stripped_subs and
 # strip_sidecar_sub come from the shared subtitle_tag_strip.sh (same
-# directory). Sourced here, next to lang_table.sh, since both are shared
-# sidecar-subtitle-handling modules. Also used by subtitle_embed_params.sh
-# and subtitle_extract_params.sh; this script's own use is sidecar-only -
-# an embedded track that needs stripping is handled by running
-# subtitle_extract_params.sh first (a separate, standalone step, not
-# something this script does itself), which turns it into a sidecar this
-# script's existing discover_sidecar_subs() then picks up normally.
+# directory), also used by subtitle_embed_params.sh and
+# subtitle_extract_params.sh. This script strips sidecars only.
 # shellcheck source=./subtitle_tag_strip.sh
 source "$(dirname "${BASH_SOURCE[0]}")/subtitle_tag_strip.sh"
 
@@ -653,10 +635,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/subtitle_tag_strip.sh"
 # unstripped sidecars silently.
 if (( ! DRY_RUN )); then
     init_subtitle_tag_strip || exit 1
-    # Re-registers the EXIT trap (see the comment at the lock's own trap,
-    # above) now that cleanup_stripped_subs is both defined (this module is
-    # sourced above) and has real state to clean up (the temp dir this call
-    # just created) - immediately after the action it undoes.
+    # Re-registers the EXIT trap now that the temp directory exists (see the
+    # lock's trap above).
     trap 'rm -f "$LOCK_FILE" 2>/dev/null || true; cleanup_stripped_subs' EXIT
 fi
 
