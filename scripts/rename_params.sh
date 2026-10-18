@@ -12,7 +12,9 @@
 #                   exists (default: off — collisions are skipped and logged).
 #                   Applies to files only: a directory-rename collision is
 #                   always skipped, since mv nests a directory inside an
-#                   existing target rather than replacing it
+#                   existing target rather than replacing it. Asks for a
+#                   typed "yes" on stdin before doing anything (not in a
+#                   dry run); any other answer aborts the run
 #   -F              Files only: rename in place; skip renaming containing
 #                   directories and all franchise-folder and Season-folder
 #                   restructuring (default: off — see "Franchise-folder
@@ -24,6 +26,8 @@
 #   -h              Show this help
 #
 # Notes:
+#   • Refuses to run as root: the folders and logs it creates must belong to
+#     the user who owns the library
 #   • Requires bash 4.0+, a grep with PCRE support (-P; GNU grep on
 #     Ubuntu/Debian has this by default), and sha256sum
 #   • Only one run may target a given <target_dir> at a time; a second run
@@ -60,7 +64,7 @@
 #   become spaces, runs of spaces collapse, and both ends are trimmed.
 #   A name with no whitespace, dots or underscores is hyphen-delimited
 #   ("Movie-Name-2010-1080p") and its title hyphens are word separators; in
-#   any other style hyphens stay in the title ("Spider-Man.2002.1080p").
+#   any other style hyphens stay in the title ("Hyphen-Title.2002.1080p").
 #
 #   Known limitation: a 4-digit number inside a title ("Movie 2049 (2017)")
 #   stays in the title because the last year wins. A name that ends in such a
@@ -129,17 +133,27 @@
 #   ("S03E01 - Title 1080p WEB-DL x264-GROUP") is kept whole, since telling
 #   them apart needs tag vocabulary or an episode-title database.
 #   Spec blocks are stripped from series and episode titles as for movies.
-#   Multi-episode (S01E01E02, S01E01-E02) and fractional (S01E17.5) numbering
-#   is NO_MATCH, not guessed at.
+#   A name that already has spaces keeps the periods in its episode title
+#   ("Hero Vs. Villain!"), trimming only trailing ones; a dot-delimited
+#   scene name converts its dots to spaces.
+#   A ".N" suffix marks a special, recap or similar extra ("S01E17.5"); it is
+#   kept as written: "Series - S01E17.5 - Title.ext". Multi-episode numbering
+#   (S01E01E02, S01E01-E02) is NO_MATCH, not guessed at.
 #
 #   Inferred episode numbering: a name with no SxxEyy token is read as an
-#   episode when it ends in one of the following AND at least two videos in
-#   the same folder share the rest of the name:
-#   - "Episode N" or "Ep N", optionally preceded by "Season N";
+#   episode when it contains one of the following AND at least two videos in
+#   the same folder share the title before the number and the same shape
+#   (the text after the number may differ):
+#   - "Episode N" or "Ep N", optionally preceded by "Season N" (a year after
+#     it marks a movie);
 #   - " - NN", optionally followed by "(...)" groups such as "(BD 1080p)"
-#     (a year there marks a movie, not an episode);
+#     (a year there marks a movie, not an episode); NN may carry a ".N"
+#     special suffix ("Show - 02.5" becomes S01E02.5);
+#   - " - NN - Episode Title" (a year in the title marks a movie);
 #   - a dot, underscore or hyphen plus two or three digits, in a name with
 #     no whitespace ("Show.Name.01", "Show-Name-01").
+#   A title after "Episode N" or " - NN - " is dropped, except after a hyphen
+#   following "Episode N" ("Show - Episode 01 - Title"), which is kept.
 #   Siblings are counted once before any rename (build_episode_stems), so the
 #   whole series stays confirmed as its files are renamed. A lone numbered
 #   file is never inferred to be an episode, since a bare number is equally a
@@ -184,6 +198,24 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 1
 fi
 
+# Dependency check
+require() { command -v "$1" &>/dev/null || { echo "ERROR: '$1' not found on PATH" >&2; exit 1; }; }
+require find
+require flock
+require grep
+require sha256sum
+grep -oP 'x' <<< 'x' &>/dev/null || {
+    echo "ERROR: grep must support -P (PCRE); GNU grep on Ubuntu/Debian has this by default" >&2
+    exit 1
+}
+
+# The script creates folders and logs the library's owner must be able to use;
+# under sudo they would belong to root.
+if [[ $EUID -eq 0 ]]; then
+    echo "ERROR: do not run this with sudo, it creates folders and logs a normal user needs to own." >&2
+    exit 1
+fi
+
 # Defaults
 DRY_RUN=0
 FORCE=0
@@ -224,20 +256,19 @@ if [[ ! -d "$TARGET_DIR" ]]; then
     exit 1
 fi
 
+# -f can overwrite existing files, so it needs a typed answer at the moment of
+# the run: a flag alone can be typed ahead of time and fired without re-reading
+# it. Anything but "yes" (including end of input) aborts. A dry run overwrites
+# nothing and is not asked.
+if (( FORCE && ! DRY_RUN )); then
+    CONFIRM=""
+    read -r -p "-f overwrites existing files. Type 'yes' to continue: " CONFIRM || true
+    [[ "$CONFIRM" == "yes" ]] || { echo "Aborted." >&2; exit 1; }
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR_REAL="$(cd "$TARGET_DIR" && pwd)"   # canonicalize so different relative paths to the same directory hash identically, and so folder-nesting checks below are reliable
 [[ -z "$OPERATIONAL_DIR" ]] && OPERATIONAL_DIR="$SCRIPT_DIR"
-
-# Dependency check
-require() { command -v "$1" &>/dev/null || { echo "ERROR: '$1' not found on PATH" >&2; exit 1; }; }
-require find
-require flock
-require grep
-require sha256sum
-grep -oP 'x' <<< 'x' &>/dev/null || {
-    echo "ERROR: grep must support -P (PCRE); GNU grep on Ubuntu/Debian has this by default" >&2
-    exit 1
-}
 
 # Concurrency lock: only one run may target a given TARGET_DIR at a time. The
 # lock file lives under OPERATIONAL_DIR, never inside TARGET_DIR, so a library
@@ -259,7 +290,7 @@ fi
 # Accepted race: a process that locks this path between the last real work
 # and this trap can have the file unlinked from under it; for a single-user
 # batch tool that window is negligible.
-trap 'rm -f "$LOCK_FILE" 2>/dev/null || true' EXIT
+trap 'rm -f -- "$LOCK_FILE" 2>/dev/null || true' EXIT
 
 # Extensions
 VIDEO_EXTS="mkv|mp4|avi|mov|m4v"
@@ -268,7 +299,11 @@ ALL_EXTS="${VIDEO_EXTS}|${SUB_EXTS}"
 
 # Language alias table (lang_table.sh, alongside this script).
 # shellcheck source=./lang_table.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lang_table.sh"
+[[ -r "${SCRIPT_DIR}/lang_table.sh" ]] || {
+    echo "ERROR: lang_table.sh not found next to this script (${SCRIPT_DIR})" >&2
+    exit 1
+}
+source "${SCRIPT_DIR}/lang_table.sh"
 
 # Prints the canonical language code for a raw subtitle language tag, or
 # nothing when the tag isn't in LANG_ALIASES (lang_table.sh).
@@ -300,7 +335,7 @@ is_whole_edition() {
 # Returns 0 when NAME is delimited by hyphens alone: no whitespace, dots or
 # underscores, at least one hyphen ("Movie-Name-2010-1080p"). In that style
 # the hyphens are word separators. In any other style a hyphen is part of a
-# title ("Spider-Man.2002.1080p") and is left alone.
+# title ("Hyphen-Title.2002.1080p") and is left alone.
 hyphen_delimited() {
     [[ "$1" != *[[:space:]._]* && "$1" == *-* ]]
 }
@@ -328,7 +363,7 @@ promote_bracket_tokens() {
         content="${content%"${content##*[![:space:]]}"}"
         if [[ "$content" =~ ^(19|20)[0-9]{2}$ ]]; then
             out+="$head ($content) "
-        elif [[ "$content" =~ ^[Ss][0-9]{1,2}[Ee][0-9]{1,3}$ ]]; then
+        elif [[ "$content" =~ ^[Ss][0-9]{1,2}[Ee][0-9]{1,3}(\.[0-9]{1,2})?$ ]]; then
             out+="$head $content "
         elif [[ "$content" =~ ^[0-9]{1,3}$ ]]; then
             nums=$(( nums + 1 ))
@@ -384,8 +419,8 @@ promote_bracket_tokens() {
 strip_junk_prefixes() {
     local s="$1"
     s="$(promote_bracket_tokens "$s")"
-    s="$(sed -E 's/[({][[:space:]]*([Ss][0-9]{1,2}[Ee][0-9]{1,3})[[:space:]]*[)}]/ \1 /g' <<< "$s")"
-    s="$(sed -E 's/([Ss][0-9]{1,2}[Ee][0-9]{1,3})[Vv][0-9]{1,2}\b/\1/g; s/([ ._-]-[ ._-]*[0-9]{1,3})[Vv][0-9]{1,2}\b/\1/g' <<< "$s")"
+    s="$(sed -E 's/[({][[:space:]]*([Ss][0-9]{1,2}[Ee][0-9]{1,3}(\.[0-9]{1,2})?)[[:space:]]*[)}]/ \1 /g' <<< "$s")"
+    s="$(sed -E 's/([Ss][0-9]{1,2}[Ee][0-9]{1,3}(\.[0-9]{1,2})?)[Vv][0-9]{1,2}\b/\1/g; s/([ ._-]-[ ._-]*[0-9]{1,3})[Vv][0-9]{1,2}\b/\1/g' <<< "$s")"
     s="$(sed -E 's/\{edition-/\x03/g; s/\{[^}]*\}//g; s/\x03/{edition-/g' <<< "$s")"
     s="$(sed -E 's/^(www\.)?[A-Za-z0-9-]+\.[A-Za-z]{2,}[[:space:]]*-[[:space:]]*//' <<< "$s")"
     s="${s//$'\t'/ }"
@@ -455,6 +490,16 @@ strip_and_clean() {
         leading)  s="${s#$trim_char}" ;;
     esac
     clean_fragment "$s"
+}
+
+# strip_and_clean for a title taken from a name that already has spaces
+# ("Hero Vs. Villain!"): its periods are punctuation, not delimiters, so
+# they are kept and only a trailing run of them is trimmed. A dot-delimited
+# scene name still goes through strip_and_clean.
+clean_spaced_title() {
+    local s
+    s="$(strip_delimited_groups "$1" | tr '_/' '  ' | tr -s ' ')"
+    sed -E 's/^[[:space:]-]+//; s/[[:space:].-]+$//' <<< "$s"
 }
 
 # Recognized edition/cut markers, matched as freeform text anywhere in a name
@@ -634,8 +679,9 @@ parse_media_name() {
 
 # PCRE for a standalone SxxEyy token without its trailing boundary check
 # (callers append what may follow it): S + 1-2 digit season, E + 1-3 digit
-# episode, not preceded by an alphanumeric character.
-EPISODE_TOKEN_PATTERN='(?<![0-9A-Za-z])[Ss][0-9]{1,2}[Ee][0-9]{1,3}'
+# episode, optionally a ".N" / ".NN" special-episode suffix ("S01E17.5"), not
+# preceded by an alphanumeric character.
+EPISODE_TOKEN_PATTERN='(?<![0-9A-Za-z])[Ss][0-9]{1,2}[Ee][0-9]{1,3}(?:\.[0-9]{1,2})?'
 
 # Zero-pads a number to at least two digits, forcing base 10 so "08" and
 # "09" aren't read as invalid octal. Prints the result.
@@ -666,16 +712,16 @@ is_episode_shaped() {
     grep -qP "${EPISODE_TOKEN_PATTERN}(?![0-9A-Za-z])" <<< "$1"
 }
 
-# Detects an SxxEyy token immediately followed by more episode numbering -
-# a fractional/special episode ("S01E17.5") or a hyphen-joined range
-# ("S01E01-E02"). The plain SxxEyy match above accepts these because "." and
-# "-" are non-alphanumeric boundaries, but it then sees only the first number
-# and the remainder fails the episode-title anchor, so the file would be
-# renamed to the wrong episode with its title dropped. These are NO_MATCH,
-# consistent with multi-episode files (S01E01E02): the script can't know what
-# number a special should take.
+# Detects an SxxEyy token immediately followed by a hyphen-joined range
+# ("S01E01-E02"). The plain SxxEyy match above accepts it because "-" is a
+# non-alphanumeric boundary, but it then sees only the first number and the
+# remainder fails the episode-title anchor, so the file would be renamed to
+# the wrong episode with its title dropped. These are NO_MATCH, consistent
+# with multi-episode files (S01E01E02): the script can't know which number
+# the file should take. A ".N" special ("S01E17.5") is part of the token and
+# is supported.
 is_unsupported_episode_numbering() {
-    grep -qP "${EPISODE_TOKEN_PATTERN}(?:\.[0-9]{1,2}(?![0-9A-Za-z])|-[Ee][0-9]{1,3}(?![0-9A-Za-z]))" <<< "$1"
+    grep -qP "${EPISODE_TOKEN_PATTERN}-[Ee][0-9]{1,3}(?![0-9A-Za-z])" <<< "$1"
 }
 
 # PCRE for an inferred episode token: "Episode N" or "Ep N", optionally
@@ -686,8 +732,15 @@ ABS_EP_PATTERN='(?<![0-9A-Za-z])(?:season[ ._-]*[0-9]{1,2}[ ._-]*)?(?:episode|ep
 # whitespace and "(...)" groups ("Title - 01 (BD 1080p)") - the "[...]"
 # groups were already read or removed by strip_junk_prefixes (a "[01]" group
 # arrives here as " - 01"), which leaves the space that preceded them.
-# Captures: 1 = title, 2 = number, 3 = the trailing text.
-ABS_BARE_PATTERN='^(.*[^ ._-])[ ._-]+-[ ._-]*([0-9]{1,3})(([[:space:]]*[(][^()]*[)])*[[:space:]]*)$'
+# The number may carry a ".N" special suffix ("Title - 02.5").
+# Captures: 1 = title, 2 = number, 3 = ".N" suffix or empty, 4 = the trailing
+# text. Underscores may separate the groups ("Title_-_01_(720p)_(Group)").
+ABS_BARE_PATTERN='^(.*[^ ._-])[ ._-]+-[ ._-]*([0-9]{1,3})(\.[0-9]{1,2})?(([[:space:]_]*[(][^()]*[)])*[[:space:]_]*)$'
+
+# Numbered episode with a title after it: "<title> - NN - <episode title>".
+# Both hyphens are required, so a number inside a title is not read as one.
+# Captures: 1 = title, 2 = number, 3 = ".N" suffix or empty, 4 = episode title.
+ABS_TITLED_PATTERN='^(.*[^ ._-])[ ._-]+-[ ._-]*([0-9]{1,3})(\.[0-9]{1,2})?[ ._]+-[ ._]+(.+)$'
 
 # Delimiter-only trailing episode number, for a name with no whitespace at
 # all: "<title><delim><NN>" where the delimiter is a dot, underscore or
@@ -698,17 +751,19 @@ ABS_DELIM_PATTERN='^([^[:space:]]*[A-Za-z][^[:space:]]*[^[:space:]._-])[._-]([0-
 
 # Locates an inferred episode token in NAME: "Episode N" / "Ep N"
 # (optionally preceded by "Season N"), a trailing " - NN" that may be
-# followed by "(...)" groups, or, for a name with no whitespace, a trailing
-# delimiter plus two or three digits. Sets ABS_FOUND (0/1), ABS_PRE (text before the
-# token), ABS_REST (text after the token, for the "Episode N" form), ABS_TAIL
-# (the trailing "(...)" groups, for the " - NN" form; kept out of ABS_REST so
-# siblings with different tags still share a stem), ABS_EP (episode digits),
-# and ABS_SEASON (empty when no "Season N" token is present). Clobbers
-# YEAR_MATCH and YEAR_OFFSET. Always returns 0, so it is safe to call as a
-# bare statement under set -e.
+# followed by "(...)" groups, " - NN - Episode Title", or, for a name with no
+# whitespace, a trailing delimiter plus two or three digits. Sets ABS_FOUND
+# (0/1), ABS_PRE (text before the token), ABS_REST (text after the token, for
+# the "Episode N" form), ABS_TAIL (the trailing "(...)" groups, for the " - NN"
+# form), ABS_EP (episode number, with its ".N" suffix for a special),
+# ABS_FORM (the shape that matched: token, bare, titled or delim) and
+# ABS_SEASON (empty when no "Season N" token is present). Siblings are matched
+# on ABS_PRE and ABS_FORM alone, so episodes with different titles or tags
+# still share a stem. Clobbers YEAR_MATCH and YEAR_OFFSET. Always returns 0,
+# so it is safe to call as a bare statement under set -e.
 abs_locate() {
     local name="$1" hit off match trailing
-    ABS_FOUND=0; ABS_PRE=""; ABS_REST=""; ABS_TAIL=""; ABS_EP=""; ABS_SEASON=""
+    ABS_FOUND=0; ABS_PRE=""; ABS_REST=""; ABS_TAIL=""; ABS_EP=""; ABS_SEASON=""; ABS_FORM=""
     hit="$(grep -boiP "$ABS_EP_PATTERN" <<< "$name" | head -1)" || true
     if [[ -n "$hit" ]]; then
         off="$(byte_to_char_offset "$name" "${hit%%:*}")"; match="${hit#*:}"
@@ -719,22 +774,39 @@ abs_locate() {
         fi
         ABS_PRE="${name:0:$off}"
         ABS_REST="${name:$(( off + ${#match} ))}"
-        ABS_FOUND=1
+        # A year after the token marks a movie ("Title Episode 4 (1977)").
+        find_last_year "$ABS_REST"
+        if [[ -z "$YEAR_MATCH" ]]; then
+            ABS_FORM="token"
+            ABS_FOUND=1
+        fi
     elif [[ "$name" =~ $ABS_BARE_PATTERN ]]; then
         ABS_PRE="${BASH_REMATCH[1]}"
-        ABS_EP="${BASH_REMATCH[2]}"
-        trailing="${BASH_REMATCH[3]}"
+        ABS_EP="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+        trailing="${BASH_REMATCH[4]}"
         # A year in the trailing group ("Title - 2 (2010)") marks a movie,
         # not an episode.
         find_last_year "$trailing"
         if [[ -z "$YEAR_MATCH" ]]; then
-            [[ -n "$(tr -d '[:space:]' <<< "$trailing")" ]] && ABS_TAIL="$trailing"
+            [[ -n "$(tr -d '[:space:]_' <<< "$trailing")" ]] && ABS_TAIL="$trailing"
+            ABS_FORM="bare"
+            ABS_FOUND=1
+        fi
+    elif [[ "$name" =~ $ABS_TITLED_PATTERN ]]; then
+        # The episode title is not carried over; only a year in it is checked,
+        # since a year marks a movie ("Title - 2 - Return (2010)").
+        ABS_PRE="${BASH_REMATCH[1]}"
+        ABS_EP="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+        find_last_year "${BASH_REMATCH[4]}"
+        if [[ -z "$YEAR_MATCH" ]]; then
+            ABS_FORM="titled"
             ABS_FOUND=1
         fi
     elif [[ "$name" != *[[:space:]]* && "$name" =~ $ABS_DELIM_PATTERN ]]; then
         ABS_PRE="${BASH_REMATCH[1]}"
         ABS_EP="${BASH_REMATCH[2]}"
         [[ "$ABS_PRE" != *[._]* ]] && ABS_PRE="${ABS_PRE//-/ }"
+        ABS_FORM="delim"
         ABS_FOUND=1
     fi
     return 0
@@ -748,7 +820,9 @@ abs_locate() {
 # full file list BEFORE any rename, because each rename removes a sibling
 # from the folder: counting live would stop confirming the last files of a
 # series partway through the batch. Takes the NUL-delimited file list on
-# stdin. Clobbers ABS_*.
+# stdin. A second count per episode number (key suffix "|ABS_EP") lets
+# normalize_absolute_episode leave two files with one number alone: they are
+# copies, not a series. Clobbers ABS_*.
 declare -A EPISODE_STEMS=()
 build_episode_stems() {
     local f base dir
@@ -759,7 +833,8 @@ build_episode_stems() {
         base="${base%.*}"
         abs_locate "$(strip_junk_prefixes "$base")"
         (( ABS_FOUND )) || continue
-        EPISODE_STEMS["$dir|$ABS_PRE|$ABS_REST"]=$(( ${EPISODE_STEMS["$dir|$ABS_PRE|$ABS_REST"]:-0} + 1 ))
+        EPISODE_STEMS["$dir|$ABS_PRE|$ABS_FORM"]=$(( ${EPISODE_STEMS["$dir|$ABS_PRE|$ABS_FORM"]:-0} + 1 ))
+        EPISODE_STEMS["$dir|$ABS_PRE|$ABS_FORM|$ABS_EP"]=$(( ${EPISODE_STEMS["$dir|$ABS_PRE|$ABS_FORM|$ABS_EP"]:-0} + 1 ))
     done
 }
 
@@ -773,13 +848,16 @@ build_episode_stems() {
 # SxxEyy token, carries no inferred token, or has no confirming siblings.
 # Clobbers ABS_* and PARSED_*.
 normalize_absolute_episode() {
-    local name="$1" dir="$2" pre rest trailing ep season show_dir
+    local name="$1" dir="$2" pre rest trailing ep season show_dir ep_int ep_frac
     ABS_NAME="$name"
     is_episode_shaped "$name" && return 0
     abs_locate "$name"
     (( ABS_FOUND )) || return 0
     pre="$ABS_PRE"; rest="$ABS_REST"; trailing="$ABS_TAIL"; ep="$ABS_EP"; season="$ABS_SEASON"
-    (( ${EPISODE_STEMS["$dir|$pre|$rest"]:-0} >= 2 )) || return 0
+    (( ${EPISODE_STEMS["$dir|$pre|$ABS_FORM"]:-0} >= 2 )) || return 0
+    # Two files for the same episode number are copies, not a series; renaming
+    # one would leave the other to be read as a movie on the next run.
+    (( ${EPISODE_STEMS["$dir|$pre|$ABS_FORM|$ep"]:-0} < 2 )) || return 0
     if [[ -z "$season" ]] && is_season_folder_name "$(basename "$dir")"; then
         season="$SEASON_FOLDER_NUMBER"
     fi
@@ -794,7 +872,8 @@ normalize_absolute_episode() {
             pre="$(basename "$show_dir")"
         fi
     fi
-    ABS_NAME="$pre S$(pad2 "$season")E$(pad2 "$ep")${rest}${trailing}"
+    ep_int="${ep%%.*}"; ep_frac="${ep#"$ep_int"}"
+    ABS_NAME="$pre S$(pad2 "$season")E$(pad2 "$ep_int")${ep_frac}${rest}${trailing}"
 }
 
 # Core name parser for TV EPISODES. Sets PARSED_OK, PARSED_SERIES,
@@ -825,12 +904,12 @@ parse_episode_name() {
     match="$(grep -oP "${EPISODE_TOKEN_PATTERN}(?![0-9A-Za-z])" <<< "$raw" | head -1)" || true
     [[ -z "$match" ]] && return
 
-    offset="$(grep -boP '(?<![0-9A-Za-z])'"$match"'(?![0-9A-Za-z])' <<< "$raw" | head -1)" || true
+    offset="$(grep -boP '(?<![0-9A-Za-z])'"${match//./\\.}"'(?![0-9A-Za-z])' <<< "$raw" | head -1)" || true
     [[ -z "$offset" ]] && return
     offset="$(byte_to_char_offset "$raw" "${offset%%:*}")"
 
-    [[ "$match" =~ ^[Ss]([0-9]{1,2})[Ee]([0-9]{1,3})$ ]] || return
-    local season="${BASH_REMATCH[1]}" episode="${BASH_REMATCH[2]}"
+    [[ "$match" =~ ^[Ss]([0-9]{1,2})[Ee]([0-9]{1,3})(\.[0-9]{1,2})?$ ]] || return
+    local season="${BASH_REMATCH[1]}" episode="${BASH_REMATCH[2]}" special="${BASH_REMATCH[3]}"
 
     local series_raw="${raw:0:$offset}"
     hyphen_delimited "$raw" && series_raw="${series_raw//-/ }"
@@ -859,12 +938,16 @@ parse_episode_name() {
             PARSED_EDITION="${BASH_REMATCH[1]}"
             ep_title="${ep_title/${BASH_REMATCH[0]}/}"
         fi
-        PARSED_EPTITLE="$(strip_and_clean "$ep_title")"
+        if [[ "$raw" == *[[:space:]]* ]]; then
+            PARSED_EPTITLE="$(clean_spaced_title "$ep_title")"
+        else
+            PARSED_EPTITLE="$(strip_and_clean "$ep_title")"
+        fi
     fi
 
     PARSED_SERIES="$series_part"
     PARSED_SEASON="$(pad2 "$season")"
-    PARSED_EPISODE="$(pad2 "$episode")"
+    PARSED_EPISODE="$(pad2 "$episode")${special}"
     PARSED_OK=1
 }
 
@@ -927,14 +1010,13 @@ SKIPPED=0
 NO_MATCH=0
 FAILED=0
 
-# Log setup. Unlike encoder_params.sh's Log_InProgress.txt -> finalize-on-
-# success dance, this writes directly to its final path: a rename pass is
-# seconds long and fully idempotent (already-correct names are simply left
-# alone on a re-run), so there's no meaningful "interrupted mid-batch" state
-# worth preserving separately.
+# Log setup. The log is written directly to its final path: a rename pass is
+# idempotent (already-correct names are left alone on a re-run), so an
+# interrupted batch has no partial state worth keeping apart from the log.
 [[ -z "$LOG_DIR" ]] && LOG_DIR="${OPERATIONAL_DIR}/Logs"
 mkdir -p -- "$LOG_DIR"
 LOG_FILE="$LOG_DIR/Rename_$(date '+%Y-%m-%d_%H%M').txt"
+# Appends one timestamped line to LOG_FILE. Sets nothing.
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
 
 # Reports a file that was left untouched because no name could be derived
@@ -1303,7 +1385,7 @@ while IFS= read -r -d '' FILE_PATH; do
 
     if [[ $ITEM_OK -ne 1 ]]; then
         if (( UNSUPPORTED_EP )); then
-            report_no_match "fractional or ranged episode number; not renamed" "$FILE_NAME"
+            report_no_match "episode range or multi-episode number; not renamed" "$FILE_NAME"
         elif (( IS_EPISODE )); then
             report_no_match "episode-shaped but unparseable" "$FILE_NAME"
         elif (( AMBIGUOUS_PARENT )); then
