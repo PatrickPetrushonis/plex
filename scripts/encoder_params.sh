@@ -4,13 +4,14 @@
 # Usage:  ./encoder_params.sh [OPTIONS] <input_file|dir|glob> [<input2> ...]
 #
 # Options:
-#   -o DIR          Output directory (default: ./encoded)
+#   -o DIR          Output directory (default: <script directory>/encoded)
 #   -c INT          CRF quality, 0-51, lower = better (default: 18)
 #   -p PRESET       x264 preset: ultrafast..veryslow (default: slow)
 #   -b BITRATE      Audio fallback encode bitrate (default: 192k)
 #   -H HEIGHT       Max output height in px; taller sources are scaled down (default: 1080)
 #   -f FORMAT       Output container: mkv or mp4 (default: mkv)
-#   -l LANGS        Comma-separated subtitle languages to keep (default: eng)
+#   -l LANGS        Comma-separated subtitle languages to keep, as primary 3-letter
+#                   codes from lang_table.tsv (default: eng)
 #   -a CODECS       Comma-separated audio codecs to copy without re-encode
 #                   (default: aac,ac3,eac3,dts,truehd,flac,opus)
 #   -e EXTS         Comma-separated input extensions to scan (default: see VIDEO_EXTS)
@@ -21,7 +22,8 @@
 #   -n              Dry run: print decisions, do not encode
 #   -s              Skip if output file already exists (default: overwrite)
 #   -M PATH         After encode: cp output to this path (NAS/SMB mount), verify size, remove original
-#   -A PATH         After encode: mv source input to this path, mirroring directory structure
+#   -A PATH         After encode: mv source input and its muxed sidecar subtitle files to this
+#                   path, mirroring directory structure (flat by file name for file and glob inputs)
 #   -d BYTES        Minimum free disk space before aborting, in bytes (default: 10737418240)
 #   -P SIZE         ffmpeg -analyzeduration and -probesize value (default: 10M)
 #   -h              Show this help
@@ -29,29 +31,48 @@
 # Notes:
 #   * Requires bash 4.0+, ffmpeg (built with the zscale and tonemap filters),
 #     ffprobe, python3, flock, sed
-#   * Video is copied if already h264, SDR (colour transfer not PQ or HLG), and
-#     within MAX_HEIGHT; otherwise re-encoded to x264
+#   * Video is copied if already h264, 8-bit 4:2:0, SDR (colour transfer not PQ or
+#     HLG), and within MAX_HEIGHT; otherwise re-encoded to x264
 #   * PQ and HLG sources are tone-mapped to SDR BT.709 and tagged bt709, since
 #     libx264 writes the source's colour tags into the output unless they are
 #     set explicitly (see README: HEVC and HDR sources)
 #   * Each encoded file's video stream is probed before it is moved to its final
 #     path; an output that still carries a PQ or HLG transfer is rejected, so
 #     -M and -A never act on it
+#   * Each encoded file's subtitle stream count is probed against the number of
+#     streams the encoder emitted before it is moved to its final path; a
+#     mismatch rejects the output, so -M and -A never act on it
 #   * Audio streams are copied if their codec is in the copy list; otherwise -> aac
 #   * Subtitles: only target languages included; Signs & Songs tracks excluded
 #   * Subtitle codec is container-aware: srt/ass in MKV; mov_text in MP4 (subtitle_mux.sh)
-#   * Sidecar subtitle files have leftover ASS override tags (e.g. {\an8}) stripped
-#     before muxing (subtitle_tag_strip.sh). An embedded track that needs the same
-#     treatment is not handled here: run subtitle_extract_params.sh first, and the
-#     sidecar it writes is picked up on the next encode
+#   * Sidecar subtitle files (<name>.<lang2>[.cc|.sdh|.forced].<ext>, ext in
+#     srt vtt ass ssa sub, claimed by probed codec subrip/webvtt/ass/microdvd;
+#     first ext in that order wins per language and type) are muxed. In MKV,
+#     webvtt and microdvd convert to srt and ass is copied; in MP4 all become
+#     mov_text. Subrip sidecars have leftover ASS override tags (e.g. {\an8})
+#     stripped before muxing (subtitle_tag_strip.sh); ass is left untouched.
+#     A sidecar replaces an embedded track of the same
+#     language and the same type (standard, CC, forced); language codes are
+#     compared after alias resolution and an untagged track counts as eng
+#   * Subtitle-extension files next to a video that discovery does not embed
+#     (.idx, .sup, .smi, a bitmap .sub, a lower-precedence duplicate format,
+#     a language outside -l, an unrecognized modifier)
+#     are reported as warnings, are not embedded, and stay where they are
+#   * An embedded track that needs tag stripping is not handled here: run
+#     subtitle_extract_params.sh first, and the sidecar it writes is picked up
+#     on the next encode
 #   * Output is written atomically (.tmp -> rename) so interrupted runs are retry-safe
 #   * On SIGINT/SIGTERM: partial .tmp file is removed, summary written to log
-#   * -M uses cp + size verify + rm (safe for cross-device/NAS destinations)
-#   * -A uses mv; source is only moved after a successful encode
+#   * -M uses cp + size verify + rm (safe for cross-device/NAS destinations); a
+#     failed archive leaves the output in place, skips -A for that file, and
+#     counts the file as failed
+#   * -A uses mv; source is only moved after a successful encode and archive. If
+#     a sidecar move fails, the source video stays in place with its remaining
+#     sidecars. A backup destination that already exists is never overwritten
 #   * Both -M and -A mirror the same relative directory structure as the output
-#   * HEVC sources are always re-encoded to x264 and logged with the source codec label,
-#     since transcoding HEVC -> x264 typically produces a larger file (see README:
-#     HEVC and HDR sources)
+#   * HEVC sources are always re-encoded to x264 and logged with the source codec label;
+#     the output can be larger than the source, and the post-encode size check
+#     reports the change (see README: HEVC and HDR sources)
 #   * Only one run may target a given -o OUTPUT_DIR at a time; a second run against
 #     the same OUTPUT_DIR exits immediately instead of racing on shared .tmp/log files
 
@@ -63,8 +84,13 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 1
 fi
 
+if [[ $EUID -eq 0 ]]; then
+    echo "ERROR: do not run this with sudo, it creates output files a normal user needs to own." >&2
+    exit 1
+fi
+
 # -- Defaults --------------------------------------------------------------------
-OUTPUT_DIR="./encoded"
+OUTPUT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/encoded"
 CRF=18
 PRESET="slow"
 AUDIO_BITRATE="192k"
@@ -141,6 +167,8 @@ shift $(( OPTIND - 1 ))
 # -- Parameter validation -----------------------------------------------------------
 validate_params() {
     local errors=0
+    local -a _LANGS=()
+    local lang
 
     if ! [[ "$CRF" =~ ^[0-9]+$ ]] || (( CRF > 51 )); then
         echo "ERROR: CRF must be an integer 0-51 (got: $CRF)" >&2
@@ -202,19 +230,25 @@ for _filter in zscale tonemap; do
 done
 
 # -- Directory and log setup -------------------------------------------------------
-mkdir -p -- "$OUTPUT_DIR"
 [[ -z "$LOG_DIR" ]] && LOG_DIR="$OUTPUT_DIR/Logs"
-mkdir -p -- "$LOG_DIR"
+if (( ! DRY_RUN )); then
+    mkdir -p -- "$OUTPUT_DIR" "$LOG_DIR"
+fi
 
 # -- Concurrency lock --------------------------------------------------------------
 # Only one run may target a given OUTPUT_DIR at a time: two runs sharing it
 # would race on the same deterministic .tmp output path per input file, and
 # on the same Log_InProgress.txt. Exclusive, non-blocking.
-LOCK_FILE="$OUTPUT_DIR/.media.lock"
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-    echo "ERROR: another run is already active against $OUTPUT_DIR (lock: $LOCK_FILE)" >&2
-    exit 1
+# A dry run against an OUTPUT_DIR that does not exist yet has nothing to race
+# on and creates nothing, so it takes no lock.
+LOCK_FILE=""
+if (( ! DRY_RUN )) || [[ -d "$OUTPUT_DIR" ]]; then
+    LOCK_FILE="$OUTPUT_DIR/.media.lock"
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        echo "ERROR: another run is already active against $OUTPUT_DIR (lock: $LOCK_FILE)" >&2
+        exit 1
+    fi
 fi
 # Registered only after the lock is acquired, so a failed acquisition never
 # deletes another process's lock file. Removes the lock file on any exit:
@@ -228,7 +262,13 @@ fi
 # directory, so each trap is added immediately after the state it undoes.
 trap 'rm -f "$LOCK_FILE" 2>/dev/null || true' EXIT
 
-LOG_FILE_TEMP="$OUTPUT_DIR/Log_InProgress.txt"
+# A dry run writes no log: every log() call and the header block go to
+# /dev/null.
+if (( DRY_RUN )); then
+    LOG_FILE_TEMP="/dev/null"
+else
+    LOG_FILE_TEMP="$OUTPUT_DIR/Log_InProgress.txt"
+fi
 if [[ -f "$LOG_FILE_TEMP" ]]; then
     # A leftover Log_InProgress.txt means the previous run failed or was
     # interrupted (a clean run always moves it to LOG_DIR before exiting).
@@ -299,6 +339,10 @@ CURRENT_TMP=""
 CURRENT_STDERR_CAPTURE=""
 CURRENT_FFMPEG_PID=""
 
+# SIGINT/SIGTERM handler. Stops the running ffmpeg, removes the partial .tmp
+# output and the stderr capture, prints the summary labelled ABORTED, and exits
+# 1 (which fires the EXIT trap that removes the lock and the stripped-subtitle
+# scratch directory). SIG is the signal name used in the messages.
 cleanup() {
     local SIG="$1"
     echo "" >&2
@@ -314,7 +358,7 @@ cleanup() {
     fi
     [[ -n "$CURRENT_STDERR_CAPTURE" && -f "$CURRENT_STDERR_CAPTURE" ]] && rm -f "$CURRENT_STDERR_CAPTURE"
     print_summary "ABORTED by $SIG"
-    echo "Log retained at: $LOG_FILE_TEMP" >&2
+    (( DRY_RUN )) || echo "Log retained at: $LOG_FILE_TEMP" >&2
     exit 1
 }
 
@@ -333,9 +377,16 @@ declare -a ALL_FILES=()
 declare -a ALL_ROOTS=()
 FILE_NUM=0  # current file index, incremented in main loop
 
+# Appends the video files named by TARGET to ALL_FILES, with ROOT appended to
+# ALL_ROOTS at the same index. TARGET is a video file (kept if its extension
+# is in VIDEO_EXT_REGEX), a directory (scanned, one level unless -r), or a glob
+# pattern (expanded, each match handled as above). ROOT is the scanned
+# directory for directory input and empty for file and glob input. Warns and
+# adds nothing for a non-video file or a pattern that matches nothing.
 collect_files() {
     local TARGET="$1"
     local ROOT="$2"
+    local f m
 
     if [[ -f "$TARGET" ]]; then
         local EXT="${TARGET##*.}"
@@ -388,10 +439,13 @@ log "Files to process: ${#ALL_FILES[@]}"
 [[ $DRY_RUN -eq 1 ]] && echo "[DRY RUN: no encoding will occur]"
 
 # -- Disk space check -----------------------------------------------------------------
+# Echoes the free space, in bytes, of the filesystem holding OUTPUT_DIR.
 free_bytes() {
     df -Pk "$OUTPUT_DIR" | awk 'NR==2 {print $4 * 1024}'
 }
 
+# Returns 0 when free space is at least DISK_WARN_BYTES. Otherwise logs,
+# prints the summary labelled "Batch aborted: disk space", and exits 1.
 check_disk_space() {
     local available
     available=$(free_bytes)
@@ -430,6 +484,7 @@ compute_output_path() {
 # -- Stream probe ------------------------------------------------------------------
 # Prints one line per stream group for the caller to parse:
 #   VIDEO <codec> <height> <fps> <label>
+#   VIDEOFMT <pix_fmt>                       ("unknown" when the probe reports none)
 #   VIDEOCOLOR <color_transfer> <has_dovi>   (transfer is "unknown" when untagged;
 #                                             has_dovi is 1 if the video stream
 #                                             carries a Dolby Vision configuration record)
@@ -535,6 +590,9 @@ else:
     height      = v.get('height', 0)
     print(f"VIDEO {codec_raw} {height} {fps} {codec_label}")
 
+    # Pixel format drives the copy/encode decision in build_video_args.
+    print(f"VIDEOFMT {v.get('pix_fmt', 'unknown')}")
+
     # Colour transfer and Dolby Vision presence drive the HDR-to-SDR decision
     # in build_video_args; an untagged transfer is reported as "unknown".
     transfer = v.get('color_transfer', 'unknown')
@@ -607,17 +665,21 @@ for s in subs:
 PYEOF
 }
 
-# -- Sidecar subtitle support (Plex-style Movie.en.srt / Movie.en.cc.srt) ----------
-# LANG_TABLE, LANG_3TO2, and LANG_LABEL_BASH come from the shared
-# lang_table.sh / lang_table.tsv (same directory) -- also the source the
-# Python probe step's LANG_NAMES reads (see probe_file()).
+# -- Sidecar subtitle support (Plex-style Movie.en.srt / Movie.en.cc.vtt) ----------
+# LANG_TABLE, LANG_3TO2, LANG_LABEL_BASH, LANG_ALIASES, LANG_CANON and
+# canon_lang() come from the shared lang_table.sh / lang_table.tsv (same
+# directory), also the source the Python probe step's LANG_NAMES reads (see
+# probe_file()).
 # shellcheck source=./lang_table.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lang_table.sh"
 
-# subtitle_output_codec(), discover_sidecar_subs() and
-# build_external_subtitle_args() come from the shared subtitle_mux.sh (same
+# subtitle_output_codec(), sidecar_output_codec(), probe_sidecar_codec(),
+# sidecar_needs_tag_strip(), find_sidecar_file(), discover_sidecar_subs(),
+# report_unclaimed_sidecars(), subtitle_track_type(), subtitle_track_key(),
+# verify_subtitle_count() and build_external_subtitle_args() come from the shared subtitle_mux.sh (same
 # directory), also used by subtitle_embed_params.sh, so the container-aware
-# codec decision and the sidecar-mux ffmpeg-arg logic exist in one place.
+# codec decision, the sidecar matching, and the sidecar-mux ffmpeg-arg logic
+# exist in one place.
 # shellcheck source=./subtitle_mux.sh
 source "$(dirname "${BASH_SOURCE[0]}")/subtitle_mux.sh"
 
@@ -640,24 +702,32 @@ if (( ! DRY_RUN )); then
     trap 'rm -f "$LOCK_FILE" 2>/dev/null || true; cleanup_stripped_subs' EXIT
 fi
 
+# Removes empty directories from the one holding $1 upward, stopping before
+# STOP_AT and never removing a directory that sits directly inside STOP_AT
+# (e.g. INPUT/Movies, one level under the scanned root passed to the script):
+# only the per-title folders below that are candidates, so the PARENT of the
+# current directory is checked against STOP_AT before attempting the rmdir.
+# An empty STOP_AT (file and glob inputs have no scanned root) removes nothing.
 cleanup_empty_dirs() {
     local DIR
     DIR="$(dirname "$1")"
     local STOP_AT="$2"
 
+    [[ -n "$STOP_AT" ]] || return 0
+
     while [[ "$DIR" != "$STOP_AT" && "$DIR" != "/" && "$DIR" != "." ]]; do
-        # Never remove a directory that sits directly inside STOP_AT (ROOT):
-        # e.g. INPUT/Movies, one level under the scanned root passed to the
-        # script. Only the folders below that - the per-title folders
-        # actually created for a single movie/show - are cleanup
-        # candidates, so this checks the PARENT of the current directory
-        # before attempting to remove it, not the directory itself.
         [[ "$(dirname "$DIR")" == "$STOP_AT" ]] && break
         rmdir "$DIR" 2>/dev/null || break
         DIR="$(dirname "$DIR")"
     done
 }
 
+# Copies SRC (an encoded output) to the same relative path under DEST_BASE,
+# verifies the copy by byte size, then removes SRC. ROOT is accepted for call
+# symmetry with backup_input() and is unused: the relative path is taken from
+# OUTPUT_DIR. A destination that already exists is never overwritten. Returns
+# 0 on success; returns 1 with SRC kept in place on any failure. In a dry run
+# it prints the plan and returns 0 without touching disk.
 archive_output() {
     local SRC="$1"
     local ROOT="$2"
@@ -668,6 +738,16 @@ archive_output() {
     local DEST_DIR
     DEST_DIR="$(dirname "$DEST")"
 
+    if (( DRY_RUN )); then
+        echo " [DRY RUN] Would archive: $SRC -> $DEST"
+        return 0
+    fi
+    if [[ -e "$DEST" ]]; then
+        echo " WARNING: archive destination already exists, not overwriting: $DEST" >&2
+        log "ARCHIVE FAILED (destination exists): $SRC"
+        return 1
+    fi
+
     echo " Archive -> $DEST"
     mkdir -p -- "$DEST_DIR" || {
         echo " WARNING: could not create archive directory: $DEST_DIR" >&2
@@ -675,7 +755,7 @@ archive_output() {
         return 1
     }
 
-    cp "$SRC" "$DEST" || {
+    cp -- "$SRC" "$DEST" || {
         echo " WARNING: cp failed: $SRC -> $DEST" >&2
         log "ARCHIVE FAILED (cp): $SRC"
         return 1
@@ -700,7 +780,7 @@ archive_output() {
         return 1
     fi
 
-    rm "$SRC" || {
+    rm -- "$SRC" || {
         echo " WARNING: archive copy verified but could not remove source: $SRC" >&2
         log "ARCHIVE WARNING (rm failed): $SRC"
         return 1
@@ -711,35 +791,58 @@ archive_output() {
     log "ARCHIVED: $(basename "$SRC")"
 }
 
+# Moves SRC under DEST_BASE, mirroring its path relative to ROOT (flat by file
+# name when ROOT is empty). Refuses to overwrite an existing destination.
+# LABEL ("" or " (sidecar)") is appended to messages. Returns 0 on success, 1
+# on any failure; every failure is logged.
+move_into_backup() {
+    local SRC="$1" ROOT="$2" DEST_BASE="$3" LABEL="$4"
+    local REL DEST DEST_DIR
+
+    if [[ -n "$ROOT" ]]; then
+        REL="${SRC#"${ROOT}"/}"
+    else
+        REL="$(basename "$SRC")"
+    fi
+    DEST="${DEST_BASE}/${REL}"
+    DEST_DIR="$(dirname "$DEST")"
+
+    if [[ -e "$DEST" ]]; then
+        echo " WARNING: backup destination already exists, not overwriting${LABEL}: $DEST" >&2
+        log "BACKUP FAILED (destination exists)${LABEL}: $SRC"
+        return 1
+    fi
+    if (( DRY_RUN )); then
+        echo " [DRY RUN] Would move${LABEL}: $SRC -> $DEST"
+        return 0
+    fi
+    mkdir -p -- "$DEST_DIR" || {
+        echo " WARNING: could not create backup directory${LABEL}: $DEST_DIR" >&2
+        log "BACKUP FAILED (mkdir)${LABEL}: $SRC"
+        return 1
+    }
+    mv -- "$SRC" "$DEST" || {
+        echo " WARNING: mv failed${LABEL}: $SRC -> $DEST" >&2
+        log "BACKUP FAILED (mv)${LABEL}: $SRC"
+        return 1
+    }
+
+    echo " Backup  -> ${DEST}${LABEL}"
+    log "BACKED UP: $(basename "$SRC")${LABEL}"
+}
+
+# Moves the source video into the backup tree, then removes the per-title
+# directories it emptied.
 backup_input() {
     local SRC="$1"
     local ROOT="$2"
     local DEST_BASE="$3"
 
-    local REL="${SRC#"${ROOT}"/}"
-    local DEST="${DEST_BASE}/${REL}"
-    local DEST_DIR
-    DEST_DIR="$(dirname "$DEST")"
-
-    echo " Backup  -> $DEST"
-    mkdir -p -- "$DEST_DIR" || {
-        echo " WARNING: could not create backup directory: $DEST_DIR" >&2
-        log "BACKUP FAILED (mkdir): $SRC"
-        return 1
-    }
-
-    mv -- "$SRC" "$DEST" || {
-        echo " WARNING: mv failed: $SRC -> $DEST" >&2
-        log "BACKUP FAILED (mv): $SRC"
-        return 1
-    }
-
+    move_into_backup "$SRC" "$ROOT" "$DEST_BASE" "" || return 1
     cleanup_empty_dirs "$SRC" "$ROOT"
-    echo " Backup  OK"
-    log "BACKED UP: $(basename "$SRC")"
 }
 
-# Moves each sidecar .srt file that was muxed into the output to BACKUP_DIR,
+# Moves each sidecar subtitle file that was muxed into the output to BACKUP_DIR,
 # mirrored relative to ROOT the same way backup_input() moves the source
 # video, so the backup tree keeps a video and its sidecar subs together.
 # Moves the ORIGINAL sidecar file, not the stripped mux copy used to feed
@@ -747,7 +850,8 @@ backup_input() {
 # swept by cleanup_stripped_subs, not backed up).
 # Called only after a successful encode with -A set. Takes ROOT and
 # DEST_BASE as its last two args; preceding args are "LANG TYPE PATH" lines
-# from discover_sidecar_subs (may be zero of them).
+# from discover_sidecar_subs (may be zero of them). Returns 1 if any sidecar
+# failed to move.
 backup_sidecar_subs() {
     local ROOT="${*: -2:1}"
     local DEST_BASE="${*: -1}"
@@ -756,31 +860,12 @@ backup_sidecar_subs() {
         LINES=("${@:1:$#-2}")
     fi
 
-    local line
+    local FAILED=0 line _lang _type SIDECAR_SRC
     for line in "${LINES[@]+"${LINES[@]}"}"; do
-        local _lang _type SIDECAR_SRC
         read -r _lang _type SIDECAR_SRC <<< "$line"
-
-        local REL="${SIDECAR_SRC#"${ROOT}"/}"
-        local DEST="${DEST_BASE}/${REL}"
-        local DEST_DIR
-        DEST_DIR="$(dirname "$DEST")"
-
-        mkdir -p -- "$DEST_DIR" || {
-            echo " WARNING: could not create backup directory for sidecar: $DEST_DIR" >&2
-            log "BACKUP FAILED (mkdir, sidecar): $SIDECAR_SRC"
-            continue
-        }
-
-        mv -- "$SIDECAR_SRC" "$DEST" || {
-            echo " WARNING: mv failed for sidecar: $SIDECAR_SRC -> $DEST" >&2
-            log "BACKUP FAILED (mv, sidecar): $SIDECAR_SRC"
-            continue
-        }
-
-        echo " Backup  -> $DEST (sidecar)"
-        log "BACKED UP: $(basename "$SIDECAR_SRC") (sidecar)"
+        move_into_backup "$SIDECAR_SRC" "$ROOT" "$DEST_BASE" " (sidecar)" || FAILED=1
     done
+    return "$FAILED"
 }
 
 # -- is_hdr_transfer ---------------------------------------------------------------
@@ -794,34 +879,39 @@ is_hdr_transfer() {
 # -- build_video_args ---------------------------------------------------------------
 # Appends the video-stream ffmpeg args to the array named by $1.
 # Args: array name, source codec, source height, source fps, source colour
-# transfer, source Dolby Vision flag (0/1).
-# Copy path: h264, within MAX_HEIGHT, and not PQ/HLG.
+# transfer, source Dolby Vision flag (0/1), source pixel format.
+# Copy path: h264, within MAX_HEIGHT, not PQ/HLG, and 8-bit 4:2:0 (yuv420p or
+# yuvj420p; an unreported pixel format is treated as eligible).
 # Encode path: everything else; PQ/HLG sources are tone-mapped to SDR and
 # tagged bt709, because libx264 writes the source's colour tags into the output
 # header unless they are set explicitly.
 build_video_args() {
     # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
     local -n _FF="$1"
-    local VID_CODEC="$2" SRC_HEIGHT="$3" SRC_FPS="$4" SRC_TRANSFER="$5" SRC_DOVI="$6"
+    local VID_CODEC="$2" SRC_HEIGHT="$3" SRC_FPS="$4" SRC_TRANSFER="$5" SRC_DOVI="$6" SRC_PIXFMT="$7"
     local OUT_HEIGHT VID_TITLE ENCODE_DESC
-    local NEEDS_SDR=0
+    local NEEDS_SDR=0 NEEDS_FMT=0
     local -a VF=()
 
     if is_hdr_transfer "$SRC_TRANSFER"; then
         NEEDS_SDR=1
     fi
+    case "$SRC_PIXFMT" in
+        yuv420p|yuvj420p|unknown) ;;
+        *) NEEDS_FMT=1 ;;
+    esac
     if (( SRC_DOVI )); then
         echo " WARNING: source carries a Dolby Vision configuration record" >&2
     fi
 
-    if [[ "$VID_CODEC" == "h264" ]] && (( SRC_HEIGHT <= MAX_HEIGHT )) && (( ! NEEDS_SDR )); then
-        echo " Video: COPY (already h264, SDR, within ${MAX_HEIGHT}p)"
+    if [[ "$VID_CODEC" == "h264" ]] && (( SRC_HEIGHT <= MAX_HEIGHT )) && (( ! NEEDS_SDR )) && (( ! NEEDS_FMT )); then
+        echo " Video: COPY (already h264, SDR, 8-bit 4:2:0, within ${MAX_HEIGHT}p)"
         _FF+=(-map 0:v:0 -c:v copy)
         VID_TITLE="H.264 ${SRC_HEIGHT}p"
     else
         _FF+=(-map 0:v:0)
         if [[ "$VID_CODEC" == "hevc" ]]; then
-            echo " WARNING: source is HEVC: x264 re-encode will very likely be LARGER and slower than the source (see README: HEVC and HDR sources)." >&2
+            echo " WARNING: source is HEVC: the x264 re-encode can be larger than the source; the post-encode size check reports the change (see README: HEVC and HDR sources)." >&2
         fi
         if (( SRC_HEIGHT > MAX_HEIGHT )); then
             OUT_HEIGHT=$MAX_HEIGHT
@@ -831,6 +921,9 @@ build_video_args() {
         else
             OUT_HEIGHT=$SRC_HEIGHT
             ENCODE_DESC="x264 @ native ${OUT_HEIGHT}p (source codec: $VID_CODEC)"
+        fi
+        if (( NEEDS_FMT )); then
+            ENCODE_DESC+=", pixel format $SRC_PIXFMT converted to yuv420p"
         fi
         if (( NEEDS_SDR )); then
             ENCODE_DESC+=", HDR ($SRC_TRANSFER) tone-mapped to SDR BT.709"
@@ -867,6 +960,8 @@ build_audio_args() {
     local -n _FF="$1"
     shift
     local -a AUDIO_LINES=("$@")
+    local -a _CODECS=()
+    local c line
 
     if [[ ${#AUDIO_LINES[@]} -eq 0 ]]; then
         echo " Audio: no streams found in source"
@@ -898,20 +993,23 @@ build_audio_args() {
 
 # -- build_subtitle_args -------------------------------------------------------------
 # Handles embedded subtitle tracks only. Does NOT strip leftover ASS
-# override tags (e.g. {\an8}) the way build_external_subtitle_args' sidecar
-# path does (see subtitle_tag_strip.sh): an embedded subrip/mov_text
+# override tags (e.g. {\an8}) the way process_file()'s sidecar path does
+# (see subtitle_tag_strip.sh): an embedded subrip/mov_text
 # track can't be sed'd in place the way a sidecar file on disk can. That
 # case is handled outside this script entirely, by subtitle_extract_params.sh:
 # run it once against a video with a risky embedded track and it produces
 # a proper sidecar file, which discover_sidecar_subs() below then finds and
 # prefers over the embedded track on the next encode - no changes needed
 # here to pick it up.
+# A second standard (non-CC, non-forced) embedded track of the same primary
+# language is dropped; the language is compared after alias resolution.
 build_subtitle_args() {
     # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
     local -n _FF="$1"
     local -n _OUT_IDX="$2"
     shift 2
     local -a SUB_LINES=("$@")
+    local line
 
     local -A _LANG_COUNT=()
 
@@ -942,8 +1040,10 @@ build_subtitle_args() {
         elif [[ "$IS_FORCED" == "1" ]]; then
             SUB_TITLE="${LANG_LABEL} Forced"
         else
-            _LANG_COUNT[$LANG]=$(( ${_LANG_COUNT[$LANG]:-0} + 1 ))
-            if (( ${_LANG_COUNT[$LANG]} > 1 )); then
+            local _lang_key
+            _lang_key="$(canon_lang "$LANG")"
+            _LANG_COUNT[$_lang_key]=$(( ${_LANG_COUNT[$_lang_key]:-0} + 1 ))
+            if (( ${_LANG_COUNT[$_lang_key]} > 1 )); then
                 echo " Subtitle[src:$SRC_IDX]: DROP ($LANG, duplicate standard track: no distinguishing title)"
                 continue
             fi
@@ -1008,16 +1108,45 @@ verify_sdr_output() {
     ! is_hdr_transfer "${TRANSFER:-unknown}"
 }
 
+# -- discard_encode_artifacts ---------------------------------------------------------
+# Removes the .tmp output and the stderr capture after a rejected encode and
+# clears the trackers the signal handler reads. Args: tmp path, stderr capture
+# path ("/dev/null" when no capture file exists).
+discard_encode_artifacts() {
+    rm -f -- "$1"
+    [[ "$2" != "/dev/null" ]] && rm -f -- "$2"
+    CURRENT_TMP=""
+    CURRENT_STDERR_CAPTURE=""
+    return 0
+}
+
 # -- execute_encode ------------------------------------------------------------------
+# Runs ffmpeg into OUTPUT_TMP, verifies the result (non-empty, SDR transfer,
+# subtitle stream count), promotes it to OUTPUT, then runs -M and -A. Args 7-9
+# are the names of the ffmpeg arg array, the container-flag array, and the
+# sidecar "LANG TYPE PATH" line array; arg 10 is the number of subtitle streams
+# the build step emitted. Returns 0 on success, 1 on any failure (including a
+# failed -M archive).
 execute_encode() {
     local INPUT="$1" OUTPUT="$2" OUTPUT_TMP="$3" OUTPUT_DIR_FOR_FILE="$4" ROOT="$5" SRC_CODEC_LABEL="$6"
     # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
     local -n _FF="$7"
     local -n _CF="$8"
     local -n _EXTSUB="$9"
+    local EXPECTED_SUBS="${10}"
 
+    if (( DRY_RUN )); then
+        echo " [DRY RUN] Would encode -> $OUTPUT"
+        return 3
+    fi
     check_disk_space
-    mkdir -p -- "$OUTPUT_DIR_FOR_FILE"
+    # errexit is inert in this function (process_file runs in a && || list),
+    # so every step that can fail is checked explicitly.
+    mkdir -p -- "$OUTPUT_DIR_FOR_FILE" || {
+        echo " ERROR: could not create output directory: $OUTPUT_DIR_FOR_FILE" >&2
+        log "FAILED (mkdir): $INPUT"
+        return 1
+    }
 
     echo " Running ffmpeg..."
     log "PROCESSING: $(basename "$INPUT")"
@@ -1081,29 +1210,37 @@ execute_encode() {
         if [[ ! -s "$OUTPUT_TMP" ]]; then
             echo " ERROR: ffmpeg exited 0 but output is empty" >&2
             log "FAILED (empty output): $INPUT"
-            rm -f "$OUTPUT_TMP"; [[ "$STDERR_CAPTURE" != "/dev/null" ]] && rm -f "$STDERR_CAPTURE"
-            CURRENT_TMP=""
-            CURRENT_STDERR_CAPTURE=""
+            discard_encode_artifacts "$OUTPUT_TMP" "$STDERR_CAPTURE"
             return 1
         fi
 
-        # The probe runs on the .tmp file, before the rename: a rejected file
+        # The probes run on the .tmp file, before the rename: a rejected file
         # never reaches OUTPUT_DIR, and -M (copy to the archive, then delete
-        # the output) and -A (move the source to the backup) never act on it.
+        # the output) and -A (move the source and sidecars to the backup)
+        # never act on it.
         if ! verify_sdr_output "$OUTPUT_TMP"; then
             echo " ERROR: output carries an HDR transfer function; not promoted to the output directory" >&2
             log "FAILED (HDR transfer in output): $INPUT"
-            rm -f "$OUTPUT_TMP"; [[ "$STDERR_CAPTURE" != "/dev/null" ]] && rm -f "$STDERR_CAPTURE"
-            CURRENT_TMP=""
-            CURRENT_STDERR_CAPTURE=""
+            discard_encode_artifacts "$OUTPUT_TMP" "$STDERR_CAPTURE"
             return 1
         fi
         if (( OUTPUT_DOVI )); then
             echo " WARNING: output carries a Dolby Vision configuration record" >&2
             log "DOVI WARNING: $(basename "$INPUT") | output carries a Dolby Vision configuration record"
         fi
+        if ! verify_subtitle_count "$OUTPUT_TMP" "$EXPECTED_SUBS"; then
+            echo " ERROR: output has ${SUB_COUNT_ACTUAL:-an unreadable number of} subtitle streams, expected $EXPECTED_SUBS; not promoted, source and sidecars untouched" >&2
+            log "FAILED (subtitle stream count ${SUB_COUNT_ACTUAL:-unreadable} != $EXPECTED_SUBS): $INPUT"
+            discard_encode_artifacts "$OUTPUT_TMP" "$STDERR_CAPTURE"
+            return 1
+        fi
 
-        mv -- "$OUTPUT_TMP" "$OUTPUT"
+        if ! mv -- "$OUTPUT_TMP" "$OUTPUT"; then
+            echo " ERROR: could not move output into place: $OUTPUT" >&2
+            log "FAILED (promote): $INPUT"
+            discard_encode_artifacts "$OUTPUT_TMP" "$STDERR_CAPTURE"
+            return 1
+        fi
         CURRENT_TMP=""
 
         local FILE_END FILE_DUR
@@ -1121,15 +1258,14 @@ execute_encode() {
         # byte comparison, not from a truncated division: integer division
         # truncates toward zero, so a naive single division mislabels small
         # shrinkage as "+0%" growth whenever the true percentage rounds to 0
-        # from below).
-        local SIZE_DIFF=""
+        # from below). GROWTH_PCT stays 0 unless the output is larger.
+        local SIZE_DIFF="" GROWTH_PCT=0
         if (( SRC_BYTES > 0 )); then
             if (( OUT_BYTES > SRC_BYTES )); then
-                local PCT=$(( (OUT_BYTES - SRC_BYTES) * 100 / SRC_BYTES ))
-                SIZE_DIFF="+${PCT}%"
+                GROWTH_PCT=$(( (OUT_BYTES - SRC_BYTES) * 100 / SRC_BYTES ))
+                SIZE_DIFF="+${GROWTH_PCT}%"
             elif (( OUT_BYTES < SRC_BYTES )); then
-                local PCT=$(( (SRC_BYTES - OUT_BYTES) * 100 / SRC_BYTES ))
-                SIZE_DIFF="-${PCT}%"
+                SIZE_DIFF="-$(( (SRC_BYTES - OUT_BYTES) * 100 / SRC_BYTES ))%"
             else
                 SIZE_DIFF="+0%"
             fi
@@ -1138,20 +1274,32 @@ execute_encode() {
         echo " Done -> $OUTPUT ($(( FILE_DUR / 60 ))m $(( FILE_DUR % 60 ))s, ${OUT_MB}MB)"
         log "COMPLETED: $(basename "$INPUT") [${SRC_CODEC_LABEL}] | $(( FILE_DUR / 60 ))m $(( FILE_DUR % 60 ))s | src: ${SRC_MB}MB -> out: ${OUT_MB}MB (${SIZE_DIFF})"
         # Ignore growth under 2%: rounding noise, not a real size regression
-        if (( OUT_BYTES > SRC_BYTES )) && (( PCT >= 2 )); then
+        if (( GROWTH_PCT >= 2 )); then
             echo " WARNING: output is larger than source (${SIZE_DIFF})" >&2
             log "SIZE WARNING: $(basename "$INPUT") | output ${OUT_MB}MB exceeds source ${SRC_MB}MB (${SIZE_DIFF})"
         fi
 
-        [[ -n "$ARCHIVE_DIR" ]] && archive_output "$OUTPUT" "$ROOT" "$ARCHIVE_DIR"
-        if [[ -n "$BACKUP_DIR" ]]; then
-            backup_sidecar_subs "${_EXTSUB[@]+"${_EXTSUB[@]}"}" "$ROOT" "$BACKUP_DIR"
-            backup_input "$INPUT" "$ROOT" "$BACKUP_DIR"
+        # The source and its sidecars move only after the output is safely in
+        # place: a failed archive leaves them where they are.
+        local POST_RC=0
+        if [[ -n "$ARCHIVE_DIR" ]]; then
+            archive_output "$OUTPUT" "$ROOT" "$ARCHIVE_DIR" || POST_RC=1
+        fi
+        if (( POST_RC )); then
+            echo " WARNING: archive failed; source and sidecars left in place, output kept at $OUTPUT" >&2
+            log "BACKUP SKIPPED (archive failed): $(basename "$INPUT")"
+        elif [[ -n "$BACKUP_DIR" ]]; then
+            if backup_sidecar_subs "${_EXTSUB[@]+"${_EXTSUB[@]}"}" "$ROOT" "$BACKUP_DIR"; then
+                backup_input "$INPUT" "$ROOT" "$BACKUP_DIR" || true
+            else
+                echo " WARNING: a sidecar move failed; source video left in place with its remaining sidecars" >&2
+                log "BACKUP SKIPPED (sidecar move failed): $(basename "$INPUT")"
+            fi
         fi
 
         [[ "$STDERR_CAPTURE" != "/dev/null" ]] && rm -f "$STDERR_CAPTURE"
         CURRENT_STDERR_CAPTURE=""
-        return 0
+        return "$POST_RC"
 
     else
         local FILE_END FILE_DUR
@@ -1160,9 +1308,7 @@ execute_encode() {
         [[ -s "$STDERR_CAPTURE" ]] && cat "$STDERR_CAPTURE" >&2
         echo " ERROR: ffmpeg exited $FFMPEG_RC" >&2
         log "FAILED: $INPUT (exit $FFMPEG_RC) | $(( FILE_DUR / 60 ))m $(( FILE_DUR % 60 ))s"
-        rm -f "$OUTPUT_TMP"; [[ "$STDERR_CAPTURE" != "/dev/null" ]] && rm -f "$STDERR_CAPTURE"
-        CURRENT_TMP=""
-        CURRENT_STDERR_CAPTURE=""
+        discard_encode_artifacts "$OUTPUT_TMP" "$STDERR_CAPTURE"
         return 1
     fi
 }
@@ -1171,6 +1317,7 @@ execute_encode() {
 process_file() {
     local INPUT="$1"
     local ROOT="$2"
+    local line
 
     local OUTPUT
     OUTPUT="$(compute_output_path "$INPUT" "$ROOT")"
@@ -1193,7 +1340,7 @@ process_file() {
     fi
 
     local VID_CODEC="" VID_CODEC_LABEL="" SRC_HEIGHT=0 SRC_FPS="24/1"
-    local SRC_TRANSFER="unknown" SRC_DOVI=0
+    local SRC_TRANSFER="unknown" SRC_DOVI=0 SRC_PIXFMT="unknown"
     local -a AUDIO_LINES=() SUB_LINES=()
     local PROBE_ERROR=""
 
@@ -1201,6 +1348,7 @@ process_file() {
         local TYPE="${line%% *}"
         case "$TYPE" in
             VIDEO)      read -r _ VID_CODEC SRC_HEIGHT SRC_FPS VID_CODEC_LABEL <<< "$line" ;;
+            VIDEOFMT)   read -r _ SRC_PIXFMT <<< "$line" ;;
             VIDEOCOLOR) read -r _ SRC_TRANSFER SRC_DOVI <<< "$line" ;;
             AUDIO)      AUDIO_LINES+=("$line") ;;
             SUB)        SUB_LINES+=("$line") ;;
@@ -1220,9 +1368,9 @@ process_file() {
         return 1
     fi
 
-    echo " Video codec: ${VID_CODEC_LABEL:-$VID_CODEC}  |  Height: ${SRC_HEIGHT}px  |  FPS: $SRC_FPS  |  Transfer: $SRC_TRANSFER"
+    echo " Video codec: ${VID_CODEC_LABEL:-$VID_CODEC}  |  Height: ${SRC_HEIGHT}px  |  FPS: $SRC_FPS  |  Pixel format: $SRC_PIXFMT  |  Transfer: $SRC_TRANSFER"
 
-    # Sidecar subtitles (Movie.en.srt / Movie.en.cc.srt / Movie.en.forced.srt).
+    # Sidecar subtitles (Movie.en.srt / Movie.en.cc.vtt / Movie.en.forced.ass, ...).
     # Raw "LANG TYPE PATH" lines, kept as-is (pointing at the ORIGINAL sidecar
     # files) for backup_sidecar_subs later - stripping happens separately,
     # below, only for the copy that gets fed to ffmpeg.
@@ -1231,38 +1379,53 @@ process_file() {
         [[ -n "$line" ]] && EXTSUB_LINES+=("$line")
     done < <(discover_sidecar_subs "$INPUT")
 
-    # Sidecar wins: an embedded track is dropped entirely for any language
-    # that has sidecar coverage, so the two are never both included.
+    # Files next to the video that discovery does not embed (other formats, a
+    # language outside -l, an unrecognized modifier, a shadowed .sdh.srt).
+    local _unclaimed
+    while IFS= read -r _unclaimed; do
+        [[ -n "$_unclaimed" ]] || continue
+        echo " WARNING: subtitle file not embedded, stays in the source directory: $(basename "$_unclaimed")" >&2
+        log "SUBTITLE FILE UNCLAIMED: $_unclaimed"
+    done < <(report_unclaimed_sidecars "$INPUT" "${EXTSUB_LINES[@]+"${EXTSUB_LINES[@]}"}")
+
+    # Sidecar wins per language and type: an embedded track is dropped only
+    # when a sidecar of the same primary language code and the same type
+    # (target, cc, forced) exists, so the two are never both included and an
+    # embedded forced or CC track survives a plain sidecar. Non-target and
+    # Signs & Songs embedded tracks are left for build_subtitle_args() to skip.
     if [[ ${#EXTSUB_LINES[@]} -gt 0 ]]; then
-        local -A _SIDECAR_LANGS=()
+        local -A _SIDECAR_KEYS=()
         for line in "${EXTSUB_LINES[@]}"; do
-            local _es_lang _rest
-            read -r _es_lang _rest <<< "$line"
-            _SIDECAR_LANGS[$_es_lang]=1
+            local _es_lang _es_type _es_rest
+            read -r _es_lang _es_type _es_rest <<< "$line"
+            _SIDECAR_KEYS["$(subtitle_track_key "$_es_lang" "$_es_type")"]=1
         done
 
         local -a _FILTERED_SUB_LINES=()
         for line in "${SUB_LINES[@]+"${SUB_LINES[@]}"}"; do
-            local _ _s_idx _s_codec _s_lang _s_rest
-            read -r _ _s_idx _s_codec _s_lang _s_rest <<< "$line"
-            if [[ -n "${_SIDECAR_LANGS[$_s_lang]+_}" ]]; then
-                echo " Subtitle[src:$_s_idx]: SKIP ($_s_lang, sidecar .srt present: sidecar wins over embedded)"
-                continue
+            local _ _s_idx _s_codec _s_lang _s_target _s_forced _s_signs _s_cc _s_rest
+            read -r _ _s_idx _s_codec _s_lang _s_target _s_forced _s_signs _s_cc _s_rest <<< "$line"
+            if [[ "$_s_target" == "1" && "$_s_signs" == "0" ]]; then
+                local _s_type _s_key
+                _s_type="$(subtitle_track_type "$_s_forced" "$_s_cc")"
+                _s_key="$(subtitle_track_key "$_s_lang" "$_s_type")"
+                if [[ -n "${_SIDECAR_KEYS[$_s_key]+_}" ]]; then
+                    echo " Subtitle[src:$_s_idx]: SKIP ($_s_lang/$_s_type, sidecar of the same language and type present: sidecar wins over embedded)"
+                    continue
+                fi
             fi
             _FILTERED_SUB_LINES+=("$line")
         done
         SUB_LINES=("${_FILTERED_SUB_LINES[@]+"${_FILTERED_SUB_LINES[@]}"}")
-        unset _SIDECAR_LANGS
+        unset _SIDECAR_KEYS
     fi
 
     local TITLE_TAG
     TITLE_TAG="$(basename "${OUTPUT%.*}")"
-    TITLE_TAG="${TITLE_TAG//\'/\'}"
-    TITLE_TAG="${TITLE_TAG//\\/\\}"
 
-    # Build the input list first: main video is input 0, each sidecar .srt
+    # Build the input list first: main video is input 0, each sidecar
     # gets its own -i and a sequential input index for -map. On a real run,
-    # each sidecar is run through strip_sidecar_sub() first so ffmpeg's -i
+    # each subrip sidecar is run through strip_sidecar_sub() first so ffmpeg's -i
     # points at a tag-stripped copy, never the original on-disk file - the
     # original path (in EXTSUB_LINES, above) is what backup_sidecar_subs()
     # moves later, so the stripped copy being scratch-only doesn't affect
@@ -1274,13 +1437,14 @@ process_file() {
     local -a INPUT_ARGS=(-analyzeduration "$PROBE_SIZE" -probesize "$PROBE_SIZE" -i "$INPUT")
     local -a EXTSUB_WITH_IDX=()
     local _next_input_idx=1
-    local line
     for line in "${EXTSUB_LINES[@]+"${EXTSUB_LINES[@]}"}"; do
         local _e_lang _e_type _e_path _e_mux_path
         read -r _e_lang _e_type _e_path <<< "$line"
 
         _e_mux_path="$_e_path"
-        if (( DRY_RUN )); then
+        if ! sidecar_needs_tag_strip "$_e_path"; then
+            :
+        elif (( DRY_RUN )); then
             echo " [DRY RUN] Would strip ASS override tags from: $(basename "$_e_path")"
         elif strip_sidecar_sub "$_e_path"; then
             _e_mux_path="$STRIPPED_SUB_PATH"
@@ -1298,7 +1462,7 @@ process_file() {
     local -a CONTAINER_FLAGS=()
     [[ "$OUT_FORMAT" == "mp4" ]] && CONTAINER_FLAGS+=(-movflags +faststart)
 
-    build_video_args    FF_ARGS "$VID_CODEC" "$SRC_HEIGHT" "$SRC_FPS" "$SRC_TRANSFER" "$SRC_DOVI"
+    build_video_args    FF_ARGS "$VID_CODEC" "$SRC_HEIGHT" "$SRC_FPS" "$SRC_TRANSFER" "$SRC_DOVI" "$SRC_PIXFMT"
     build_audio_args    FF_ARGS "${AUDIO_LINES[@]+"${AUDIO_LINES[@]}"}"
 
     local SUB_OUT_IDX=0
@@ -1312,7 +1476,7 @@ process_file() {
         return 3
     fi
 
-    execute_encode "$INPUT" "$OUTPUT" "$OUTPUT_TMP" "$OUTPUT_DIR_FOR_FILE" "$ROOT" "${VID_CODEC_LABEL:-$VID_CODEC}" FF_ARGS CONTAINER_FLAGS EXTSUB_LINES
+    execute_encode "$INPUT" "$OUTPUT" "$OUTPUT_TMP" "$OUTPUT_DIR_FOR_FILE" "$ROOT" "${VID_CODEC_LABEL:-$VID_CODEC}" FF_ARGS CONTAINER_FLAGS EXTSUB_LINES "$SUB_OUT_IDX"
 }
 
 # -- Main loop -------------------------------------------------------------------------
@@ -1336,7 +1500,7 @@ TOTAL_DUR=$(( SCRIPT_END - SCRIPT_START ))
 print_summary "Batch complete" "$TOTAL_DUR"
 
 if (( DRY_RUN )); then
-    echo "Log retained at: $LOG_FILE_TEMP (dry run)"
+    echo "Dry run: nothing was written."
 elif [[ $ENCODE_FAIL -eq 0 ]]; then
     LOG_FILE_FINAL="$LOG_DIR/Log_$(date '+%Y-%m-%d_%H%M').txt"
     mv -- "$LOG_FILE_TEMP" "$LOG_FILE_FINAL"

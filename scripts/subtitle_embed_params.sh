@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# subtitle_embed_params.sh: Muxes a sidecar .srt file into a video as a new
+# subtitle_embed_params.sh: Muxes a sidecar subtitle file (.srt, .vtt, .ass,
+# .ssa, or a text .sub) into a video as a new
 # subtitle stream, without re-encoding video or audio. This is
 # encoder_params.sh's sidecar-embedding mechanism (subtitle_tag_strip.sh +
 # subtitle_mux.sh), pulled out as its own tool for embedding a subtitle
@@ -40,11 +41,18 @@
 #     track's own explicit codec override as a genuine multiple-codec-option
 #     conflict on that output index, so every stream is enumerated
 #     individually instead. Only the newly embedded track(s) are new.
-#   * Every .srt muxed in - explicit or auto-discovered - has ASS override
-#     tags (e.g. {\an8}) stripped first via subtitle_tag_strip.sh; the
-#     original .srt file is never modified
+#   * Every subrip-codec sidecar muxed in - explicit or auto-discovered - has
+#     ASS override tags (e.g. {\an8}) stripped first via subtitle_tag_strip.sh;
+#     the original file is never modified. ASS/SSA, WebVTT and MicroDVD
+#     sidecars are not stripped: ASS keeps its tags as positioning (copied in
+#     MKV, converted to mov_text in MP4); WebVTT and MicroDVD convert to srt
+#     in MKV and mov_text in MP4
+#   * A sidecar is embedded even when the video already has an embedded track
+#     of the same language and type; both tracks are present in the output
 #   * Output is written atomically (.tmp -> rename) so an interrupted run is
-#     retry-safe
+#     retry-safe; the output's subtitle stream count is probed against the
+#     number of streams the command emitted before the rename, and a
+#     mismatch rejects the output
 #   * Locked per input file (canonical path), so two runs can't race on the
 #     same video; runs against different videos are not blocked by each other
 
@@ -126,7 +134,12 @@ if [[ -n "$EXPLICIT_SRT" ]]; then
     if [[ ! -f "$EXPLICIT_SRT" && -n "$BASE_DIR" && -f "${BASE_DIR}/${EXPLICIT_SRT}" ]]; then
         EXPLICIT_SRT="${BASE_DIR}/${EXPLICIT_SRT}"
     fi
-    [[ -f "$EXPLICIT_SRT" ]] || { echo "ERROR: srt input not found: $EXPLICIT_SRT" >&2; exit 1; }
+    [[ -f "$EXPLICIT_SRT" ]] || { echo "ERROR: subtitle input not found: $EXPLICIT_SRT" >&2; exit 1; }
+    EXPLICIT_CODEC="$(probe_sidecar_codec "$EXPLICIT_SRT")" || EXPLICIT_CODEC=""
+    [[ " $SUBTITLE_MUX_CODECS " == *" $EXPLICIT_CODEC "* ]] || {
+        echo "ERROR: unsupported subtitle codec '${EXPLICIT_CODEC:-unreadable}' in $EXPLICIT_SRT (supported: $SUBTITLE_MUX_CODECS)" >&2
+        exit 1
+    }
     case "$EXPLICIT_TYPE" in
         target|cc|forced) ;;
         *) echo "ERROR: -t must be target, cc, or forced (got: $EXPLICIT_TYPE)" >&2; exit 1 ;;
@@ -149,7 +162,7 @@ if [[ -f "$OUTPUT" ]] && (( SKIP_EXISTING )); then
 fi
 
 # -- Concurrency lock (per input file, not per output dir - see
-# Bash_Style_Guide.md section 6: hash the canonical path, not the raw
+# Linux_Script_Style_Guide.md section 5: hash the canonical path, not the raw
 # argument, so two different relative paths to the same file collide) -----
 INPUT_REAL="$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")"
 LOCK_DIR="${TMPDIR:-/tmp}/subtitle_embed_locks"
@@ -169,6 +182,9 @@ if (( ! DRY_RUN )); then
 fi
 
 CURRENT_TMP=""
+# SIGINT/SIGTERM handler. Removes the in-progress .tmp output named by
+# CURRENT_TMP, then exits 1 (the EXIT trap removes the lock and the
+# stripped-subtitle scratch directory). SIG is the signal name in the message.
 cleanup() {
     local SIG="$1"
     echo "" >&2
@@ -210,7 +226,9 @@ NEXT_INPUT_IDX=1
 for LINE in "${SRT_LINES[@]}"; do
     read -r LINE_LANG LINE_TYPE LINE_PATH <<< "$LINE"
     MUX_PATH="$LINE_PATH"
-    if (( DRY_RUN )); then
+    if ! sidecar_needs_tag_strip "$LINE_PATH"; then
+        :
+    elif (( DRY_RUN )); then
         echo " [DRY RUN] Would strip ASS override tags from: $(basename "$LINE_PATH")"
     elif strip_sidecar_sub "$LINE_PATH"; then
         MUX_PATH="$STRIPPED_SUB_PATH"
@@ -255,9 +273,19 @@ fi
 echo ""
 echo "Running ffmpeg..."
 CURRENT_TMP="$OUTPUT_TMP"
-if ffmpeg -hide_banner -loglevel warning -nostats "${FF_ARGS[@]}" "$OUTPUT_TMP"; then
+# A stale .tmp from a run killed past this script's own cleanup would make
+# ffmpeg prompt on stdin; it is this script's private scratch file, so it is
+# removed up front and -y is passed as defense in depth.
+rm -f -- "$OUTPUT_TMP"
+if ffmpeg -y -hide_banner -loglevel warning -nostats "${FF_ARGS[@]}" "$OUTPUT_TMP"; then
     if [[ ! -s "$OUTPUT_TMP" ]]; then
         echo "ERROR: ffmpeg exited 0 but output is empty" >&2
+        rm -f -- "$OUTPUT_TMP"
+        CURRENT_TMP=""
+        exit 1
+    fi
+    if ! verify_subtitle_count "$OUTPUT_TMP" "$SUB_OUT_IDX"; then
+        echo "ERROR: output has ${SUB_COUNT_ACTUAL:-an unreadable number of} subtitle streams, expected $SUB_OUT_IDX; not promoted" >&2
         rm -f -- "$OUTPUT_TMP"
         CURRENT_TMP=""
         exit 1

@@ -13,7 +13,7 @@ plex/
     ├── rename_dry.sh               Preview a rename batch (writes nothing)
     ├── rename.sh                   Run a rename batch for real
     ├── rename_params.sh            Plex-convention renamer for movies + TV episodes + subtitles (called by the two above; can also be run standalone)
-    ├── subtitle_mux.sh             Shared: container-aware subtitle codec choice, sidecar discovery, external-subtitle ffmpeg arg building
+    ├── subtitle_mux.sh             Shared: container-aware subtitle codec choice, sidecar discovery, embedded/sidecar matching, output stream-count check, external-subtitle ffmpeg arg building
     ├── subtitle_tag_strip.sh       Shared: strips leftover ASS override tags (e.g. {\an8}) from a plain-text subtitle file
     ├── subtitle_embed_dry.sh       Preview embedding a subtitle into one video (writes nothing)
     ├── subtitle_embed.sh           Embed a subtitle into one video for real
@@ -22,7 +22,7 @@ plex/
     ├── subtitle_extract.sh         Extract an embedded subtitle to a sidecar for real
     ├── subtitle_extract_params.sh  Core single-file subtitle extractor (called by the two above; can also be run standalone)
     ├── scan_subtitle_types.sh      Standalone, read-only inventory of embedded subtitle codecs across a directory - no wrapper, no config.sh dependency
-    ├── lang_table.sh               Shared language-code loader (bash side)
+    ├── lang_table.sh               Shared language-code loader (bash side) and canon_lang()
     └── lang_table.tsv              Canonical language data (single source of truth)
 ```
 
@@ -137,9 +137,9 @@ The subtitle single-file tools take their own locks too, scoped per input file (
 
 `lang_table.tsv` is the single source of truth for every language code, alias, and display label used across the project — add a language once here and it's picked up everywhere. Each row has a primary 3-letter code (`code3`, ISO 639-2), a 2-letter code (`code2`, ISO 639-1, used in sidecar filenames), a display label, and a comma-separated alias list (e.g. `fra`'s alias is the bibliographic `fre`). **Pass the primary `code3` to `-l`.** Sidecar discovery looks each `-l` value up in `LANG_3TO2` and silently skips a value with no entry, and the encoder's own check only warns when a value is not 2–3 letters. Aliases are for matching a file's own language tag and for display.
 
-- `encoder_params.sh` sources `lang_table.sh` for its bash-side sidecar matching (`LANG_TABLE`, `LANG_3TO2`, `LANG_LABEL_BASH`), and its Python probe step reads `lang_table.tsv` directly for embedded-track display labels (which resolve aliases).
+- `encoder_params.sh` sources `lang_table.sh` for its bash-side sidecar matching (`LANG_TABLE`, `LANG_3TO2`, `LANG_LABEL_BASH`, `canon_lang()`), and its Python probe step reads `lang_table.tsv` directly for embedded-track display labels (which resolve aliases).
 - `rename_params.sh` sources `lang_table.sh` for its `LANG_ALIASES` lookup, used to normalize subtitle filename language tags (e.g. `.eng.srt` → `.en.srt`, `.fre.srt` → `.fr.srt`) to the 2-letter form `encoder_params.sh`'s sidecar matching expects.
-- `subtitle_embed_params.sh` and `subtitle_extract_params.sh` source `lang_table.sh` directly. `subtitle_mux.sh` does not: it depends on `LANG_3TO2`/`LANG_LABEL_BASH` already being loaded by whichever script sourced it. `subtitle_extract_params.sh` resolves an embedded track's own language tag through `LANG_ALIASES` rather than `LANG_3TO2`, since that tag is read from the file, not typed by a user, and is commonly a bibliographic alias (`fre`, `ger`, `chi`, `dut`, `cze`, `rum`) rather than the primary code.
+- `subtitle_embed_params.sh` and `subtitle_extract_params.sh` source `lang_table.sh` directly. `subtitle_mux.sh` does not: it depends on `LANG_3TO2`/`LANG_LABEL_BASH`/`canon_lang()` already being loaded by whichever script sourced it. `canon_lang()` maps any code3, code2, or alias to the primary code3 (`und` → `eng`); `subtitle_mux.sh` and `subtitle_extract_params.sh` use it so a file's own tag compares equal to a code typed for `-l`. `subtitle_extract_params.sh` resolves an embedded track's own language tag through `LANG_ALIASES` rather than `LANG_3TO2` when naming the sidecar, since that tag is read from the file, not typed by a user, and is commonly a bibliographic alias (`fre`, `ger`, `chi`, `dut`, `cze`, `rum`) rather than the primary code.
 
 Both `lang_table.sh` and `lang_table.tsv` resolve their own file locations relative to themselves, not the caller's working directory, so this works regardless of where a script is invoked from. `lang_table.sh` is also safe to source more than once in the same process (an include guard makes the second call a no-op).
 
@@ -153,19 +153,24 @@ The core encoder is documented in full detail — every flag, the audio/subtitle
 
 | Source | Result |
 |---|---|
-| h264, SDR, height ≤ `MAX_HEIGHT` | Stream copy (colour tags are unchanged because the stream is not touched) |
+| h264, SDR, 8-bit 4:2:0 (`yuv420p`/`yuvj420p`), height ≤ `MAX_HEIGHT` | Stream copy (colour tags are unchanged because the stream is not touched) |
+| h264, SDR, any other pixel format (e.g. 10-bit), height ≤ `MAX_HEIGHT` | Re-encoded to x264 as `yuv420p` |
 | h264 with a PQ or HLG transfer, height ≤ `MAX_HEIGHT` | Tone-mapped to SDR, re-encoded to x264, tagged bt709 |
 | h264, height > `MAX_HEIGHT` | Scaled to `MAX_HEIGHT` (width derived from the aspect ratio, even-numbered), re-encoded to x264; if PQ or HLG, scaled and then tone-mapped |
 | Any other codec, SDR | Re-encoded to x264 at native or `MAX_HEIGHT` height |
 | Any other codec, PQ or HLG | Tone-mapped to SDR, re-encoded to x264, tagged bt709 |
 
+A source whose probe reports no pixel format is treated as eligible for stream copy.
+
 An HDR source is identified by its colour *transfer function* (`smpte2084` for PQ, `arib-std-b67` for HLG), read by the probe step. Colour primaries are not used: they describe gamut, and BT.2020 primaries can accompany an SDR curve.
 
 Every encoded file's video stream is probed while it is still the `.tmp` file. A file whose transfer function is still PQ or HLG is rejected: it is deleted, logged as `FAILED (HDR transfer in output)`, and never reaches `OUTPUT_DIR`. This ordering matters because `-M` copies the output to the archive and then deletes it, and `-A` moves the source to the backup directory; both run only after the probe passes. The encode can exit 0 with wrong tags, and those two steps are destructive.
 
+The same ordering applies to subtitles: the `.tmp` file's subtitle stream count is probed against the number of streams the encoder emitted. A mismatch deletes the file, logs `FAILED (subtitle stream count ...)`, and leaves the source and its sidecars untouched.
+
 ### HEVC and HDR sources
 
-**HEVC sources** are always re-encoded to x264. The script prints a warning because transcoding HEVC to x264 typically produces a larger file.
+**HEVC sources** are always re-encoded to x264. The script prints a warning because the x264 output can be larger than the HEVC source, and reports the size change after each encode.
 
 **HDR sources are converted to SDR rather than carried through, and tagged explicitly, for these reasons:**
 
@@ -189,7 +194,16 @@ The conversion filter chain lives in one constant, `SDR_TONEMAP_CHAIN`, near the
 
 ### Subtitles
 
-Sidecar discovery, the container-aware subtitle codec choice and external-subtitle ffmpeg arg building live in the shared `subtitle_mux.sh` (also used by `subtitle_embed_params.sh`). Sidecars are tag-stripped before muxing (see [Subtitle tag stripping](#subtitle-tag-stripping-subtitle_tag_stripsh)). An *embedded* track that needs stripping is not handled by `encoder_params.sh`: run `subtitle_extract_params.sh` against the video first, and the sidecar it writes is picked up by sidecar discovery on the next encode.
+Sidecar discovery, the container-aware subtitle codec choice, embedded/sidecar matching, the output stream-count check, and external-subtitle ffmpeg arg building live in the shared `subtitle_mux.sh` (also used by `subtitle_embed_params.sh`).
+
+- **Discovered sidecars:** `<name>.<lang2>.<ext>`, `.cc.<ext>` (or `.sdh.<ext>` when no `.cc` file exists), and `.forced.<ext>`, for each `-l` language. `<ext>` is `srt`, `vtt`, `ass`, `ssa` or `sub`, tried in that order; the first file whose probed codec is `subrip`, `webvtt`, `ass` or `microdvd` is claimed, and the others are reported as not embedded. A `.sub` that is not MicroDVD text (a VobSub bitmap) is not claimed.
+- **Sidecar codec:** in MKV, `webvtt` and `microdvd` convert to `srt`, and `ass` is copied; in MP4 every claimed format becomes `mov_text`. Only `subrip` sidecars are tag-stripped before muxing (see [Subtitle tag stripping](#subtitle-tag-stripping-subtitle_tag_stripsh)); an `ass` sidecar keeps its tags as positioning.
+- **Sidecar vs. embedded:** an embedded track is dropped only when a sidecar of the same primary language and the same type (standard, CC, forced) exists. Language codes are compared after alias resolution (`fre` = `fra`) and an untagged track counts as `eng`. An embedded forced or CC track survives a plain sidecar. A second standard embedded track of the same language is dropped.
+- **Files not embedded:** any other subtitle-extension file named `<video name>.*` next to the video (`.idx`, `.sup`, `.smi`, a bitmap `.sub`, a lower-precedence duplicate format such as `.en.ass` beside `.en.srt`, a language outside `-l`, an unrecognized modifier such as `.en.hi.srt`, an `.sdh` file shadowed by a `.cc` file) produces a warning and a log line. It is not embedded and not moved, and stays in the source directory.
+- **`-A` and sidecars:** the muxed sidecar originals move to the backup directory before the video, mirroring the same relative path (flat by file name for file and glob inputs). A destination that already exists is never overwritten. If any sidecar move fails, the video stays in place with its remaining sidecars.
+- **`-M` failure:** a failed archive leaves the output in place, skips `-A` for that file, and counts the file as failed.
+
+An *embedded* track that needs stripping is not handled by `encoder_params.sh`: run `subtitle_extract_params.sh` against the video first, and the sidecar it writes is picked up by sidecar discovery on the next encode.
 
 ## `rename_params.sh`
 
@@ -203,7 +217,7 @@ Skipped and logged rather than guessed: an unrecognized subtitle language or mod
 
 ## Subtitle tag stripping (`subtitle_tag_strip.sh`)
 
-Some subtitle files carry leftover ASS/SSA override tags (most commonly `{\an8}`, a positioning tag) as literal text, usually from a lazy ASS→SRT conversion somewhere upstream (a subtitle service, an encoder, etc). Most players, including Plex on TV clients, don't parse the tag and instead display it as on-screen text. `subtitle_tag_strip.sh` provides `strip_sidecar_sub()`, which strips any `{\...}` bracketed override sequence (structural match, not a tag-name keyword list) from a plain-text subtitle file, writing the result to a scratch copy — the original file is never modified.
+Some subtitle files carry leftover ASS/SSA override tags (for example `{\an8}`, a positioning tag) as literal text, from an ASS→SRT conversion that keeps the tags in the text. A player that does not parse the tag displays it as on-screen text. `subtitle_tag_strip.sh` provides `strip_sidecar_sub()`, which strips any `{\...}` bracketed override sequence (structural match, not a tag-name keyword list) from a `subrip` subtitle file, writing the result to a scratch copy — the original file is never modified.
 
 This is sidecar-file logic specifically (a real file already on disk); an *embedded* subtitle stream can't be edited in place the same way. `subtitle_extract_params.sh` handles that case by extracting the embedded track to a temp file first, then running it through the same `strip_sidecar_sub()`.
 
@@ -211,7 +225,7 @@ Genuine `ass`/`ssa` tracks are never run through this pipeline anywhere in this 
 
 ## `subtitle_embed_params.sh` / `subtitle_embed.sh` / `subtitle_embed_dry.sh`
 
-Embeds a sidecar `.srt` file into a video as a new subtitle stream, without re-encoding video or audio, using the same mechanism `encoder_params.sh` uses for sidecars. Takes an explicit `.srt` path or auto-discovers a Plex-convention sidecar next to the video (same convention as `encoder_params.sh`'s own `-l`/sidecar lookup). Every subtitle muxed in is tag-stripped first. Supports `.mkv`/`.mp4` only. See `-h` for the full flag set.
+Embeds a sidecar subtitle file (`.srt`, `.vtt`, `.ass`, `.ssa`, or a MicroDVD text `.sub`) into a video as a new subtitle stream, without re-encoding video or audio, using the same mechanism `encoder_params.sh` uses for sidecars. The output's subtitle stream count is probed before it is moved into place. Takes an explicit subtitle path or auto-discovers a Plex-convention sidecar next to the video (same convention as `encoder_params.sh`'s own `-l`/sidecar lookup). Every `subrip` subtitle muxed in is tag-stripped first. Supports `.mkv`/`.mp4` only. See `-h` for the full flag set.
 
 ## `subtitle_extract_params.sh` / `subtitle_extract.sh` / `subtitle_extract_dry.sh`
 

@@ -17,7 +17,9 @@
 #               extract. If omitted, auto-picks the first subrip/mov_text
 #               track matching -l LANG, skipping any Signs/Songs track by
 #               title (same skip rule encoder_params.sh's probe applies).
-#   -l LANG     3-letter language code to auto-pick by by (default: eng).
+#   -l LANG     3-letter language code to auto-pick by (default: eng). The
+#               track's own language tag is compared after alias resolution
+#               (fre = fra) and an untagged track (und) counts as eng.
 #               Ignored if -i is given explicitly.
 #   -o DIR      Directory to write the sidecar into (default: same
 #               directory as the input video)
@@ -41,9 +43,10 @@
 #   * The destination filename follows the same convention
 #     discover_sidecar_subs() (subtitle_mux.sh) already expects, so a
 #     subsequent encoder_params.sh or subtitle_embed_params.sh run picks
-#     it up as a normal sidecar - and per encoder_params.sh's existing
-#     rule, a sidecar wins over its embedded counterpart, so a later
-#     encode of this same video will prefer this new sidecar over the
+#     it up as a normal sidecar. The file's suffix carries the track's type
+#     (standard, .cc, .forced), and encoder_params.sh's rule is that a
+#     sidecar replaces an embedded track of the same language and the same
+#     type, so a later encode of this video prefers this sidecar over the
 #     embedded track it came from.
 #   * The source video is never modified; the embedded track stays exactly
 #     as it was. This script only ever writes the new sidecar file.
@@ -125,6 +128,9 @@ fi
 [[ -z "$OUT_DIR" ]] && OUT_DIR="$(dirname "$INPUT")"
 [[ -d "$OUT_DIR" ]] || { echo "ERROR: output directory does not exist: $OUT_DIR" >&2; exit 1; }
 
+# Primary code3 of -l, compared against each track's canonicalized tag.
+TARGET_CANON="$(canon_lang "$TARGET_LANG")"
+
 # -- Probe subtitle streams: prints "INDEX CODEC LANG IS_FORCED IS_CC
 # IS_SIGNS" one line per subtitle stream. IS_CC/IS_FORCED come from
 # disposition flags or title keywords, the same signal encoder_params.sh's
@@ -205,7 +211,7 @@ else
         [[ -n "$SRC_INDEX" ]] && break
         for LINE in "${SUB_LINES[@]}"; do
             read -r LINE_IDX LINE_CODEC LINE_LANG LINE_FORCED LINE_CC LINE_SIGNS <<< "$LINE"
-            [[ "$LINE_LANG" != "$TARGET_LANG" ]] && continue
+            [[ "$(canon_lang "$LINE_LANG")" != "$TARGET_CANON" ]] && continue
             [[ "$LINE_SIGNS" == "1" ]] && continue
             case "$LINE_CODEC" in
                 subrip|mov_text) ;;
@@ -310,6 +316,9 @@ init_subtitle_tag_strip || exit 1
 trap 'rm -f "$LOCK_FILE" 2>/dev/null || true; cleanup_stripped_subs' EXIT
 
 CURRENT_TMP=""
+# SIGINT/SIGTERM handler. Removes the in-progress .tmp output named by
+# CURRENT_TMP, then exits 1 (the EXIT trap removes the lock and the
+# stripped-subtitle scratch directory). SIG is the signal name in the message.
 cleanup() {
     local SIG="$1"
     echo "" >&2
@@ -349,6 +358,7 @@ fi
 echo "Stripping ASS override tags..."
 if ! strip_sidecar_sub "$RAW_EXTRACT"; then
     echo "ERROR: tag-strip failed on the extracted subtitle" >&2
+    rm -f -- "$RAW_EXTRACT"
     CURRENT_TMP=""
     exit 1
 fi

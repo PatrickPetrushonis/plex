@@ -2,15 +2,13 @@
 # subtitle_tag_strip.sh: Strips leftover ASS/SSA override tags (e.g. {\an8},
 # {\pos(400,300)}, {\c&HFF0000&}) from plain-text subtitle files. These tags
 # are valid ASS/SSA syntax but are not part of the SRT spec; when a subtitle
-# service does a lazy ASS→SRT conversion, the tags end up as literal text
-# instead of being interpreted, and most players (including Plex on TV
-# clients) render "{\an8}" on screen rather than positioning the line.
+# service does an ASS→SRT conversion that keeps the tags, they end up as
+# literal text instead of being interpreted, and a player that does not parse
+# them renders "{\an8}" on screen rather than positioning the line.
 #
-# Scope: sidecar .srt files only. Sidecars discovered by
-# discover_sidecar_subs() in encoder_params.sh are always plain SRT (see
-# that repo's naming convention: Movie.en.srt / Movie.en.cc.srt), so no
-# codec check is needed here - the caller only ever hands this module a
-# sidecar path.
+# Scope: sidecar files whose probed codec is subrip. The caller gates on
+# sidecar_needs_tag_strip() in subtitle_mux.sh and only hands this module
+# such a path; ASS/SSA, WebVTT and MicroDVD sidecars never reach it.
 #
 # Embedded subtitle tracks are handled by a separate tool,
 # subtitle_extract_params.sh, not by this module directly: an embedded
@@ -62,8 +60,8 @@ init_subtitle_tag_strip() {
 # never reached init_subtitle_tag_strip, or already cleaned up). Intended
 # to be wired into the caller's own EXIT trap alongside its existing
 # lock-file cleanup, so an interrupted run doesn't leave stripped copies
-# behind - the same reasoning Bash_Style_Guide.md section 6 applies to
-# restoring any state on exit, not just locks.
+# behind - the same reasoning Linux_Script_Style_Guide.md section 5 applies
+# to restoring any state on exit, not just locks.
 cleanup_stripped_subs() {
     [[ -n "$STRIPPED_TMP_DIR" && -d "$STRIPPED_TMP_DIR" ]] || return 0
     rm -rf -- "$STRIPPED_TMP_DIR" 2>/dev/null || true
@@ -73,8 +71,8 @@ cleanup_stripped_subs() {
 # Reads SRC (a plain sidecar .srt file), strips every {\...} override tag
 # from it, and writes the result to a new file under STRIPPED_TMP_DIR. Sets
 # STRIPPED_SUB_PATH to that new file's path. SRC itself is never modified -
-# the caller's original sidecar file (and its later backup_input-style
-# move) is unaffected by this function.
+# the caller's original sidecar file (and its later backup move) is
+# unaffected by this function.
 #
 # Returns 1 (STRIPPED_SUB_PATH left empty) if init_subtitle_tag_strip
 # hasn't been called, SRC doesn't exist, or the strip itself fails; the
