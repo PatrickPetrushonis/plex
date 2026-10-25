@@ -114,9 +114,42 @@ sidecar_needs_tag_strip() {
     [[ "$(probe_sidecar_codec "$1")" == "subrip" ]]
 }
 
+# Given a probed subtitle codec, echoes "EXT CODEC FORMAT" for writing it as a
+# standalone sidecar: the file extension, the ffmpeg -c:s value, and the ffmpeg
+# -f muxer. SubRip, ASS/SSA and WebVTT are copied (ASS keeps its styling);
+# mov_text and MicroDVD are converted to srt. Returns 1 with nothing echoed for
+# a codec with no text sidecar form (the bitmap codecs).
+sidecar_output_spec() {
+    case "$1" in
+        subrip)            echo "srt copy srt" ;;
+        mov_text|microdvd) echo "srt srt srt" ;;
+        webvtt)            echo "vtt copy webvtt" ;;
+        ass|ssa)           echo "ass copy ass" ;;
+        *)                 return 1 ;;
+    esac
+}
+
+# Echoes the sidecar file name (no directory) "<BASE>.<lang2>[.cc|.forced].<EXT>"
+# for a track of language LANG3 and TYPE (target|cc|forced); the suffixes match
+# subtitle_extract_params.sh. Returns 1 with nothing echoed if LANG3 has no
+# 2-letter code in the language table.
+sidecar_file_name() {
+    local BASE="$1" LANG3="$2" TYPE="$3" EXT="$4"
+    local LANG2 SUFFIX=""
+    LANG2="${LANG_3TO2[$(canon_lang "$LANG3")]:-}"
+    [[ -n "$LANG2" ]] || return 1
+    case "$TYPE" in
+        cc)     SUFFIX=".cc" ;;
+        forced) SUFFIX=".forced" ;;
+    esac
+    echo "${BASE}.${LANG2}${SUFFIX}.${EXT}"
+}
+
 # Echoes the first existing file named "<PREFIX>.<ext>" for ext in
-# SUBTITLE_MUX_EXTS whose probed codec is in SUBTITLE_MUX_CODECS. Returns 1 if
-# none qualifies. Exact name match only, no globbing.
+# SUBTITLE_MUX_EXTS whose probed codec is in SUBTITLE_MUX_CODECS and whose
+# bytes are valid UTF-8 (Plex expects UTF-8; a file in another encoding stays
+# unclaimed and report_unclaimed_sidecars() reports it). Returns 1 if none
+# qualifies. Exact name match only, no globbing. Needs iconv.
 find_sidecar_file() {
     local PREFIX="$1" ext f codec
     for ext in $SUBTITLE_MUX_EXTS; do
@@ -124,6 +157,7 @@ find_sidecar_file() {
         [[ -f "$f" ]] || continue
         codec="$(probe_sidecar_codec "$f")" || continue
         [[ " $SUBTITLE_MUX_CODECS " == *" $codec "* ]] || continue
+        iconv -f UTF-8 -t UTF-8 "$f" >/dev/null 2>&1 || continue
         echo "$f"
         return 0
     done
@@ -175,7 +209,8 @@ SUBTITLE_SIDECAR_EXTS="srt sub idx ass ssa vtt sup smi"
 # next to INPUT that is not among the claimed "LANG TYPE PATH" lines passed as
 # the remaining arguments (the output of discover_sidecar_subs). These are the
 # files discovery does not embed: formats outside SUBTITLE_MUX_EXTS (.idx,
-# .sup, .smi), a file whose probed codec is not muxed (a bitmap .sub), a
+# .sup, .smi), a file whose probed codec is not muxed (a bitmap .sub) or whose
+# text is not valid UTF-8, a
 # language outside SUB_LANGS, an unrecognized modifier (.en.hi.srt), a lower
 # precedence format of a claimed language and type (.en.ass beside .en.srt),
 # and an .sdh file shadowed by a .cc file. Matching is by string prefix, never by glob,

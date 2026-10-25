@@ -24,6 +24,9 @@
 #   -M PATH         After encode: cp output to this path (NAS/SMB mount), verify size, remove original
 #   -A PATH         After encode: mv source input and its muxed sidecar subtitle files to this
 #                   path, mirroring directory structure (flat by file name for file and glob inputs)
+#   -S MODE         Subtitle delivery (default: @DEFAULT_SUB_MODE@): embed muxes subtitles into
+#                   the output; sidecar extracts text subtitle tracks and writes input
+#                   sidecars next to the output as Plex-named files (see Notes)
 #   -d BYTES        Minimum free disk space before aborting, in bytes (default: 10737418240)
 #   -P SIZE         ffmpeg -analyzeduration and -probesize value (default: 10M)
 #   -h              Show this help
@@ -58,7 +61,18 @@
 #     (.idx, .sup, .smi, a bitmap .sub, a lower-precedence duplicate format,
 #     a language outside -l, an unrecognized modifier)
 #     are reported as warnings, are not embedded, and stay where they are
-#   * An embedded track that needs tag stripping is not handled here: run
+#   * -S sidecar: embedded text tracks (subrip, mov_text, webvtt, microdvd, ass/ssa) in target
+#     languages are extracted, and input sidecars are written, next to the output as
+#     <output name>.<lang2>[.cc|.forced].<ext> (srt; ass for ASS/SSA; vtt for WebVTT), in
+#     the same ffmpeg run that encodes the video. Extracted srt files have ASS override
+#     tags stripped. Bitmap tracks (PGS, VobSub) stay embedded in MKV and are dropped in
+#     MP4. Sidecars are promoted before the video, so an existing output video implies a
+#     complete set; a failed video promote removes the sidecars already promoted. -M
+#     copies the sidecars with the video. A second track with the same language and type,
+#     and a track whose language has no 2-letter code, are dropped. Input sidecars are
+#     written first, so they win a name collision. Existing sidecar files at the
+#     destination are overwritten, as the video is (-s skips on the video only)
+#   * -S embed: an embedded track that needs tag stripping is not handled here: run
 #     subtitle_extract_params.sh first, and the sidecar it writes is picked up
 #     on the next encode
 #   * Output is written atomically (.tmp -> rename) so interrupted runs are retry-safe
@@ -108,6 +122,9 @@ DISK_WARN_BYTES=$(( 10 * 1024 * 1024 * 1024 ))  # 10 GB
 PROBE_SIZE="10M"    # -P: analyzeduration / probesize passed to ffmpeg
 ARCHIVE_DIR=""      # -M: cp output here after encode (cross-device safe)
 BACKUP_DIR=""       # -A: mv source input here after encode
+SUB_MODE_CHOICES=(embed sidecar)   # valid -S values
+DEFAULT_SUB_MODE="embed"           # subtitle delivery when -S is not given: one of SUB_MODE_CHOICES
+SUB_MODE="$DEFAULT_SUB_MODE"       # -S: set from the option, validated in validate_params
 
 # Filter chain applied to PQ and HLG sources: linearize, convert primaries to
 # BT.709, tone-map, then convert to the BT.709 transfer and matrix at 8-bit
@@ -126,12 +143,13 @@ OUTPUT_DOVI=0
 
 # -- Usage -----------------------------------------------------------------------
 usage() {
-    grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//' || true
+    grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//' \
+        | sed "s/@DEFAULT_SUB_MODE@/${DEFAULT_SUB_MODE}/" || true
     exit 0
 }
 
 # -- Arg parsing -------------------------------------------------------------------
-while getopts ":o:c:p:b:H:f:l:a:e:L:M:A:d:P:rFnsh" opt; do
+while getopts ":o:c:p:b:H:f:l:a:e:L:M:A:S:d:P:rFnsh" opt; do
     case $opt in
         o) OUTPUT_DIR="$OPTARG" ;;
         c) CRF="$OPTARG" ;;
@@ -147,6 +165,7 @@ while getopts ":o:c:p:b:H:f:l:a:e:L:M:A:d:P:rFnsh" opt; do
         P) PROBE_SIZE="$OPTARG" ;;
         M) ARCHIVE_DIR="$OPTARG" ;;
         A) BACKUP_DIR="$OPTARG" ;;
+        S) SUB_MODE="$OPTARG" ;;
         r) RECURSE=1 ;;
         F) FLAT_OUTPUT=1 ;;
         n) DRY_RUN=1 ;;
@@ -186,6 +205,15 @@ validate_params() {
         (( errors++ )) || true
     fi
 
+    local m valid_mode=0
+    for m in "${SUB_MODE_CHOICES[@]}"; do
+        [[ "$SUB_MODE" == "$m" ]] && valid_mode=1
+    done
+    if (( ! valid_mode )); then
+        echo "ERROR: -S must be one of: ${SUB_MODE_CHOICES[*]} (got: $SUB_MODE)" >&2
+        (( errors++ )) || true
+    fi
+
     if ! [[ "$MAX_HEIGHT" =~ ^[0-9]+$ ]] || (( MAX_HEIGHT < 1 )); then
         echo "ERROR: MAX_HEIGHT must be a positive integer (got: $MAX_HEIGHT)" >&2
         (( errors++ )) || true
@@ -215,6 +243,7 @@ require ffprobe
 require python3
 require flock
 require sed
+require iconv
 
 # zscale (libzimg) and tonemap convert HDR sources to SDR; checked here so a
 # batch fails before any work instead of on the first HDR file. The filter
@@ -338,6 +367,12 @@ print_summary() {
 CURRENT_TMP=""
 CURRENT_STDERR_CAPTURE=""
 CURRENT_FFMPEG_PID=""
+# Sidecar .tmp files of the encode in progress (-S sidecar); the signal handler
+# and discard_encode_artifacts() remove them.
+declare -a CURRENT_SIDECAR_TMPS=()
+# Set by build_subtitle_args() in -S sidecar mode: one "SRC_IDX CODEC TYPE LANG3"
+# line per embedded text track to extract. process_file() resets it per file.
+declare -a SIDECAR_EXTRACT_LINES=()
 
 # SIGINT/SIGTERM handler. Stops the running ffmpeg, removes the partial .tmp
 # output and the stderr capture, prints the summary labelled ABORTED, and exits
@@ -356,6 +391,10 @@ cleanup() {
         echo "  Removing partial output: $CURRENT_TMP" >&2
         rm -f "$CURRENT_TMP"
     fi
+    local _t
+    for _t in "${CURRENT_SIDECAR_TMPS[@]+"${CURRENT_SIDECAR_TMPS[@]}"}"; do
+        rm -f -- "$_t"
+    done
     [[ -n "$CURRENT_STDERR_CAPTURE" && -f "$CURRENT_STDERR_CAPTURE" ]] && rm -f "$CURRENT_STDERR_CAPTURE"
     print_summary "ABORTED by $SIG"
     (( DRY_RUN )) || echo "Log retained at: $LOG_FILE_TEMP" >&2
@@ -672,6 +711,10 @@ PYEOF
 # probe_file()).
 # shellcheck source=./lang_table.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lang_table.sh"
+declare -F canon_lang >/dev/null || {
+    echo "ERROR: canon_lang is not defined; lang_table.sh is not the version this script requires" >&2
+    exit 1
+}
 
 # subtitle_output_codec(), sidecar_output_codec(), probe_sidecar_codec(),
 # sidecar_needs_tag_strip(), find_sidecar_file(), discover_sidecar_subs(),
@@ -974,33 +1017,32 @@ build_audio_args() {
 
     local OUT_AUDIO_IDX=0
     for line in "${AUDIO_LINES[@]}"; do
-        local _ SRC_IDX ACODEC LANG AUDIO_TITLE
-        read -r _ SRC_IDX ACODEC LANG AUDIO_TITLE <<< "$line"
+        local _ SRC_IDX ACODEC AUDIO_LANG AUDIO_TITLE
+        read -r _ SRC_IDX ACODEC AUDIO_LANG AUDIO_TITLE <<< "$line"
         _FF+=(-map "0:${SRC_IDX}")
         if [[ -n "${COPY_SET[$ACODEC]+_}" ]]; then
-            echo " Audio[src:$SRC_IDX -> out:$OUT_AUDIO_IDX]: COPY ($ACODEC / $LANG)"
+            echo " Audio[src:$SRC_IDX -> out:$OUT_AUDIO_IDX]: COPY ($ACODEC / $AUDIO_LANG)"
             _FF+=("-c:a:${OUT_AUDIO_IDX}" copy)
         else
-            echo " Audio[src:$SRC_IDX -> out:$OUT_AUDIO_IDX]: ENCODE -> aac @ ${AUDIO_BITRATE} (source: $ACODEC / $LANG)"
+            echo " Audio[src:$SRC_IDX -> out:$OUT_AUDIO_IDX]: ENCODE -> aac @ ${AUDIO_BITRATE} (source: $ACODEC / $AUDIO_LANG)"
             _FF+=("-c:a:${OUT_AUDIO_IDX}" aac "-b:a:${OUT_AUDIO_IDX}" "$AUDIO_BITRATE")
             AUDIO_TITLE="AAC ${AUDIO_TITLE#* }"  # replace codec, keep language + layout
         fi
-        _FF+=("-metadata:s:a:${OUT_AUDIO_IDX}" "language=${LANG}")
+        _FF+=("-metadata:s:a:${OUT_AUDIO_IDX}" "language=${AUDIO_LANG}")
         _FF+=("-metadata:s:a:${OUT_AUDIO_IDX}" "title=${AUDIO_TITLE}")
         OUT_AUDIO_IDX=$(( OUT_AUDIO_IDX + 1 ))
     done
 }
 
 # -- build_subtitle_args -------------------------------------------------------------
-# Handles embedded subtitle tracks only. Does NOT strip leftover ASS
-# override tags (e.g. {\an8}) the way process_file()'s sidecar path does
-# (see subtitle_tag_strip.sh): an embedded subrip/mov_text
-# track can't be sed'd in place the way a sidecar file on disk can. That
-# case is handled outside this script entirely, by subtitle_extract_params.sh:
-# run it once against a video with a risky embedded track and it produces
-# a proper sidecar file, which discover_sidecar_subs() below then finds and
-# prefers over the embedded track on the next encode - no changes needed
-# here to pick it up.
+# Selects embedded subtitle tracks. In -S embed mode each kept track becomes an
+# embedded stream in the output. In -S sidecar mode a kept track that has a text
+# sidecar form (see sidecar_output_spec) is appended to SIDECAR_EXTRACT_LINES as
+# "SRC_IDX CODEC TYPE LANG3" and written as a file by build_sidecar_outputs();
+# bitmap tracks stay embedded. This function does not strip ASS override tags
+# (e.g. {\an8}): -S sidecar strips the extracted srt files, and in -S embed mode
+# subtitle_extract_params.sh writes a stripped sidecar that discover_sidecar_subs()
+# finds on the next encode.
 # A second standard (non-CC, non-forced) embedded track of the same primary
 # language is dropped; the language is compared after alias resolution.
 build_subtitle_args() {
@@ -1014,15 +1056,15 @@ build_subtitle_args() {
     local -A _LANG_COUNT=()
 
     for line in "${SUB_LINES[@]+"${SUB_LINES[@]}"}"; do
-        local _ SRC_IDX SUB_CODEC LANG IS_TARGET IS_FORCED IS_SIGNS IS_CC LANG_LABEL
-        read -r _ SRC_IDX SUB_CODEC LANG IS_TARGET IS_FORCED IS_SIGNS IS_CC LANG_LABEL <<< "$line"
+        local _ SRC_IDX SUB_CODEC SUB_LANG IS_TARGET IS_FORCED IS_SIGNS IS_CC LANG_LABEL
+        read -r _ SRC_IDX SUB_CODEC SUB_LANG IS_TARGET IS_FORCED IS_SIGNS IS_CC LANG_LABEL <<< "$line"
 
         if [[ "$IS_TARGET" == "0" ]]; then
-            echo " Subtitle[src:$SRC_IDX]: SKIP ($LANG, not in target languages)"
+            echo " Subtitle[src:$SRC_IDX]: SKIP ($SUB_LANG, not in target languages)"
             continue
         fi
         if [[ "$IS_SIGNS" == "1" ]]; then
-            echo " Subtitle[src:$SRC_IDX]: SKIP ($LANG, Signs & Songs)"
+            echo " Subtitle[src:$SRC_IDX]: SKIP ($SUB_LANG, Signs & Songs)"
             continue
         fi
 
@@ -1030,7 +1072,7 @@ build_subtitle_args() {
         OUT_SUB_CODEC="$(subtitle_output_codec "$SUB_CODEC")"
 
         if [[ "$OUT_SUB_CODEC" == "DROP" ]]; then
-            echo " Subtitle[src:$SRC_IDX]: DROP ($LANG, $SUB_CODEC bitmap format incompatible with MP4)"
+            echo " Subtitle[src:$SRC_IDX]: DROP ($SUB_LANG, $SUB_CODEC bitmap format incompatible with MP4)"
             continue
         fi
 
@@ -1041,13 +1083,19 @@ build_subtitle_args() {
             SUB_TITLE="${LANG_LABEL} Forced"
         else
             local _lang_key
-            _lang_key="$(canon_lang "$LANG")"
+            _lang_key="$(canon_lang "$SUB_LANG")"
             _LANG_COUNT[$_lang_key]=$(( ${_LANG_COUNT[$_lang_key]:-0} + 1 ))
             if (( ${_LANG_COUNT[$_lang_key]} > 1 )); then
-                echo " Subtitle[src:$SRC_IDX]: DROP ($LANG, duplicate standard track: no distinguishing title)"
+                echo " Subtitle[src:$SRC_IDX]: DROP ($SUB_LANG, duplicate standard track: no distinguishing title)"
                 continue
             fi
             SUB_TITLE="${LANG_LABEL}"
+        fi
+
+        if [[ "$SUB_MODE" == "sidecar" ]] && sidecar_output_spec "$SUB_CODEC" >/dev/null; then
+            echo " Subtitle[src:$SRC_IDX]: SIDECAR: $SUB_TITLE ($SUB_CODEC)"
+            SIDECAR_EXTRACT_LINES+=("${SRC_IDX} ${SUB_CODEC} $(subtitle_track_type "$IS_FORCED" "$IS_CC") ${SUB_LANG}")
+            continue
         fi
 
         echo " Subtitle[src:$SRC_IDX -> out:${_OUT_IDX}]: INCLUDE: $SUB_TITLE ($SUB_CODEC -> $OUT_SUB_CODEC)"
@@ -1055,7 +1103,7 @@ build_subtitle_args() {
         _FF+=(
             -map "0:${SRC_IDX}"
             "-c:s:${_OUT_IDX}" "$OUT_SUB_CODEC"
-            "-metadata:s:s:${_OUT_IDX}" "language=${LANG}"
+            "-metadata:s:s:${_OUT_IDX}" "language=${SUB_LANG}"
             "-metadata:s:s:${_OUT_IDX}" "title=${SUB_TITLE}"
         )
 
@@ -1070,6 +1118,117 @@ build_subtitle_args() {
         _OUT_IDX=$(( _OUT_IDX + 1 ))
     done
     unset _LANG_COUNT
+}
+
+# -- build_sidecar_outputs ------------------------------------------------------------
+# -S sidecar mode. Plans one standalone sidecar file per input sidecar line
+# ("LANG TYPE INPUT_IDX PATH", the ffmpeg input each was opened as) and per
+# extracted embedded track (SIDECAR_EXTRACT_LINES). Args: output base name,
+# output directory, the names of the ffmpeg output-argument array and the job
+# array, then the input sidecar lines. Appends to the first array the ffmpeg
+# arguments that follow the main output, and to the second one tab-separated
+# line per file: "STRIP<TAB>TMP_PATH<TAB>FINAL_PATH", where STRIP is 1 for an
+# extracted srt file that still needs its ASS override tags stripped. Input
+# sidecars are planned first, so on a name collision they win; a later track
+# with the same final name is dropped, as is a track whose language has no
+# 2-letter code. Final names are <base>.<lang2>[.cc|.forced].<ext>.
+build_sidecar_outputs() {
+    local OUT_BASE="$1" OUT_DIR="$2"
+    # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
+    local -n _SFF="$3"
+    local -n _JOBS="$4"
+    shift 4
+    local -a PLAN=()
+    local line
+
+    for line in "$@"; do
+        local I_LANG I_TYPE I_IDX I_PATH I_CODEC
+        read -r I_LANG I_TYPE I_IDX I_PATH <<< "$line"
+        I_CODEC="$(probe_sidecar_codec "$I_PATH")" || I_CODEC=""
+        PLAN+=("${I_IDX}:0"$'\t'"${I_CODEC}"$'\t'"${I_TYPE}"$'\t'"${I_LANG}"$'\t'"0"$'\t'"external:$(basename "$I_PATH")")
+    done
+    for line in "${SIDECAR_EXTRACT_LINES[@]+"${SIDECAR_EXTRACT_LINES[@]}"}"; do
+        local X_IDX X_CODEC X_TYPE X_LANG
+        read -r X_IDX X_CODEC X_TYPE X_LANG <<< "$line"
+        PLAN+=("0:${X_IDX}"$'\t'"${X_CODEC}"$'\t'"${X_TYPE}"$'\t'"${X_LANG}"$'\t'"1"$'\t'"src:${X_IDX}")
+    done
+
+    local -A SEEN=()
+    for line in "${PLAN[@]+"${PLAN[@]}"}"; do
+        local P_MAP P_CODEC P_TYPE P_LANG P_STRIP P_LABEL P_SPEC P_EXT P_CODEC_OUT P_FMT P_NAME P_TMP
+        IFS=$'\t' read -r P_MAP P_CODEC P_TYPE P_LANG P_STRIP P_LABEL <<< "$line"
+        if ! P_SPEC="$(sidecar_output_spec "$P_CODEC")"; then
+            echo " Sidecar[$P_LABEL]: DROP (no text sidecar form for codec '${P_CODEC:-unreadable}')"
+            continue
+        fi
+        read -r P_EXT P_CODEC_OUT P_FMT <<< "$P_SPEC"
+        if ! P_NAME="$(sidecar_file_name "$OUT_BASE" "$P_LANG" "$P_TYPE" "$P_EXT")"; then
+            echo " Sidecar[$P_LABEL]: DROP ($P_LANG has no 2-letter code in the language table)"
+            continue
+        fi
+        if [[ -n "${SEEN[$P_NAME]+_}" ]]; then
+            echo " Sidecar[$P_LABEL]: DROP (duplicate of $P_NAME)"
+            continue
+        fi
+        SEEN["$P_NAME"]=1
+        [[ "$P_EXT" == "srt" ]] || P_STRIP=0
+        P_TMP="${OUT_DIR}/.${P_NAME%.*}.tmp.${P_EXT}"
+        _SFF+=(-map "$P_MAP" -c:s "$P_CODEC_OUT" -f "$P_FMT" "$P_TMP")
+        _JOBS+=("${P_STRIP}"$'\t'"${P_TMP}"$'\t'"${OUT_DIR}/${P_NAME}")
+        echo " Sidecar[$P_LABEL]: WRITE $P_NAME ($P_CODEC -> $P_CODEC_OUT)"
+    done
+}
+
+# Checks each sidecar .tmp file named by the job array (arg 1) is non-empty and
+# strips ASS override tags from the ones marked for it, replacing the .tmp file
+# in place. A failed strip keeps the unstripped file with a warning. Returns 1
+# on the first empty or missing file.
+prepare_sidecars() {
+    local -n _PJOBS="$1"
+    local job p_strip p_tmp p_final
+    for job in "${_PJOBS[@]+"${_PJOBS[@]}"}"; do
+        IFS=$'\t' read -r p_strip p_tmp p_final <<< "$job"
+        if [[ ! -s "$p_tmp" ]]; then
+            echo " ERROR: sidecar is empty or missing: $(basename "$p_final")" >&2
+            return 1
+        fi
+        [[ "$p_strip" == "1" ]] || continue
+        if strip_sidecar_sub "$p_tmp" && mv -- "$STRIPPED_SUB_PATH" "$p_tmp"; then
+            :
+        else
+            echo " WARNING: tag-strip failed for $(basename "$p_final"); keeping the unstripped file" >&2
+            log "SUBTITLE TAG STRIP FAILED: $p_final (written unstripped)"
+        fi
+    done
+}
+
+# Moves each sidecar .tmp file named by the job array (arg 1) to its final
+# path (mv -T, so an existing directory at the final path is an error, not a
+# move into it). On a failed move, removes the sidecars already moved and returns 1.
+promote_sidecars() {
+    local -n _MJOBS="$1"
+    local job m_strip m_tmp m_final
+    local -a moved=()
+    for job in "${_MJOBS[@]+"${_MJOBS[@]}"}"; do
+        IFS=$'\t' read -r m_strip m_tmp m_final <<< "$job"
+        if ! mv -T -- "$m_tmp" "$m_final"; then
+            echo " ERROR: could not move sidecar into place: $m_final" >&2
+            local f
+            for f in "${moved[@]+"${moved[@]}"}"; do rm -f -- "$f"; done
+            return 1
+        fi
+        moved+=("$m_final")
+    done
+}
+
+# Removes the final sidecar files named by the job array (arg 1).
+remove_sidecar_finals() {
+    local -n _RJOBS="$1"
+    local job r_strip r_tmp r_final
+    for job in "${_RJOBS[@]+"${_RJOBS[@]}"}"; do
+        IFS=$'\t' read -r r_strip r_tmp r_final <<< "$job"
+        rm -f -- "$r_final"
+    done
 }
 
 # -- log_ffmpeg_warnings --------------------------------------------------------------
@@ -1109,12 +1268,17 @@ verify_sdr_output() {
 }
 
 # -- discard_encode_artifacts ---------------------------------------------------------
-# Removes the .tmp output and the stderr capture after a rejected encode and
-# clears the trackers the signal handler reads. Args: tmp path, stderr capture
-# path ("/dev/null" when no capture file exists).
+# Removes the .tmp output, the sidecar .tmp files, and the stderr capture after
+# a rejected encode and clears the trackers the signal handler reads. Args: tmp
+# path, stderr capture path ("/dev/null" when no capture file exists).
 discard_encode_artifacts() {
+    local _t
     rm -f -- "$1"
+    for _t in "${CURRENT_SIDECAR_TMPS[@]+"${CURRENT_SIDECAR_TMPS[@]}"}"; do
+        rm -f -- "$_t"
+    done
     [[ "$2" != "/dev/null" ]] && rm -f -- "$2"
+    CURRENT_SIDECAR_TMPS=()
     CURRENT_TMP=""
     CURRENT_STDERR_CAPTURE=""
     return 0
@@ -1125,7 +1289,9 @@ discard_encode_artifacts() {
 # subtitle stream count), promotes it to OUTPUT, then runs -M and -A. Args 7-9
 # are the names of the ffmpeg arg array, the container-flag array, and the
 # sidecar "LANG TYPE PATH" line array; arg 10 is the number of subtitle streams
-# the build step emitted. Returns 0 on success, 1 on any failure (including a
+# the build step emitted; args 11 and 12 are the names of the sidecar ffmpeg
+# output-argument array and sidecar job array (-S sidecar; empty otherwise, see
+# build_sidecar_outputs). Returns 0 on success, 1 on any failure (including a
 # failed -M archive).
 execute_encode() {
     local INPUT="$1" OUTPUT="$2" OUTPUT_TMP="$3" OUTPUT_DIR_FOR_FILE="$4" ROOT="$5" SRC_CODEC_LABEL="$6"
@@ -1134,6 +1300,8 @@ execute_encode() {
     local -n _CF="$8"
     local -n _EXTSUB="$9"
     local EXPECTED_SUBS="${10}"
+    local -n _SFF="${11}"
+    local -n _JOBS="${12}"
 
     if (( DRY_RUN )); then
         echo " [DRY RUN] Would encode -> $OUTPUT"
@@ -1154,6 +1322,15 @@ execute_encode() {
     FILE_START=$(date +%s)
 
     CURRENT_TMP="$OUTPUT_TMP"
+    # The sidecar .tmp files are this script's private scratch like OUTPUT_TMP:
+    # a leftover one is replaced without a collision policy.
+    CURRENT_SIDECAR_TMPS=()
+    local _job _j_strip _j_tmp _j_final
+    for _job in "${_JOBS[@]+"${_JOBS[@]}"}"; do
+        IFS=$'\t' read -r _j_strip _j_tmp _j_final <<< "$_job"
+        CURRENT_SIDECAR_TMPS+=("$_j_tmp")
+        rm -f -- "$_j_tmp"
+    done
 
     # A leftover .tmp from a run killed hard enough to skip this script's
     # own SIGINT/SIGTERM cleanup (SIGKILL, a power loss, a container stop)
@@ -1182,7 +1359,8 @@ execute_encode() {
     ffmpeg -y -hide_banner -loglevel warning -nostats \
             "${_FF[@]}" \
             ${_CF[@]+"${_CF[@]}"} \
-            "$OUTPUT_TMP" 2> "$STDERR_CAPTURE" &
+            "$OUTPUT_TMP" \
+            ${_SFF[@]+"${_SFF[@]}"} 2> "$STDERR_CAPTURE" &
     local FFMPEG_PID=$!
     CURRENT_FFMPEG_PID=$FFMPEG_PID
 
@@ -1235,13 +1413,27 @@ execute_encode() {
             return 1
         fi
 
+        if ! prepare_sidecars _JOBS; then
+            log "FAILED (sidecar output): $INPUT"
+            discard_encode_artifacts "$OUTPUT_TMP" "$STDERR_CAPTURE"
+            return 1
+        fi
+        # Sidecars first, video last: an existing output video implies a
+        # complete set.
+        if ! promote_sidecars _JOBS; then
+            log "FAILED (sidecar promote): $INPUT"
+            discard_encode_artifacts "$OUTPUT_TMP" "$STDERR_CAPTURE"
+            return 1
+        fi
         if ! mv -- "$OUTPUT_TMP" "$OUTPUT"; then
             echo " ERROR: could not move output into place: $OUTPUT" >&2
             log "FAILED (promote): $INPUT"
+            remove_sidecar_finals _JOBS
             discard_encode_artifacts "$OUTPUT_TMP" "$STDERR_CAPTURE"
             return 1
         fi
         CURRENT_TMP=""
+        CURRENT_SIDECAR_TMPS=()
 
         local FILE_END FILE_DUR
         FILE_END=$(date +%s)
@@ -1283,7 +1475,13 @@ execute_encode() {
         # place: a failed archive leaves them where they are.
         local POST_RC=0
         if [[ -n "$ARCHIVE_DIR" ]]; then
-            archive_output "$OUTPUT" "$ROOT" "$ARCHIVE_DIR" || POST_RC=1
+            # Sidecars first, video last, and the video only if every sidecar
+            # was archived.
+            for _job in "${_JOBS[@]+"${_JOBS[@]}"}"; do
+                IFS=$'\t' read -r _j_strip _j_tmp _j_final <<< "$_job"
+                archive_output "$_j_final" "$ROOT" "$ARCHIVE_DIR" || POST_RC=1
+            done
+            (( POST_RC )) || archive_output "$OUTPUT" "$ROOT" "$ARCHIVE_DIR" || POST_RC=1
         fi
         if (( POST_RC )); then
             echo " WARNING: archive failed; source and sidecars left in place, output kept at $OUTPUT" >&2
@@ -1318,6 +1516,7 @@ process_file() {
     local INPUT="$1"
     local ROOT="$2"
     local line
+    SIDECAR_EXTRACT_LINES=()
 
     local OUTPUT
     OUTPUT="$(compute_output_path "$INPUT" "$ROOT")"
@@ -1384,7 +1583,7 @@ process_file() {
     local _unclaimed
     while IFS= read -r _unclaimed; do
         [[ -n "$_unclaimed" ]] || continue
-        echo " WARNING: subtitle file not embedded, stays in the source directory: $(basename "$_unclaimed")" >&2
+        echo " WARNING: subtitle file not used (format, language, modifier, duplicate, or text not valid UTF-8), stays in the source directory: $(basename "$_unclaimed")" >&2
         log "SUBTITLE FILE UNCLAIMED: $_unclaimed"
     done < <(report_unclaimed_sidecars "$INPUT" "${EXTSUB_LINES[@]+"${EXTSUB_LINES[@]}"}")
 
@@ -1449,8 +1648,8 @@ process_file() {
         elif strip_sidecar_sub "$_e_path"; then
             _e_mux_path="$STRIPPED_SUB_PATH"
         else
-            echo " WARNING: tag-strip failed for $(basename "$_e_path"); muxing original (may still show {\\an8}-style text on screen)" >&2
-            log "SUBTITLE TAG STRIP FAILED: $_e_path (muxed unstripped)"
+            echo " WARNING: tag-strip failed for $(basename "$_e_path"); using original (may still show {\\an8}-style text on screen)" >&2
+            log "SUBTITLE TAG STRIP FAILED: $_e_path (used unstripped)"
         fi
 
         INPUT_ARGS+=(-i "$_e_mux_path")
@@ -1466,17 +1665,23 @@ process_file() {
     build_audio_args    FF_ARGS "${AUDIO_LINES[@]+"${AUDIO_LINES[@]}"}"
 
     local SUB_OUT_IDX=0
+    local -a SIDECAR_FF=() SIDECAR_JOBS=()
     build_subtitle_args          FF_ARGS SUB_OUT_IDX "${SUB_LINES[@]+"${SUB_LINES[@]}"}"
-    build_external_subtitle_args FF_ARGS SUB_OUT_IDX "${EXTSUB_WITH_IDX[@]+"${EXTSUB_WITH_IDX[@]}"}"
-    [[ $SUB_OUT_IDX -eq 0 ]] && echo " Subtitles: none matching criteria"
+    if [[ "$SUB_MODE" == "sidecar" ]]; then
+        build_sidecar_outputs "$(basename "${OUTPUT%.*}")" "$OUTPUT_DIR_FOR_FILE" SIDECAR_FF SIDECAR_JOBS \
+            "${EXTSUB_WITH_IDX[@]+"${EXTSUB_WITH_IDX[@]}"}"
+    else
+        build_external_subtitle_args FF_ARGS SUB_OUT_IDX "${EXTSUB_WITH_IDX[@]+"${EXTSUB_WITH_IDX[@]}"}"
+    fi
+    [[ $SUB_OUT_IDX -eq 0 && ${#SIDECAR_JOBS[@]} -eq 0 ]] && echo " Subtitles: none matching criteria"
 
     echo ""
     if (( DRY_RUN )); then
-        echo " [DRY RUN] ffmpeg ${FF_ARGS[*]} ${CONTAINER_FLAGS[*]:-} \"$OUTPUT_TMP\" && mv -> \"$OUTPUT\""
+        echo " [DRY RUN] ffmpeg ${FF_ARGS[*]} ${CONTAINER_FLAGS[*]:-} \"$OUTPUT_TMP\" ${SIDECAR_FF[*]:-} && mv -> \"$OUTPUT\""
         return 3
     fi
 
-    execute_encode "$INPUT" "$OUTPUT" "$OUTPUT_TMP" "$OUTPUT_DIR_FOR_FILE" "$ROOT" "${VID_CODEC_LABEL:-$VID_CODEC}" FF_ARGS CONTAINER_FLAGS EXTSUB_LINES "$SUB_OUT_IDX"
+    execute_encode "$INPUT" "$OUTPUT" "$OUTPUT_TMP" "$OUTPUT_DIR_FOR_FILE" "$ROOT" "${VID_CODEC_LABEL:-$VID_CODEC}" FF_ARGS CONTAINER_FLAGS EXTSUB_LINES "$SUB_OUT_IDX" SIDECAR_FF SIDECAR_JOBS
 }
 
 # -- Main loop -------------------------------------------------------------------------

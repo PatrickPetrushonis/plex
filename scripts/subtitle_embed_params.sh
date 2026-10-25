@@ -69,6 +69,7 @@ require ffmpeg
 require ffprobe
 require flock
 require sed
+require iconv
 
 if [[ $EUID -eq 0 ]]; then
     echo "ERROR: do not run this with sudo, it creates an output file a normal user needs to own." >&2
@@ -78,6 +79,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./lang_table.sh
 source "$SCRIPT_DIR/lang_table.sh"
+declare -F canon_lang >/dev/null || {
+    echo "ERROR: canon_lang is not defined; lang_table.sh is not the version this script requires" >&2
+    exit 1
+}
 # shellcheck source=./subtitle_tag_strip.sh
 source "$SCRIPT_DIR/subtitle_tag_strip.sh"
 # shellcheck source=./subtitle_mux.sh
@@ -138,6 +143,10 @@ if [[ -n "$EXPLICIT_SRT" ]]; then
     EXPLICIT_CODEC="$(probe_sidecar_codec "$EXPLICIT_SRT")" || EXPLICIT_CODEC=""
     [[ " $SUBTITLE_MUX_CODECS " == *" $EXPLICIT_CODEC "* ]] || {
         echo "ERROR: unsupported subtitle codec '${EXPLICIT_CODEC:-unreadable}' in $EXPLICIT_SRT (supported: $SUBTITLE_MUX_CODECS)" >&2
+        exit 1
+    }
+    iconv -f UTF-8 -t UTF-8 "$EXPLICIT_SRT" >/dev/null 2>&1 || {
+        echo "ERROR: $EXPLICIT_SRT is not valid UTF-8; convert it first (iconv -f <source charset> -t UTF-8)" >&2
         exit 1
     }
     case "$EXPLICIT_TYPE" in

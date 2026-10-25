@@ -74,6 +74,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./lang_table.sh
 source "$SCRIPT_DIR/lang_table.sh"
+declare -F canon_lang >/dev/null || {
+    echo "ERROR: canon_lang is not defined; lang_table.sh is not the version this script requires" >&2
+    exit 1
+}
 # shellcheck source=./subtitle_tag_strip.sh
 source "$SCRIPT_DIR/subtitle_tag_strip.sh"
 
