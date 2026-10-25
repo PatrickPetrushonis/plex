@@ -72,9 +72,10 @@
 #     and a track whose language has no 2-letter code, are dropped. Input sidecars are
 #     written first, so they win a name collision. Existing sidecar files at the
 #     destination are overwritten, as the video is (-s skips on the video only)
-#   * -S embed: an embedded track that needs tag stripping is not handled here: run
-#     subtitle_extract_params.sh first, and the sidecar it writes is picked up
-#     on the next encode
+#   * -S embed: an embedded SubRip or mov_text track that carries ASS override tags
+#     (e.g. {\an8}) is extracted to a scratch file, tag-stripped, and muxed from the
+#     stripped copy; a track without tags is muxed from the source as is. A dry run
+#     does not inspect embedded tracks
 #   * Output is written atomically (.tmp -> rename) so interrupted runs are retry-safe
 #   * On SIGINT/SIGTERM: partial .tmp file is removed, summary written to log
 #   * -M uses cp + size verify + rm (safe for cross-device/NAS destinations); a
@@ -719,17 +720,13 @@ declare -F canon_lang >/dev/null || {
 # subtitle_output_codec(), sidecar_output_codec(), probe_sidecar_codec(),
 # sidecar_needs_tag_strip(), find_sidecar_file(), discover_sidecar_subs(),
 # report_unclaimed_sidecars(), subtitle_track_type(), subtitle_track_key(),
-# verify_subtitle_count() and build_external_subtitle_args() come from the shared subtitle_mux.sh (same
-# directory), also used by subtitle_embed_params.sh, so the container-aware
-# codec decision, the sidecar matching, and the sidecar-mux ffmpeg-arg logic
-# exist in one place.
+# verify_subtitle_count() and build_external_subtitle_args() come from
+# subtitle_mux.sh (same directory).
 # shellcheck source=./subtitle_mux.sh
 source "$(dirname "${BASH_SOURCE[0]}")/subtitle_mux.sh"
 
 # TAG_STRIP_PATTERN, init_subtitle_tag_strip, cleanup_stripped_subs and
-# strip_sidecar_sub come from the shared subtitle_tag_strip.sh (same
-# directory), also used by subtitle_embed_params.sh and
-# subtitle_extract_params.sh. This script strips sidecars only.
+# strip_sidecar_sub come from subtitle_tag_strip.sh (same directory).
 # shellcheck source=./subtitle_tag_strip.sh
 source "$(dirname "${BASH_SOURCE[0]}")/subtitle_tag_strip.sh"
 
@@ -1034,6 +1031,86 @@ build_audio_args() {
     done
 }
 
+# -- strip_embedded_text_tracks -------------------------------------------------------
+# -S embed mode, real runs only. Extracts each embedded SubRip or mov_text track
+# that build_subtitle_args() would keep to a scratch .srt file. A track whose text
+# carries ASS override tags (e.g. {\an8}) is removed from the SUB_LINES array and
+# replaced by a tag-stripped copy, which the caller muxes as an external input; a
+# track without tags, or one that cannot be extracted (warning), stays in
+# SUB_LINES and is muxed from the source. Args: input video, the name of the
+# SUB_LINES array, the name of the output array. Appends to the output array one
+# "LANG3 TYPE PATH" line per replaced track, LANG3 being the primary code. A
+# second standard (non-CC, non-forced) track of one language is dropped here by
+# the rule build_subtitle_args() applies, so a dropped duplicate is never
+# extracted and removing a replaced track cannot promote a duplicate behind it.
+EMBED_STRIP_SEQ=0
+strip_embedded_text_tracks() {
+    local INPUT="$1"
+    # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
+    local -n _SL="$2"
+    local -n _REPL="$3"
+    local -a kept=()
+    local -A seen=()
+    local line
+
+    for line in "${_SL[@]+"${_SL[@]}"}"; do
+        local _ idx codec lang is_target is_forced is_signs is_cc rest
+        read -r _ idx codec lang is_target is_forced is_signs is_cc rest <<< "$line"
+
+        if [[ "$is_target" != "1" || "$is_signs" == "1" \
+              || "$(subtitle_output_codec "$codec")" == "DROP" ]]; then
+            kept+=("$line")
+            continue
+        fi
+
+        local type key
+        type="$(subtitle_track_type "$is_forced" "$is_cc")"
+        if [[ "$type" == "target" ]]; then
+            key="$(canon_lang "$lang")"
+            if [[ -n "${seen[$key]+_}" ]]; then
+                echo " Subtitle[src:$idx]: DROP ($lang, duplicate standard track: no distinguishing title)"
+                continue
+            fi
+            seen["$key"]=1
+        fi
+
+        if [[ "$codec" != "subrip" && "$codec" != "mov_text" ]]; then
+            kept+=("$line")
+            continue
+        fi
+
+        EMBED_STRIP_SEQ=$(( EMBED_STRIP_SEQ + 1 ))
+        local raw="${STRIPPED_TMP_DIR}/raw/e${EMBED_STRIP_SEQ}_${idx}.srt"
+        mkdir -p -- "${STRIPPED_TMP_DIR}/raw"
+        if ! ffmpeg -nostdin -v error -y -analyzeduration "$PROBE_SIZE" -probesize "$PROBE_SIZE" \
+                -i "$INPUT" -map "0:${idx}" -c:s srt "$raw" 2>/dev/null || [[ ! -s "$raw" ]]; then
+            echo " WARNING: could not read embedded subtitle src:$idx to check it for override tags; muxing it unchecked" >&2
+            log "SUBTITLE TAG CHECK FAILED: $INPUT src:$idx (muxed unchecked)"
+            rm -f -- "$raw"
+            kept+=("$line")
+            continue
+        fi
+
+        if ! grep -qE -- "$TAG_STRIP_PATTERN" "$raw"; then
+            rm -f -- "$raw"
+            kept+=("$line")
+            continue
+        fi
+
+        if strip_sidecar_sub "$raw"; then
+            echo " Subtitle[src:$idx]: ASS override tags found, muxing a tag-stripped copy"
+            _REPL+=("$(canon_lang "$lang") ${type} ${STRIPPED_SUB_PATH}")
+        else
+            echo " WARNING: tag-strip failed for embedded subtitle src:$idx; muxing the original (may still show {\\an8}-style text on screen)" >&2
+            log "SUBTITLE TAG STRIP FAILED: $INPUT src:$idx (muxed unstripped)"
+            kept+=("$line")
+        fi
+        rm -f -- "$raw"
+    done
+
+    _SL=("${kept[@]+"${kept[@]}"}")
+}
+
 # -- build_subtitle_args -------------------------------------------------------------
 # Selects embedded subtitle tracks. In -S embed mode each kept track becomes an
 # embedded stream in the output. In -S sidecar mode a kept track that has a text
@@ -1041,8 +1118,8 @@ build_audio_args() {
 # "SRC_IDX CODEC TYPE LANG3" and written as a file by build_sidecar_outputs();
 # bitmap tracks stay embedded. This function does not strip ASS override tags
 # (e.g. {\an8}): -S sidecar strips the extracted srt files, and in -S embed mode
-# subtitle_extract_params.sh writes a stripped sidecar that discover_sidecar_subs()
-# finds on the next encode.
+# strip_embedded_text_tracks() replaces a tagged SubRip or mov_text track with a
+# stripped copy before this function runs.
 # A second standard (non-CC, non-forced) embedded track of the same primary
 # language is dropped; the language is compared after alias resolution.
 build_subtitle_args() {
@@ -1619,6 +1696,14 @@ process_file() {
         unset _SIDECAR_KEYS
     fi
 
+    # -S embed: an embedded SubRip or mov_text track that carries ASS override
+    # tags is replaced by a tag-stripped copy, muxed below as an extra input.
+    # Not in EXTSUB_LINES: these copies are scratch files, never backed up.
+    local -a EMBED_STRIPPED_LINES=()
+    if [[ "$SUB_MODE" == "embed" ]] && (( ! DRY_RUN )); then
+        strip_embedded_text_tracks "$INPUT" SUB_LINES EMBED_STRIPPED_LINES
+    fi
+
     local TITLE_TAG
     TITLE_TAG="$(basename "${OUTPUT%.*}")"
 
@@ -1654,6 +1739,14 @@ process_file() {
 
         INPUT_ARGS+=(-i "$_e_mux_path")
         EXTSUB_WITH_IDX+=("${_e_lang} ${_e_type} ${_next_input_idx} ${_e_mux_path}")
+        _next_input_idx=$(( _next_input_idx + 1 ))
+    done
+
+    for line in "${EMBED_STRIPPED_LINES[@]+"${EMBED_STRIPPED_LINES[@]}"}"; do
+        local _m_lang _m_type _m_path
+        read -r _m_lang _m_type _m_path <<< "$line"
+        INPUT_ARGS+=(-i "$_m_path")
+        EXTSUB_WITH_IDX+=("${_m_lang} ${_m_type} ${_next_input_idx} ${_m_path}")
         _next_input_idx=$(( _next_input_idx + 1 ))
     done
 

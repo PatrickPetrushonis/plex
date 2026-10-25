@@ -4,7 +4,7 @@
 # track matching, output stream-count verification, and ffmpeg arg-building
 # for muxing external subtitle files into a video.
 #
-# Shared by encoder_params.sh and subtitle_embed_params.sh.
+# Sourced by encoder_params.sh.
 #
 # The caller provides, before sourcing this file and calling into it:
 #   OUT_FORMAT       "mkv" or "mp4" - read by subtitle_output_codec()
@@ -58,7 +58,7 @@ subtitle_output_codec() {
 # -- Track identity ------------------------------------------------------------------
 # Echoes the type of an embedded track from its disposition flags:
 # forced, cc, or target. Forced outranks cc, matching the sidecar file
-# suffix subtitle_extract_params.sh writes for the same flags.
+# suffix sidecar_file_name() writes for the same flags.
 subtitle_track_type() {
     local IS_FORCED="$1" IS_CC="$2"
     if [[ "$IS_FORCED" == "1" ]]; then
@@ -130,9 +130,8 @@ sidecar_output_spec() {
 }
 
 # Echoes the sidecar file name (no directory) "<BASE>.<lang2>[.cc|.forced].<EXT>"
-# for a track of language LANG3 and TYPE (target|cc|forced); the suffixes match
-# subtitle_extract_params.sh. Returns 1 with nothing echoed if LANG3 has no
-# 2-letter code in the language table.
+# for a track of language LANG3 and TYPE (target|cc|forced). Returns 1 with
+# nothing echoed if LANG3 has no 2-letter code in the language table.
 sidecar_file_name() {
     local BASE="$1" LANG3="$2" TYPE="$3" EXT="$4"
     local LANG2 SUFFIX=""
