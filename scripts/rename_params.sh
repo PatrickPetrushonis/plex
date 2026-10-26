@@ -158,15 +158,31 @@
 #   whole series stays confirmed as its files are renamed. A lone numbered
 #   file is never inferred to be an episode, since a bare number is equally a
 #   sequel or part number. A confirmed name is rewritten to "Title SxxEyy"
-#   and parsed like any episode. Season comes from a "Season N" token, else a
-#   "Season NN" parent folder, else 1. With no title before the number, the
-#   show folder's name is the title.
+#   and parsed like any episode. Season comes from a "Season N" token, else the
+#   nearest "Season NN" folder above the file, else 1. With no title before
+#   the number, the show folder's name is the title.
 #   Known limitations: season 1 is a guess when nothing names a season; movie
 #   sequels sharing a folder ("Title - 1", "Title - 2") look like episodes; a
 #   series with one unrenamed file left has too few siblings to confirm and
 #   is NO_MATCH.
 #
-#   Episode folder layout: every episode video and subtitle is placed at
+#   Show folders: a folder named "Series Name (YYYY)" (the outermost one
+#   below the scanned root) that holds at least one episode, directly or in
+#   Season, release or extras subfolders, is a show folder. Everything under
+#   it is named from it: each episode becomes "Series Name - SxxEyy[ -
+#   Title].ext" whatever series name its own file name carries, and is
+#   placed in "Season XX" of that folder. The season comes from the file
+#   name (SxxEyy or "Season N"), else from the nearest "Season NN" folder it
+#   sits in ("Season NN - Descriptor" counts; the descriptor is dropped and
+#   the files land in plain "Season NN"), else it is season 1. A season named
+#   in the file name wins over the folder's. A video or subtitle under a show folder
+#   with no episode number (extras, credits, trailers) is moved to "Season
+#   00" with its cleaned name. A numbered file that lacks the siblings to
+#   confirm it is NO_MATCH, not an extra. Folders emptied by these moves are
+#   removed, innermost first.
+#
+#   Episode folder layout outside a show folder: every episode video and
+#   subtitle is placed at
 #   <Series Name (YYYY)>/Season XX/<Series Name - SxxEyy>.<ext>. The season
 #   folder always comes from the file's own SxxEyy token (zero-padded, so a
 #   file in "Season 1" moves to "Season 01"), and a folder left empty by such
@@ -688,12 +704,27 @@ EPISODE_TOKEN_PATTERN='(?<![0-9A-Za-z])[Ss][0-9]{1,2}[Ee][0-9]{1,3}(?:\.[0-9]{1,
 pad2() { printf '%02d' "$((10#$1))"; }
 
 # Returns 0 when NAME (a folder's basename) is a "Season NN" folder -
-# "Season", an optional separator, then digits ("Season 1", "Season.02").
-# Sets SEASON_FOLDER_NUMBER to the digits, empty when it isn't one.
+# "Season", an optional separator, then digits ("Season 1", "Season.02"),
+# optionally followed by a hyphen and a descriptor ("Season 02 - Descriptor"),
+# which is dropped. Sets SEASON_FOLDER_NUMBER to the digits, empty when it
+# isn't one.
 is_season_folder_name() {
     SEASON_FOLDER_NUMBER=""
-    [[ "$1" =~ ^[Ss]eason[\ ._-]*([0-9]+)$ ]] || return 1
+    [[ "$1" =~ ^[Ss]eason[\ ._-]*([0-9]+)([\ ._]*-[\ ._-]*[^\ ._-].*)?$ ]] || return 1
     SEASON_FOLDER_NUMBER="${BASH_REMATCH[1]}"
+}
+
+# Returns 0 when DIR or a folder above it, up to but excluding the scanned
+# root, is a "Season NN" folder; the nearest one wins. Sets
+# SEASON_FOLDER_NUMBER (empty when there is none).
+season_folder_above() {
+    local d="$1"
+    SEASON_FOLDER_NUMBER=""
+    while [[ "$d" != "$TARGET_DIR" && "$d" != "/" && "$d" != "." ]]; do
+        is_season_folder_name "$(basename "$d")" && return 0
+        d="$(dirname "$d")"
+    done
+    return 1
 }
 
 # Detects whether an already-prefix-stripped name is TV-episode-shaped:
@@ -841,14 +872,15 @@ build_episode_stems() {
 # Rewrites an inferred-episode name into "Title SxxEyy<rest>" so the normal
 # episode parser handles it, but only when EPISODE_STEMS (built by
 # build_episode_stems) confirms a series. Season: "Season N" in the name,
-# else a "Season NN" parent folder, else 1. When nothing precedes the
-# token, the title is the show folder's name (the parent of a "Season NN"
-# folder, otherwise the folder itself).
+# else the nearest "Season NN" folder above the file, else 1. When nothing
+# precedes the token, the title is the show folder's name (the parent of a
+# "Season NN" folder, otherwise the folder itself).
 # Sets ABS_NAME; unchanged from the input when the name already has an
 # SxxEyy token, carries no inferred token, or has no confirming siblings.
 # Clobbers ABS_* and PARSED_*.
 normalize_absolute_episode() {
-    local name="$1" dir="$2" pre rest trailing ep season show_dir ep_int ep_frac
+    local name="$1" dir="$2"
+    local pre rest trailing ep season show_dir ep_int ep_frac
     ABS_NAME="$name"
     is_episode_shaped "$name" && return 0
     abs_locate "$name"
@@ -858,7 +890,7 @@ normalize_absolute_episode() {
     # Two files for the same episode number are copies, not a series; renaming
     # one would leave the other to be read as a movie on the next run.
     (( ${EPISODE_STEMS["$dir|$pre|$ABS_FORM|$ep"]:-0} < 2 )) || return 0
-    if [[ -z "$season" ]] && is_season_folder_name "$(basename "$dir")"; then
+    if [[ -z "$season" ]] && season_folder_above "$dir"; then
         season="$SEASON_FOLDER_NUMBER"
     fi
     [[ -z "$season" ]] && season=1
@@ -1197,6 +1229,83 @@ find_series_dir() {
     return 0
 }
 
+# Returns 0 when any video under DIR is an episode: it carries an SxxEyy
+# token or is a confirmed inferred episode (see normalize_absolute_episode).
+# Clobbers ABS_* and PARSED_*.
+folder_has_episodes() {
+    local dir="$1" f base
+    while IFS= read -r -d '' f; do
+        base="$(basename "$f")"
+        normalize_absolute_episode "$(strip_junk_prefixes "${base%.*}")" "$(dirname "$f")"
+        is_episode_shaped "$ABS_NAME" && return 0
+    done < <(find "$dir" -type f -regextype posix-extended -iregex ".*\.(${VIDEO_EXTS})$" -print0 | sort -z)
+    return 1
+}
+
+# Finds the show folder for a file in DIR: the outermost folder between the
+# scanned root (excluded) and DIR (included) that is named "Title (YYYY)" and
+# holds at least one episode. Sets SHOW_DIR and SHOW_TITLE, both empty when
+# there is none. Answers are cached per folder in SHOW_FOLDER_TITLE, since
+# every file in a show asks about the same few folders. Clobbers ABS_* and
+# PARSED_*. Always returns 0.
+declare -A SHOW_FOLDER_TITLE=()
+find_show_folder() {
+    local dir="$1" d base
+    local -a chain=()
+    SHOW_DIR=""; SHOW_TITLE=""
+    d="$dir"
+    while [[ "$d" != "$TARGET_DIR" && "$d" != "/" && "$d" != "." ]]; do
+        chain+=("$d")
+        d="$(dirname "$d")"
+    done
+    local i
+    for (( i = ${#chain[@]} - 1; i >= 0; i-- )); do
+        d="${chain[i]}"
+        if [[ -z "${SHOW_FOLDER_TITLE[$d]+set}" ]]; then
+            SHOW_FOLDER_TITLE["$d"]=""
+            base="$(basename "$d")"
+            if ! is_season_folder_name "$base"; then
+                parse_media_name "$(strip_junk_prefixes "$base")"
+                if (( PARSED_OK )) && [[ -n "$PARSED_YEAR" ]]; then
+                    local title="$PARSED_TITLE"
+                    folder_has_episodes "$d" && SHOW_FOLDER_TITLE["$d"]="$title"
+                fi
+            fi
+        fi
+        if [[ -n "${SHOW_FOLDER_TITLE[$d]}" ]]; then
+            SHOW_DIR="$d"; SHOW_TITLE="${SHOW_FOLDER_TITLE[$d]}"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Cleans the name of a file under a show folder that has no episode number
+# (an extra): spec groups are dropped except a year, and separators are
+# cleaned as for an episode title. Prints the result, empty when nothing
+# usable is left.
+clean_extra_name() {
+    local s="$1" mark=$'\x01' endmark=$'\x02'
+    s="$(sed -E "s/\(((19|20)[0-9]{2})\)/${mark}\1${endmark}/g" <<< "$s")"
+    if [[ "$s" == *[[:space:]]* ]]; then
+        s="$(clean_spaced_title "$s")"
+    else
+        s="$(strip_and_clean "$s")"
+    fi
+    s="${s//$mark/(}"; s="${s//$endmark/)}"
+    printf '%s' "$s"
+}
+
+# Adds DIR and each folder above it, up to but excluding STOP, to PRUNE_DIRS,
+# so the folders an episode was moved out of are removed once empty.
+queue_prune() {
+    local d="$1" stop="$2"
+    while [[ "$d" != "$stop" && "$d" != "/" && "$d" != "." ]]; do
+        PRUNE_DIRS["$d"]=1
+        d="$(dirname "$d")"
+    done
+}
+
 # Plans where an episode file belongs: <show folder>/Season XX/ (the rules are
 # in the header's "Episode folder layout"). Sets EP_DEST_DIR (empty = rename in
 # place), EP_TRACK_DIR (the show folder for the directory pass, or empty) and
@@ -1312,7 +1421,7 @@ while IFS= read -r -d '' FILE_PATH; do
 
     # Reset per-iteration state so a stale value from a previous iteration
     # can never leak into this one's decisions.
-    IS_EPISODE=0; EP_YEAR=""
+    IS_EPISODE=0; IS_EXTRA=0; EP_YEAR=""; EXTRA_NAME=""
     OWN_OK=0; DIR_OK=0; MOVIE_OK=0; USED_PARENT_FALLBACK=0; AMBIGUOUS_PARENT=0; UNSUPPORTED_EP=0
     ITEM_OK=0
 
@@ -1338,6 +1447,7 @@ while IFS= read -r -d '' FILE_PATH; do
     #    unconditionally, so a title containing a bare year is never
     #    misrouted into movie parsing (see is_episode_shaped's own comment).
     WORKING_NAME_STRIPPED="$(strip_junk_prefixes "$WORKING_NAME")"
+    find_show_folder "$FILE_DIR"
     normalize_absolute_episode "$WORKING_NAME_STRIPPED" "$FILE_DIR"
     WORKING_NAME_STRIPPED="$ABS_NAME"
 
@@ -1347,8 +1457,25 @@ while IFS= read -r -d '' FILE_PATH; do
     elif is_episode_shaped "$WORKING_NAME_STRIPPED"; then
         IS_EPISODE=1
         parse_episode_name "$WORKING_NAME_STRIPPED"
+        if [[ -n "$SHOW_DIR" ]]; then
+            # The show folder names the series, whatever the file's own name
+            # says; a name that starts at the SxxEyy token has no series part
+            # of its own, so the folder's title is supplied.
+            (( PARSED_OK )) || parse_episode_name "$SHOW_TITLE $WORKING_NAME_STRIPPED"
+            (( PARSED_OK )) && PARSED_SERIES="$SHOW_TITLE"
+        fi
         ITEM_OK=$PARSED_OK
         EP_YEAR="$PARSED_YEAR"
+    elif [[ -n "$SHOW_DIR" ]]; then
+        # Under a show folder, a file with no episode number is an extra,
+        # unless it is numbered like an episode and only lacks the siblings
+        # to confirm it, which stays unrenamed.
+        abs_locate "$WORKING_NAME_STRIPPED"
+        if (( ! ABS_FOUND )); then
+            IS_EXTRA=1
+            EXTRA_NAME="$(clean_extra_name "$WORKING_NAME_STRIPPED")"
+            [[ -n "$EXTRA_NAME" ]] && ITEM_OK=1
+        fi
     else
         # MOVIE path: try the file's own name, then (independently) its
         # immediate parent folder's name. Both attempts are made - not just
@@ -1388,6 +1515,10 @@ while IFS= read -r -d '' FILE_PATH; do
             report_no_match "episode range or multi-episode number; not renamed" "$FILE_NAME"
         elif (( IS_EPISODE )); then
             report_no_match "episode-shaped but unparseable" "$FILE_NAME"
+        elif (( IS_EXTRA )); then
+            report_no_match "no usable name left after cleaning" "$FILE_NAME"
+        elif [[ -n "$SHOW_DIR" ]]; then
+            report_no_match "numbered like an episode but no matching siblings confirm it" "$FILE_NAME"
         elif (( AMBIGUOUS_PARENT )); then
             report_no_match "parent folder has multiple videos; its name can't name them all" "$FILE_NAME"
         else
@@ -1412,6 +1543,8 @@ while IFS= read -r -d '' FILE_PATH; do
         CLEAN_PLEX_NAME="$PARSED_SERIES - S${PARSED_SEASON}E${PARSED_EPISODE}"
         [[ -n "$PARSED_EPTITLE" ]] && CLEAN_PLEX_NAME="$CLEAN_PLEX_NAME - $PARSED_EPTITLE"
         [[ -n "$PARSED_EDITION" ]] && CLEAN_PLEX_NAME="$CLEAN_PLEX_NAME {edition-$PARSED_EDITION}"
+    elif (( IS_EXTRA )); then
+        CLEAN_PLEX_NAME="$EXTRA_NAME"
     else
         CLEAN_PLEX_NAME="$(build_movie_name "$FINAL_TITLE" "$FINAL_YEAR" "$FINAL_EDITION")"
     fi
@@ -1423,24 +1556,31 @@ while IFS= read -r -d '' FILE_PATH; do
     # Gated on RENAME_DIRS (-F): with -F, nothing is ever created or
     # moved, only renamed in place.
     RESTRUCTURED=0
-    if (( IS_EPISODE )) && (( RENAME_DIRS )); then
-        # Episodes go to <show folder>/Season XX/ - see
-        # _plan_episode_destination for how the show folder is found.
-        PLAN_RC=0
-        plan_episode_destination "$FILE_DIR" "$PARSED_SERIES" "$PARSED_SEASON" "$EP_YEAR" || PLAN_RC=$?
-        [[ $PLAN_RC -eq 2 ]] && continue
+    if (( IS_EPISODE || IS_EXTRA )) && (( RENAME_DIRS )); then
+        # Episodes go to <show folder>/Season XX/, extras to Season 00. Under
+        # a show folder (find_show_folder) the folder is already known;
+        # otherwise _plan_episode_destination finds or creates it.
+        if [[ -n "$SHOW_DIR" ]]; then
+            EP_TRACK_DIR="$SHOW_DIR"; EP_SHOW_NAME=""
+            EP_DEST_DIR="${SHOW_DIR}/Season ${PARSED_SEASON:-00}"
+            (( IS_EXTRA )) && EP_DEST_DIR="${SHOW_DIR}/Season 00"
+        else
+            PLAN_RC=0
+            plan_episode_destination "$FILE_DIR" "$PARSED_SERIES" "$PARSED_SEASON" "$EP_YEAR" || PLAN_RC=$?
+            [[ $PLAN_RC -eq 2 ]] && continue
+        fi
         [[ -n "$EP_TRACK_DIR" ]] && MATCHED_DIRS["$EP_TRACK_DIR"]="show"
         [[ -n "$EP_TRACK_DIR" && -n "$EP_SHOW_NAME" ]] && SHOW_FALLBACK_NAME["$EP_TRACK_DIR"]="$EP_SHOW_NAME"
         if [[ -n "$EP_DEST_DIR" && "$EP_DEST_DIR" != "$FILE_DIR" ]]; then
             NEW_FILE_DIR="$EP_DEST_DIR"
             ensure_dir "$NEW_FILE_DIR" || continue
             RESTRUCTURED=1
-            PRUNE_DIRS["$FILE_DIR"]=1
+            queue_prune "$FILE_DIR" "${SHOW_DIR:-$TARGET_DIR}"
         else
             NEW_FILE_DIR="$FILE_DIR"
         fi
         NEW_FILE_PATH="${NEW_FILE_DIR}/${NEW_FILE_NAME}"
-    elif [[ $IS_EPISODE -eq 0 && $DIR_OK -eq 0 ]] && (( RENAME_DIRS )); then
+    elif [[ $IS_EPISODE -eq 0 && $IS_EXTRA -eq 0 && $DIR_OK -eq 0 ]] && (( RENAME_DIRS )); then
         ROOT_CHECK=0
         check_root "$FILE_DIR" || ROOT_CHECK=$?
         if [[ $ROOT_CHECK -eq 2 ]]; then
@@ -1465,8 +1605,12 @@ while IFS= read -r -d '' FILE_PATH; do
 
     [[ "$FILE_PATH" == "$NEW_FILE_PATH" ]] && continue
 
-    if (( IS_EPISODE )); then
-        echo "  Cached Data:   Series: '$PARSED_SERIES' | S${PARSED_SEASON}E${PARSED_EPISODE} | Title: '$PARSED_EPTITLE' | Edition: '$PARSED_EDITION' | Lang: '$SUB_LANG_TAG'"
+    if (( IS_EPISODE || IS_EXTRA )); then
+        if (( IS_EXTRA )); then
+            echo "  Cached Data:   Extra: '$EXTRA_NAME' | Lang: '$SUB_LANG_TAG'"
+        else
+            echo "  Cached Data:   Series: '$PARSED_SERIES' | S${PARSED_SEASON}E${PARSED_EPISODE} | Title: '$PARSED_EPTITLE' | Edition: '$PARSED_EDITION' | Lang: '$SUB_LANG_TAG'"
+        fi
         if (( RESTRUCTURED )); then
             echo "  Restructure:   moving into '${NEW_FILE_DIR#"$TARGET_DIR_REAL"/}/'"
             log "RESTRUCTURED: $FILE_NAME -> $NEW_FILE_DIR"
@@ -1493,9 +1637,11 @@ done < <(list_media_files)
 # Prune pass: remove folders an episode was moved out of (e.g. "Season 1"
 # after its files move to "Season 01") if that left them empty.
 if (( RENAME_DIRS && ${#PRUNE_DIRS[@]} > 0 )); then
-    for PRUNE_PATH in "${!PRUNE_DIRS[@]}"; do
+    # Reverse order lists a folder's subfolders before it, so a chain of
+    # emptied folders is removed from the inside out.
+    while IFS= read -r -d '' PRUNE_PATH; do
         prune_empty_dir "$PRUNE_PATH"
-    done
+    done < <(printf '%s\0' "${!PRUNE_DIRS[@]}" | sort -rz)
 fi
 
 # Directory pass. Runs after all file renames, over the directories that are
