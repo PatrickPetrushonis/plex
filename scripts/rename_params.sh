@@ -151,7 +151,8 @@
 #     special suffix ("Show - 02.5" becomes S01E02.5);
 #   - " - NN - Episode Title" (a year in the title marks a movie);
 #   - a dot, underscore or hyphen plus two or three digits, in a name with
-#     no whitespace ("Show.Name.01", "Show-Name-01").
+#     no whitespace ("Show.Name.01", "Show-Name-01"), optionally followed by
+#     "(...)" groups ("Show_Name_01_(720p)"; a year in one marks a movie).
 #   A title after "Episode N" or " - NN - " is dropped, except after a hyphen
 #   following "Episode N" ("Show - Episode 01 - Title"), which is kept.
 #   Siblings are counted once before any rename (build_episode_stems), so the
@@ -441,7 +442,7 @@ strip_junk_prefixes() {
     s="$(sed -E 's/^(www\.)?[A-Za-z0-9-]+\.[A-Za-z]{2,}[[:space:]]*-[[:space:]]*//' <<< "$s")"
     s="${s//$'\t'/ }"
     s="${s//$'\xc2\xa0'/ }"
-    s="$(sed -E 's/ +/ /g; s/^ //; s/ $//' <<< "$s")"
+    s="$(sed -E 's/ +/ /g; s/^[ _]+//; s/[ _]+$//' <<< "$s")"
     printf '%s\n' "$s"
 }
 
@@ -777,8 +778,10 @@ ABS_TITLED_PATTERN='^(.*[^ ._-])[ ._-]+-[ ._-]*([0-9]{1,3})(\.[0-9]{1,2})?[ ._]+
 # all: "<title><delim><NN>" where the delimiter is a dot, underscore or
 # hyphen ("Show.Name.01", "Show_Name_01", "Show-Name-01"). Two or three digits
 # only: a single digit is too often a sequel number, and four digits is a
-# year. Captures: 1 = title, 2 = number.
-ABS_DELIM_PATTERN='^([^[:space:]]*[A-Za-z][^[:space:]]*[^[:space:]._-])[._-]([0-9]{2,3})$'
+# year. Trailing "(...)" groups may follow the number ("Show_Name_01_(720p)");
+# a year in one marks a movie. Captures: 1 = title, 2 = number, 3 = the
+# trailing groups.
+ABS_DELIM_PATTERN='^([^[:space:]]*[A-Za-z][^[:space:]]*[^[:space:]._-])[._-]([0-9]{2,3})(([._-]?[(][^()]*[)])*)$'
 
 # Locates an inferred episode token in NAME: "Episode N" / "Ep N"
 # (optionally preceded by "Season N"), a trailing " - NN" that may be
@@ -836,9 +839,13 @@ abs_locate() {
     elif [[ "$name" != *[[:space:]]* && "$name" =~ $ABS_DELIM_PATTERN ]]; then
         ABS_PRE="${BASH_REMATCH[1]}"
         ABS_EP="${BASH_REMATCH[2]}"
-        [[ "$ABS_PRE" != *[._]* ]] && ABS_PRE="${ABS_PRE//-/ }"
-        ABS_FORM="delim"
-        ABS_FOUND=1
+        # A year in a trailing "(...)" group marks a movie, as for " - NN".
+        find_last_year "${BASH_REMATCH[3]}"
+        if [[ -z "$YEAR_MATCH" ]]; then
+            [[ "$ABS_PRE" != *[._]* ]] && ABS_PRE="${ABS_PRE//-/ }"
+            ABS_FORM="delim"
+            ABS_FOUND=1
+        fi
     fi
     return 0
 }
