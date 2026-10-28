@@ -9,7 +9,8 @@
 #   LANG_3TO2       code3 -> code2           (sidecar filename lookups)
 #   LANG_LABEL_BASH code3 -> Label           (embedded/sidecar track titles)
 #   LANG_ALIASES    any lowercase code (2-letter, 3-letter, or listed alias)
-#                   -> code2                 (rename_params.sh normalization)
+#                   or lowercase label -> code2
+#                                            (rename_params.sh normalization)
 #   LANG_CANON      any lowercase code3, code2, or listed alias -> primary
 #                   code3. The "und" row contributes only its own code3: its
 #                   code2 ("en") belongs to "eng".
@@ -47,6 +48,7 @@ while IFS=$'\t' read -r _code3 _code2 _label _aliases; do
 
     LANG_ALIASES["$_code3"]="$_code2"
     LANG_ALIASES["$_code2"]="$_code2"
+    LANG_ALIASES["${_label,,}"]="$_code2"
 
     LANG_CANON["$_code3"]="$_code3"
     [[ "$_code3" != "und" ]] && LANG_CANON["$_code2"]="$_code3"

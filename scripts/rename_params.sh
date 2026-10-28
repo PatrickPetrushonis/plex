@@ -182,6 +182,17 @@
 #   confirm it is NO_MATCH, not an extra. Folders emptied by these moves are
 #   removed, innermost first.
 #
+#   Track-numbered subtitles: a subtitle under a show folder named only
+#   "<track> <language>" ("2 English", "3_English") takes its episode from the
+#   nearest ancestor folder that carries an SxxEyy token, its language from
+#   lang_table.sh, and its modifier from how that folder's track subtitles of
+#   the same language compare: of two, the one with more lines containing [ or
+#   ] is the closed-caption one ("Series - SxxEyy.en.cc.srt") and the other the
+#   plain one ("Series - SxxEyy.en.srt"); equal counts fall back to the
+#   byte-order sort of the names, first plain, second cc. The track number
+#   itself is ignored. A third or later track, or a language not in
+#   lang_table.sh, is skipped. With no SxxEyy ancestor the file is an extra.
+#
 #   Episode folder layout outside a show folder: every episode video and
 #   subtitle is placed at
 #   <Series Name (YYYY)>/Season XX/<Series Name - SxxEyy>.<ext>. The season
@@ -1303,6 +1314,103 @@ clean_extra_name() {
     printf '%s' "$s"
 }
 
+# Reads the SxxEyy token from the nearest folder name between DIR (inclusive)
+# and STOP (exclusive). Sets ANC_TOKEN to e.g. "S01E07", zero-padded to two
+# digits, or "" when no folder in that range carries one. Always returns 0.
+ancestor_episode_token() {
+    local d="$1" stop="$2" base
+    ANC_TOKEN=""
+    while [[ "$d" != "$stop" && "$d" != "/" && "$d" != "." ]]; do
+        base="$(basename -- "$d")"
+        if [[ "$base" =~ (^|[^0-9A-Za-z])[Ss]([0-9]{1,2})[Ee]([0-9]{1,3})([^0-9A-Za-z]|$) ]]; then
+            printf -v ANC_TOKEN 'S%02dE%02d' "$((10#${BASH_REMATCH[2]}))" "$((10#${BASH_REMATCH[3]}))"
+            return 0
+        fi
+        d="$(dirname -- "$d")"
+    done
+    return 0
+}
+
+# Counts the lines of FILE that contain a square bracket, the mark of a
+# closed-caption track's sound descriptions. Prints the count, 0 for an
+# unreadable file. Sets nothing.
+count_bracket_lines() {
+    local n
+    n="$(LC_ALL=C grep -a -c '[][]' -- "$1" 2>/dev/null)" || true
+    printf '%s' "${n:-0}"
+}
+
+# Fills TRACK_RANK for every track subtitle in DIR, keyed by full path: the
+# position (0, 1, ...) of the file among DIR's track subtitles of the same
+# language and extension. Two tracks are told apart by content: the one with
+# more bracketed lines (count_bracket_lines) is rank 1, the closed-caption
+# track. Equal counts, or any other number of tracks, fall back to the
+# byte-order sort of the file names. Run once per folder and extension before
+# its first file moves, so a later file is still ranked against the files that
+# were there at the start. Arguments: directory. Reads FILE_EXT_LOWER.
+rank_track_subtitles() {
+    local dir="$1" f sib lang group i n
+    local -A members=()
+    local -a list=()
+    TRACK_RANKED["$dir|$FILE_EXT_LOWER"]=1
+    while IFS= read -r -d '' f; do
+        sib="$(strip_junk_prefixes "${f##*/}")"
+        sib="${sib%.*}"
+        [[ "$sib" =~ ^[0-9]{1,2}[\ ._-]+([A-Za-z]+)$ ]] || continue
+        lang="$(normalize_lang "${BASH_REMATCH[1]}")"
+        [[ -n "$lang" ]] || continue
+        members["$lang"]+="${f}"$'\x1f'
+    done < <(find "$dir" -maxdepth 1 -type f -iname "*.${FILE_EXT_LOWER}" -print0 | LC_ALL=C sort -z)
+    for lang in "${!members[@]}"; do
+        group="${members[$lang]}"
+        list=()
+        while [[ -n "$group" ]]; do
+            list+=("${group%%$'\x1f'*}")
+            group="${group#*$'\x1f'}"
+        done
+        for i in "${!list[@]}"; do TRACK_RANK["${list[$i]}"]="$i"; done
+        if (( ${#list[@]} == 2 )); then
+            n=$(( $(count_bracket_lines "${list[0]}") - $(count_bracket_lines "${list[1]}") ))
+            if (( n > 0 )); then
+                TRACK_RANK["${list[0]}"]=1; TRACK_RANK["${list[1]}"]=0
+            fi
+        fi
+    done
+    return 0
+}
+
+# Plans a subtitle named only "<track> <language>" (for example "2 English")
+# that sits under a show folder: the episode comes from the nearest ancestor
+# folder (ancestor_episode_token) and the language from lang_table.sh. The
+# track number itself is ignored; the file's rank (rank_track_subtitles) sets
+# the modifier: rank 0 is plain, rank 1 is cc, a third or later is skipped.
+# Sets TRACK_STATUS to "none" (the name has another shape, or no ancestor
+# carries an episode, so the file is handled as before), "ok" (SUB_LANG_TAG
+# and TRACK_NAME are set) or "skip" (TRACK_REASON says why). Arguments:
+# stripped name, directory. Reads FILE_PATH.
+plan_track_subtitle() {
+    local name="$1" dir="$2" word lang mod rank
+    TRACK_STATUS="none"; TRACK_NAME=""; TRACK_REASON=""
+    [[ "$name" =~ ^[0-9]{1,2}[\ ._-]+([A-Za-z]+)$ ]] || return 0
+    word="${BASH_REMATCH[1]}"
+    ancestor_episode_token "$dir" "$SHOW_DIR"
+    [[ -n "$ANC_TOKEN" ]] || return 0
+    lang="$(normalize_lang "$word")"
+    if [[ -z "$lang" ]]; then
+        TRACK_STATUS="skip"; TRACK_REASON="unrecognized subtitle language '${word}'"
+        return 0
+    fi
+    [[ -n "${TRACK_RANKED[$dir|$FILE_EXT_LOWER]:-}" ]] || rank_track_subtitles "$dir"
+    rank="${TRACK_RANK[$FILE_PATH]:-0}"
+    case "$rank" in
+        0) mod="" ;;
+        1) mod=".cc" ;;
+        *) TRACK_STATUS="skip"; TRACK_REASON="more than two '${word}' subtitle tracks for one episode"; return 0 ;;
+    esac
+    TRACK_STATUS="ok"; TRACK_NAME="$ANC_TOKEN"; SUB_LANG_TAG=".${lang}${mod}"
+    return 0
+}
+
 # Adds DIR and each folder above it, up to but excluding STOP, to PRUNE_DIRS,
 # so the folders an episode was moved out of are removed once empty.
 queue_prune() {
@@ -1408,6 +1516,8 @@ list_media_files() { find "$TARGET_DIR" -type f -regextype posix-extended -irege
 build_episode_stems < <(list_media_files)
 
 declare -A SHOW_FALLBACK_NAME=()   # show folder -> "Series (YYYY)" to rename it to when its own name has no year but an episode's file name did
+declare -A TRACK_RANK=()           # track subtitle path -> its rank among the folder's same-language track subtitles (rank_track_subtitles)
+declare -A TRACK_RANKED=()         # "folder|extension" -> 1 once that folder has been ranked
 declare -A PRUNE_DIRS=()           # folders an episode was moved out of; removed after the file loop if now empty
 declare -A MATCHED_DIRS=()   # unique ancestor dirs of successfully-parsed movie/show files, for the directory pass. Value is "movie" or "show" - only "movie" entries are ever eligible for franchise-wrapper insertion.
 
@@ -1455,6 +1565,20 @@ while IFS= read -r -d '' FILE_PATH; do
     #    misrouted into movie parsing (see is_episode_shaped's own comment).
     WORKING_NAME_STRIPPED="$(strip_junk_prefixes "$WORKING_NAME")"
     find_show_folder "$FILE_DIR"
+    # A subtitle named only "<track> <language>" carries its episode in an
+    # ancestor folder; plan_track_subtitle supplies the SxxEyy and the tag, and
+    # the file then follows the ordinary episode path.
+    TRACK_STATUS="none"
+    if (( IS_SUBTITLE )) && [[ -z "$SUB_LANG_TAG" && -n "$SHOW_DIR" ]]; then
+        plan_track_subtitle "$WORKING_NAME_STRIPPED" "$FILE_DIR"
+        if [[ "$TRACK_STATUS" == "skip" ]]; then
+            echo "SKIPPING ($TRACK_REASON): ${FILE_DIR##*/}/$FILE_NAME"
+            log "SKIPPED ($TRACK_REASON): ${FILE_DIR##*/}/$FILE_NAME"
+            SKIPPED=$(( SKIPPED + 1 ))
+            continue
+        fi
+        [[ "$TRACK_STATUS" == "ok" ]] && WORKING_NAME_STRIPPED="$TRACK_NAME"
+    fi
     normalize_absolute_episode "$WORKING_NAME_STRIPPED" "$FILE_DIR"
     WORKING_NAME_STRIPPED="$ABS_NAME"
 

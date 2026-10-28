@@ -9,7 +9,9 @@
 #             and as the LANG_TABLE key consumed by encoder_params.sh.
 #   code2   — 2-letter code (ISO 639-1). Used for Plex-convention sidecar
 #             filenames (Movie.<code2>.srt) by both scripts.
-#   label   — display label used in track titles and renamer output.
+#   label   — display label used in track titles and renamer output. Its
+#             lowercase form is also accepted as a language name in subtitle
+#             file names ("2 English.srt").
 #   aliases — comma-separated alternate codes that should resolve to this
 #             language (e.g. bibliographic ISO 639-2/B variants), or "-" if
 #             none. Used by rename_params.sh's language normalization and by
