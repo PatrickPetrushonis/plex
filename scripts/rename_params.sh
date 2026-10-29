@@ -437,8 +437,8 @@ promote_bracket_tokens() {
 #      is removed; it requires a domain-like token followed by
 #      whitespace-hyphen-whitespace, so a legitimate title that starts with
 #      a hyphenated phrase is untouched.
-#   4. A release-version suffix on an episode number ("S01E01v3", " - 05v2")
-#      is dropped.
+#   4. A release-version suffix on an episode number ("S01E01v3", " - 05v2",
+#      " - 05 v2", "S01E01 v2") is dropped.
 #   5. Whitespace is normalized: tabs and non-breaking spaces become spaces,
 #      runs collapse to one space, and both ends are trimmed.
 # Run once by the caller before branching on movie vs. episode, so the
@@ -448,7 +448,7 @@ strip_junk_prefixes() {
     local s="$1"
     s="$(promote_bracket_tokens "$s")"
     s="$(sed -E 's/[({][[:space:]]*([Ss][0-9]{1,2}[Ee][0-9]{1,3}(\.[0-9]{1,2})?)[[:space:]]*[)}]/ \1 /g' <<< "$s")"
-    s="$(sed -E 's/([Ss][0-9]{1,2}[Ee][0-9]{1,3}(\.[0-9]{1,2})?)[Vv][0-9]{1,2}\b/\1/g; s/([ ._-]-[ ._-]*[0-9]{1,3})[Vv][0-9]{1,2}\b/\1/g' <<< "$s")"
+    s="$(sed -E 's/([Ss][0-9]{1,2}[Ee][0-9]{1,3}(\.[0-9]{1,2})?)[ ._]?[Vv][0-9]{1,2}\b/\1/g; s/([ ._-]-[ ._-]*[0-9]{1,3})[ ._]?[Vv][0-9]{1,2}\b/\1/g' <<< "$s")"
     s="$(sed -E 's/\{edition-/\x03/g; s/\{[^}]*\}//g; s/\x03/{edition-/g' <<< "$s")"
     s="$(sed -E 's/^(www\.)?[A-Za-z0-9-]+\.[A-Za-z]{2,}[[:space:]]*-[[:space:]]*//' <<< "$s")"
     s="${s//$'\t'/ }"
