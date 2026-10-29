@@ -887,10 +887,30 @@ build_episode_stems() {
     done
 }
 
+# Splits a season marker off the end of an inferred title: "Show S2",
+# "Show Season 2" or "Show 2nd Season". Sets TITLE_BASE (the title without the
+# marker) and TITLE_SEASON (the season number) and returns 0, or returns 1 and
+# sets both empty when the title carries no marker or nothing would be left.
+split_title_season() {
+    local t="$1"
+    TITLE_BASE=""; TITLE_SEASON=""
+    if [[ "$t" =~ ^(.*[^\ ._-])[\ ._-]+([Ss]|[Ss]eason[\ ._-]*)([0-9]{1,2})$ ]]; then
+        TITLE_BASE="${BASH_REMATCH[1]}"; TITLE_SEASON="${BASH_REMATCH[3]}"
+    elif [[ "$t" =~ ^(.*[^\ ._-])[\ ._-]+([0-9]{1,2})(st|nd|rd|th)[\ ._-]+[Ss]eason$ ]]; then
+        TITLE_BASE="${BASH_REMATCH[1]}"; TITLE_SEASON="${BASH_REMATCH[2]}"
+    else
+        return 1
+    fi
+    return 0
+}
+
 # Rewrites an inferred-episode name into "Title SxxEyy<rest>" so the normal
 # episode parser handles it, but only when EPISODE_STEMS (built by
 # build_episode_stems) confirms a series. Season: "Season N" in the name,
-# else the nearest "Season NN" folder above the file, else 1. When nothing
+# else a season marker ending the title ("Show S2", "Show Season 2", "Show
+# 2nd Season"), else the nearest "Season NN" folder above the file, else 1.
+# The sibling stem keeps the marker, so "Show S1 - 01" and "Show S2 - 01" in
+# one folder are two series, not copies of one episode. When nothing
 # precedes the token, the title is the show folder's name (the parent of a
 # "Season NN" folder, otherwise the folder itself).
 # Sets ABS_NAME; unchanged from the input when the name already has an
@@ -908,6 +928,9 @@ normalize_absolute_episode() {
     # Two files for the same episode number are copies, not a series; renaming
     # one would leave the other to be read as a movie on the next run.
     (( ${EPISODE_STEMS["$dir|$pre|$ABS_FORM|$ep"]:-0} < 2 )) || return 0
+    if [[ -z "$season" ]] && split_title_season "$pre"; then
+        pre="$TITLE_BASE"; season="$TITLE_SEASON"
+    fi
     if [[ -z "$season" ]] && season_folder_above "$dir"; then
         season="$SEASON_FOLDER_NUMBER"
     fi
