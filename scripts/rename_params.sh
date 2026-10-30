@@ -570,7 +570,7 @@ EDITION_PATTERNS=(
     "extended(?:[ ._-](?:cut|edition|version))?::Extended"
     "final[ ._-]cut::Final"
     "international[ ._-](?:cut|edition|version)::International"
-    "open[ ._-]matte(?:[ ._-](?:edition|version))?::Open Matte"
+    "(?:open[ ._-]matte|(?<![0-9A-Za-z])imax(?![0-9A-Za-z]))(?:[ ._-](?:edition|version))?::Open Matte"
     "platinum[ ._-](?:edition|series)::Platinum"
     "redux(?:[ ._-](?:cut|edition|version))?::Redux"
     "remaster(?:ed)?(?:[ ._-](?:edition|version))?::Remastered"
