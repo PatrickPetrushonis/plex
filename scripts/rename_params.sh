@@ -193,6 +193,23 @@
 #   itself is ignored. A third or later track, or a language not in
 #   lang_table.sh, is skipped. With no SxxEyy ancestor the file is an extra.
 #
+#   Subtitles below their video: a subtitle in a folder with no video of its
+#   own, named only by a language ("English", "2 English", "English.forced")
+#   or carrying a dot language tag, with no episode in its name or folders,
+#   belongs to the nearest folder above it that directly holds exactly one
+#   video. It is renamed after that video's final name plus the language tag
+#   and moved beside it, in a pass after the file pass; of two tracks of one
+#   language the one with more bracketed lines is ".cc" (see Track-numbered
+#   subtitles). If that video was not renamed (collision or no match), or the
+#   nearest folder with videos holds several, the subtitle is NO MATCH. With
+#   -F these subtitles are handled as before.
+#
+#   Title casing: Title Case small words (a an and but by for in nor of on or
+#   the to at) inside a movie, series or episode title or an extra's name are
+#   lowercased, except the first and last word, a word after ": ; . ! ? ( [ -"
+#   or a dash, and an all-caps word. Folders named from those titles follow.
+#   Nothing is ever capitalized.
+#
 #   Episode folder layout outside a show folder: every episode video and
 #   subtitle is placed at
 #   <Series Name (YYYY)>/Season XX/<Series Name - SxxEyy>.<ext>. The season
@@ -530,6 +547,32 @@ clean_spaced_title() {
     sed -E 's/^[[:space:]-]+//; s/[[:space:].-]+$//' <<< "$s"
 }
 
+# Words lowercased when they appear mid-title in Title Case.
+SMALL_WORDS=" a an and but by for in nor of on or the to at "
+CLAUSE_END='[:;.!?([–—-]$'
+
+# Prints TITLE with every Title Case small word lowercased unless it is the
+# first or last word, follows a clause break, or carries punctuation. All-caps
+# and already-lowercase words are left alone, and nothing is ever capitalized.
+# Sets nothing.
+fix_small_word_case() {
+    local s="$1" out="" w lw prev="" i n
+    local -a words
+    read -ra words <<< "$s"
+    n=${#words[@]}
+    for i in "${!words[@]}"; do
+        w="${words[$i]}"; lw="${w,,}"
+        if (( i > 0 && i < n - 1 )) && [[ "$w" =~ ^[[:alpha:]]+$ ]] \
+            && [[ "$SMALL_WORDS" == *" $lw "* && "$w" == "${w^}" && "$w" != "$lw" && "${w:1}" == "${lw:1}" ]] \
+            && [[ ! "$prev" =~ $CLAUSE_END ]]; then
+            w="$lw"
+        fi
+        out+="${out:+ }$w"
+        prev="${words[$i]}"
+    done
+    printf '%s' "$out"
+}
+
 # Recognized edition/cut markers, matched as freeform text anywhere in a name
 # (the "{edition-X}" syntax is Plex's own and is not on a file before this
 # script runs). Each entry is "<PCRE>::<label>", matched case-insensitively,
@@ -700,7 +743,7 @@ parse_media_name() {
 
     [[ -z "$title_part" ]] && return
 
-    PARSED_TITLE="$title_part"
+    PARSED_TITLE="$(fix_small_word_case "$title_part")"
     PARSED_YEAR="$year_match"
     PARSED_OK=1
 }
@@ -1012,13 +1055,13 @@ parse_episode_name() {
             ep_title="${ep_title/${BASH_REMATCH[0]}/}"
         fi
         if [[ "$raw" == *[[:space:]]* ]]; then
-            PARSED_EPTITLE="$(clean_spaced_title "$ep_title")"
+            PARSED_EPTITLE="$(fix_small_word_case "$(clean_spaced_title "$ep_title")")"
         else
-            PARSED_EPTITLE="$(strip_and_clean "$ep_title")"
+            PARSED_EPTITLE="$(fix_small_word_case "$(strip_and_clean "$ep_title")")"
         fi
     fi
 
-    PARSED_SERIES="$series_part"
+    PARSED_SERIES="$(fix_small_word_case "$series_part")"
     PARSED_SEASON="$(pad2 "$season")"
     PARSED_EPISODE="$(pad2 "$episode")${special}"
     PARSED_OK=1
@@ -1101,7 +1144,9 @@ report_no_match() {
     NO_MATCH=$(( NO_MATCH + 1 ))
 }
 
-# Rename executor shared by every call site: handles the unchanged-path no-op,
+# Rename executor shared by every call site: sets ATTEMPT_OK to 1 when the
+# path was already right or the move succeeded or was previewed, and to 0 on a
+# collision or failure. Handles the unchanged-path no-op,
 # collision check, dry-run preview, mv and counters in one place. The no-op
 # check compares full paths, since a target can share a basename with its
 # source while moving to a different directory.
@@ -1111,7 +1156,8 @@ attempt_rename() {
     old_base="$(basename "$old")"
     new_base="$(basename "$new")"
 
-    [[ "$old" == "$new" ]] && return 0
+    ATTEMPT_OK=0
+    [[ "$old" == "$new" ]] && { ATTEMPT_OK=1; return 0; }
 
     # The two collision outcomes below differ in message, log tag and the
     # path shown, so they stay separate rather than sharing a helper whose
@@ -1142,8 +1188,10 @@ attempt_rename() {
         echo "  [DRY RUN] Would rename/move to: $new"
         log "PREVIEWED: $old -> $new"
         PREVIEWED=$(( PREVIEWED + 1 ))
+        ATTEMPT_OK=1
     else
         if mv -- "$old" "$new"; then
+            ATTEMPT_OK=1
             echo "  [SUCCESS] Renamed."
             log "RENAMED: $old -> $new"
             RENAMED=$(( RENAMED + 1 ))
@@ -1334,7 +1382,7 @@ clean_extra_name() {
         s="$(strip_and_clean "$s")"
     fi
     s="${s//$mark/(}"; s="${s//$endmark/)}"
-    printf '%s' "$s"
+    printf '%s' "$(fix_small_word_case "$s")"
 }
 
 # Reads the SxxEyy token from the nearest folder name between DIR (inclusive)
@@ -1379,8 +1427,8 @@ rank_track_subtitles() {
     while IFS= read -r -d '' f; do
         sib="$(strip_junk_prefixes "${f##*/}")"
         sib="${sib%.*}"
-        [[ "$sib" =~ ^[0-9]{1,2}[\ ._-]+([A-Za-z]+)$ ]] || continue
-        lang="$(normalize_lang "${BASH_REMATCH[1]}")"
+        [[ "$sib" =~ ^([0-9]{1,2}[\ ._-]+)?([A-Za-z]+)$ ]] || continue
+        lang="$(normalize_lang "${BASH_REMATCH[2]}")"
         [[ -n "$lang" ]] || continue
         members["$lang"]+="${f}"$'\x1f'
     done < <(find "$dir" -maxdepth 1 -type f -iname "*.${FILE_EXT_LOWER}" -print0 | LC_ALL=C sort -z)
@@ -1431,6 +1479,41 @@ plan_track_subtitle() {
         *) TRACK_STATUS="skip"; TRACK_REASON="more than two '${word}' subtitle tracks for one episode"; return 0 ;;
     esac
     TRACK_STATUS="ok"; TRACK_NAME="$ANC_TOKEN"; SUB_LANG_TAG=".${lang}${mod}"
+    return 0
+}
+
+# Finds the video a subtitle in DIR belongs to: the nearest folder from DIR up
+# to the scanned root (excluded) that directly holds videos, when it holds
+# exactly one. Sets COMPANION_VIDEO to its path, or "" when no such folder has
+# videos or the nearest one has several. Always returns 0.
+find_companion_video() {
+    local d="$1"
+    local -a vids
+    COMPANION_VIDEO=""
+    while [[ "$d" != "$TARGET_DIR" && "$d" != "/" && "$d" != "." ]]; do
+        mapfile -d '' vids < <(find "$d" -maxdepth 1 -type f -regextype posix-extended \
+            -iregex ".*\.(${VIDEO_EXTS})$" -print0)
+        if (( ${#vids[@]} )); then
+            (( ${#vids[@]} == 1 )) && COMPANION_VIDEO="${vids[0]}"
+            return 0
+        fi
+        d="$(dirname -- "$d")"
+    done
+    return 0
+}
+
+# Returns 0 when NAME (a subtitle name without extension, junk stripped) is
+# only a language: "English", "2 English" or "English.forced", the language
+# being in lang_table.tsv. Sets TRACK_WORD (the language word), TRACK_LANG (its
+# code) and TRACK_MOD (".cc", ".sdh" or ".forced" when the name carries one,
+# else ""). Returns 1 and sets all three empty otherwise.
+subtitle_is_language_name() {
+    TRACK_WORD=""; TRACK_LANG=""; TRACK_MOD=""
+    [[ "$1" =~ ^([0-9]{1,2}[\ ._-]+)?([A-Za-z]+)(\.(cc|sdh|forced))?$ ]] || return 1
+    TRACK_LANG="$(normalize_lang "${BASH_REMATCH[2]}")"
+    [[ -n "$TRACK_LANG" ]] || return 1
+    TRACK_WORD="${BASH_REMATCH[2]}"
+    [[ -n "${BASH_REMATCH[4]}" ]] && TRACK_MOD=".${BASH_REMATCH[4],,}"
     return 0
 }
 
@@ -1541,6 +1624,11 @@ build_episode_stems < <(list_media_files)
 declare -A SHOW_FALLBACK_NAME=()   # show folder -> "Series (YYYY)" to rename it to when its own name has no year but an episode's file name did
 declare -A TRACK_RANK=()           # track subtitle path -> its rank among the folder's same-language track subtitles (rank_track_subtitles)
 declare -A TRACK_RANKED=()         # "folder|extension" -> 1 once that folder has been ranked
+declare -a DEFERRED_SUBS=()        # subtitles set aside to be named after their companion video
+declare -A DEFERRED_VIDEO=()       # deferred subtitle path -> its companion video's path
+declare -A DEFERRED_TAG=()         # deferred subtitle path -> its dot language tag, or ""
+declare -A DEFERRED_STEM=()        # deferred subtitle path -> its name stem, junk stripped
+declare -A FINAL_VIDEO_PATH=()     # video path -> its final path, recorded when its rename succeeded
 declare -A PRUNE_DIRS=()           # folders an episode was moved out of; removed after the file loop if now empty
 declare -A MATCHED_DIRS=()   # unique ancestor dirs of successfully-parsed movie/show files, for the directory pass. Value is "movie" or "show" - only "movie" entries are ever eligible for franchise-wrapper insertion.
 
@@ -1601,6 +1689,29 @@ while IFS= read -r -d '' FILE_PATH; do
             continue
         fi
         [[ "$TRACK_STATUS" == "ok" ]] && WORKING_NAME_STRIPPED="$TRACK_NAME"
+    fi
+    # A subtitle in a folder with no video, whose name is a language or a
+    # language tag and carries no episode, belongs to the video nearest above
+    # it. It is set aside and renamed after that video once the video's final
+    # name is known (the deferred subtitle pass). Not with -F, which moves
+    # nothing.
+    if (( IS_SUBTITLE && RENAME_DIRS )) && [[ "$TRACK_STATUS" != "ok" ]] \
+        && (( $(count_videos_in "$FILE_DIR") == 0 )) \
+        && ! is_episode_shaped "$WORKING_NAME_STRIPPED"; then
+        if [[ -n "$SUB_LANG_TAG" ]] || subtitle_is_language_name "$WORKING_NAME_STRIPPED"; then
+            find_companion_video "$FILE_DIR"
+            if [[ -n "$COMPANION_VIDEO" ]]; then
+                DEFERRED_SUBS+=("$FILE_PATH")
+                DEFERRED_VIDEO["$FILE_PATH"]="$COMPANION_VIDEO"
+                DEFERRED_TAG["$FILE_PATH"]="$SUB_LANG_TAG"
+                DEFERRED_STEM["$FILE_PATH"]="$WORKING_NAME_STRIPPED"
+                continue
+            fi
+            if [[ -n "$SHOW_DIR" && -z "$SUB_LANG_TAG" ]]; then
+                report_no_match "subtitle folder has no single video or episode to attach to" "${FILE_DIR##*/}/$FILE_NAME"
+                continue
+            fi
+        fi
     fi
     normalize_absolute_episode "$WORKING_NAME_STRIPPED" "$FILE_DIR"
     WORKING_NAME_STRIPPED="$ABS_NAME"
@@ -1757,7 +1868,10 @@ while IFS= read -r -d '' FILE_PATH; do
         NEW_FILE_PATH="${FILE_DIR}/${NEW_FILE_NAME}"
     fi
 
-    [[ "$FILE_PATH" == "$NEW_FILE_PATH" ]] && continue
+    if [[ "$FILE_PATH" == "$NEW_FILE_PATH" ]]; then
+        (( IS_SUBTITLE )) || FINAL_VIDEO_PATH["$FILE_PATH"]="$NEW_FILE_PATH"
+        continue
+    fi
 
     if (( IS_EPISODE || IS_EXTRA )); then
         if (( IS_EXTRA )); then
@@ -1785,8 +1899,48 @@ while IFS= read -r -d '' FILE_PATH; do
 
     # 4. EXECUTE
     attempt_rename "$FILE_PATH" "$NEW_FILE_PATH" "$TYPE_LABEL"
+    (( IS_SUBTITLE || ! ATTEMPT_OK )) || FINAL_VIDEO_PATH["$FILE_PATH"]="$NEW_FILE_PATH"
 
 done < <(list_media_files)
+
+# Deferred subtitle pass: each set-aside subtitle takes its companion video's
+# final name plus its language tag and moves beside it. A tag comes from the
+# subtitle's own dot tag or its language name; a name with no modifier is told
+# from a second track of the same language by rank_track_subtitles (first
+# plain, second ".cc", a third is skipped). A companion whose rename did not
+# succeed leaves its subtitle NO MATCH.
+for FILE_PATH in "${DEFERRED_SUBS[@]}"; do
+    FILE_NAME="$(basename "$FILE_PATH")"
+    FILE_DIR="$(dirname "$FILE_PATH")"
+    FILE_EXT_LOWER="$(tr 'A-Z' 'a-z' <<< "${FILE_NAME##*.}")"
+    VIDEO_FINAL="${FINAL_VIDEO_PATH[${DEFERRED_VIDEO[$FILE_PATH]}]:-}"
+    if [[ -z "$VIDEO_FINAL" ]]; then
+        report_no_match "companion video was not renamed" "${FILE_DIR##*/}/$FILE_NAME"
+        continue
+    fi
+    SUB_LANG_TAG="${DEFERRED_TAG[$FILE_PATH]}"
+    if [[ -z "$SUB_LANG_TAG" ]]; then
+        subtitle_is_language_name "${DEFERRED_STEM[$FILE_PATH]}" || continue
+        if [[ -n "$TRACK_MOD" ]]; then
+            SUB_LANG_TAG=".${TRACK_LANG}${TRACK_MOD}"
+        else
+            [[ -n "${TRACK_RANKED[$FILE_DIR|$FILE_EXT_LOWER]:-}" ]] || rank_track_subtitles "$FILE_DIR"
+            case "${TRACK_RANK[$FILE_PATH]:-0}" in
+                0) SUB_LANG_TAG=".${TRACK_LANG}" ;;
+                1) SUB_LANG_TAG=".${TRACK_LANG}.cc" ;;
+                *)
+                    echo "SKIPPING (more than two '${TRACK_WORD}' subtitle tracks for one video): ${FILE_DIR##*/}/$FILE_NAME"
+                    log "SKIPPED (more than two '${TRACK_WORD}' subtitle tracks for one video): ${FILE_DIR##*/}/$FILE_NAME"
+                    SKIPPED=$(( SKIPPED + 1 ))
+                    continue
+                    ;;
+            esac
+        fi
+    fi
+    NEW_FILE_PATH="${VIDEO_FINAL%.*}${SUB_LANG_TAG}.${FILE_EXT_LOWER}"
+    queue_prune "$FILE_DIR" "$TARGET_DIR"
+    attempt_rename "$FILE_PATH" "$NEW_FILE_PATH" "Subtitle"
+done
 
 # Prune pass: remove folders an episode was moved out of (e.g. "Season 1"
 # after its files move to "Season 01") if that left them empty.
