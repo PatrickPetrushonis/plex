@@ -204,6 +204,19 @@
 #   nearest folder with videos holds several, the subtitle is NO MATCH. With
 #   -F these subtitles are handled as before.
 #
+#   Unsupported subtitles: only the languages in SUPPORTED_SUB_LANGS ("en")
+#   are kept. A subtitle whose language is recognized (lang_table.tsv) and not
+#   supported is deleted, not renamed: one carrying a dot tag
+#   ("Name.2010.fr.srt", "Name.S01E01.fr.forced.srt") when the name outside the
+#   tag has a year or an episode token, and one named only by a language word
+#   of three or more letters ("3 Arabic.srt", "French.srt"). A real run asks
+#   once for a typed "yes" before the first deletion; any other answer leaves
+#   every such file in place. A dry run lists them as "Would delete". Folders
+#   left empty are removed. A subtitle with an unrecognized language tag is
+#   skipped, not deleted. Any other unsupported subtitle (a tag on a name with
+#   no year or episode, a two-letter language name) is skipped, never renamed.
+#   -F does not affect deletion.
+#
 #   Title casing: Title Case small words (a an and but by for in nor of on or
 #   the to at) inside a movie, series or episode title or an extra's name are
 #   lowercased, except the first and last word, a word after ": ; . ! ? ( [ -"
@@ -311,6 +324,10 @@ if (( FORCE && ! DRY_RUN )); then
     [[ "$CONFIRM" == "yes" ]] || { echo "Aborted." >&2; exit 1; }
 fi
 
+# Keep the caller's stdin on descriptor 8: the file loop reads its own input
+# from stdin, so a prompt inside it (delete_subtitle) reads from here instead.
+exec 8<&0
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR_REAL="$(cd "$TARGET_DIR" && pwd)"   # canonicalize so different relative paths to the same directory hash identically, and so folder-nesting checks below are reliable
 [[ -z "$OPERATIONAL_DIR" ]] && OPERATIONAL_DIR="$SCRIPT_DIR"
@@ -342,6 +359,11 @@ VIDEO_EXTS="mkv|mp4|avi|mov|m4v"
 SUB_EXTS="srt|vtt|ass|idx|sub"
 ALL_EXTS="${VIDEO_EXTS}|${SUB_EXTS}"
 
+# Subtitle languages kept: space-separated 2-letter codes, each a code2 in
+# lang_table.tsv. A subtitle in any other recognized language is deleted. To
+# keep another language, add its code here (SUPPORTED_SUB_LANGS="en fr").
+SUPPORTED_SUB_LANGS="en"
+
 # Language alias table (lang_table.sh, alongside this script).
 # shellcheck source=./lang_table.sh
 [[ -r "${SCRIPT_DIR}/lang_table.sh" ]] || {
@@ -356,6 +378,9 @@ normalize_lang() {
     local raw="${1,,}"
     echo "${LANG_ALIASES[$raw]:-}"
 }
+
+# Returns 0 when CODE (a 2-letter language code) is in SUPPORTED_SUB_LANGS.
+is_supported_lang() { [[ " $SUPPORTED_SUB_LANGS " == *" $1 "* ]]; }
 
 # Only cc, sdh, and forced are meaningful to encoder_params.sh's sidecar
 # lookup. Anything else comes back empty and the caller treats it as unknown
@@ -1082,8 +1107,11 @@ parse_episode_name() {
 #   SUB_TAG_STRIPPED_NAME  name with the tag removed (unchanged if none found)
 #   SUB_TAG_UNRECOGNIZED   "lang:X" or "modifier:X" if a tag was present but
 #                          not recognized; "" otherwise
+# and a fourth, SUB_LANG_CODE: the 2-letter code of a recognized language,
+# also set when its modifier is unrecognized, "" otherwise.
 extract_sub_lang_tag() {
     local name="$1"
+    SUB_LANG_CODE=""
     SUB_LANG_TAG=""
     SUB_TAG_STRIPPED_NAME="$name"
     SUB_TAG_UNRECOGNIZED=""
@@ -1093,6 +1121,7 @@ extract_sub_lang_tag() {
         local norm_lang norm_mod
         norm_lang="$(normalize_lang "$raw_lang")"
         norm_mod="$(normalize_modifier "$raw_mod")"
+        SUB_LANG_CODE="$norm_lang"
         if [[ -n "$norm_lang" && -n "$norm_mod" ]]; then
             SUB_LANG_TAG=".${norm_lang}.${norm_mod}"
             SUB_TAG_STRIPPED_NAME="$base"
@@ -1110,6 +1139,7 @@ extract_sub_lang_tag() {
         local norm_lang
         norm_lang="$(normalize_lang "$raw_lang")"
         if [[ -n "$norm_lang" ]]; then
+            SUB_LANG_CODE="$norm_lang"
             SUB_LANG_TAG=".${norm_lang}"
             SUB_TAG_STRIPPED_NAME="$base"
             return
@@ -1125,6 +1155,9 @@ PREVIEWED=0
 SKIPPED=0
 NO_MATCH=0
 FAILED=0
+DELETED=0
+DELETE_PREVIEWED=0
+DELETE_STATE=""
 
 # Log setup. The log is written directly to its final path: a rename pass is
 # idempotent (already-correct names are left alone on a re-run), so an
@@ -1142,6 +1175,54 @@ report_no_match() {
     echo "NO MATCH ($1): $2"
     log "NO MATCH ($1): $2"
     NO_MATCH=$(( NO_MATCH + 1 ))
+}
+
+# Reports a file that was left untouched on purpose rather than failed: prints
+# and logs the reason, and counts it. Arguments: reason, file name.
+report_skip() {
+    echo "SKIPPING ($1): $2"
+    log "SKIPPED ($1): $2"
+    SKIPPED=$(( SKIPPED + 1 ))
+}
+
+# Deletes a subtitle in an unsupported language (not in SUPPORTED_SUB_LANGS):
+# it is removed instead of renamed. Checks the
+# dry-run flag itself. A real run asks once, before the first deletion, for a
+# typed "yes"; any other answer, or no input, leaves every such file in place
+# for the rest of the run. Counts DELETED (DELETE_PREVIEWED in a dry run),
+# SKIPPED when not confirmed and FAILED when rm fails, and queues the file's
+# folder for pruning. Sets DELETE_STATE ("", "yes" or "no"). Argument: path.
+delete_subtitle() {
+    local file="$1" confirm=""
+    echo "MATCH FOUND (Subtitle, unsupported language):"
+    echo "  Current path:  $file"
+    if (( DRY_RUN )); then
+        echo "  [DRY RUN] Would delete: $file"
+        log "PREVIEWED (delete): $file"
+        DELETE_PREVIEWED=$(( DELETE_PREVIEWED + 1 ))
+        echo "----------------------------------------------------------------"
+        return 0
+    fi
+    if [[ -z "$DELETE_STATE" ]]; then
+        read -r -u 8 -p "Subtitle files in unsupported languages are deleted, not renamed. Type 'yes' to allow deletions in this run: " confirm || true
+        if [[ "$confirm" == "yes" ]]; then DELETE_STATE="yes"; else DELETE_STATE="no"; fi
+    fi
+    if [[ "$DELETE_STATE" != "yes" ]]; then
+        echo "  [SKIPPED] deletion not confirmed."
+        log "SKIPPED (deletion not confirmed): $file"
+        SKIPPED=$(( SKIPPED + 1 ))
+    elif rm -- "$file"; then
+        echo "  [SUCCESS] Deleted."
+        log "DELETED: $file"
+        DELETED=$(( DELETED + 1 ))
+        queue_prune "$(dirname -- "$file")" "$TARGET_DIR"
+    else
+        echo "  [FAILED] rm error" >&2
+        log "FAILED (rm): $file"
+        FAILED=$(( FAILED + 1 ))
+    fi
+    echo "----------------------------------------------------------------"
+    return 0
 }
 
 # Rename executor shared by every call site: sets ATTEMPT_OK to 1 when the
@@ -1659,12 +1740,23 @@ while IFS= read -r -d '' FILE_PATH; do
     WORKING_NAME="$FILE_BASE"
     if (( IS_SUBTITLE )); then
         extract_sub_lang_tag "$FILE_BASE"
+        # A recognized language outside SUPPORTED_SUB_LANGS is deleted, not renamed,
+        # when the name outside the tag has a year or an episode token, so a
+        # title that happens to end in a language code ("Dr.No") is never
+        # taken for a tagged subtitle.
+        if [[ -n "$SUB_LANG_CODE" ]] && ! is_supported_lang "$SUB_LANG_CODE"; then
+            find_last_year "$SUB_TAG_STRIPPED_NAME"
+            if [[ -n "$YEAR_MATCH" ]] || is_episode_shaped "$(strip_junk_prefixes "$SUB_TAG_STRIPPED_NAME")"; then
+                delete_subtitle "$FILE_PATH"
+            else
+                report_skip "unsupported-language subtitle with no year or episode in its name; not renamed or deleted" "$FILE_NAME"
+            fi
+            continue
+        fi
         if [[ -n "$SUB_TAG_UNRECOGNIZED" ]]; then
             SKIP_KIND="${SUB_TAG_UNRECOGNIZED%%:*}"
             [[ "$SKIP_KIND" == "lang" ]] && SKIP_KIND="language"
-            echo "SKIPPING (unrecognized subtitle ${SKIP_KIND} '${SUB_TAG_UNRECOGNIZED#*:}'): $FILE_NAME"
-            log "SKIPPED (unrecognized ${SKIP_KIND} '${SUB_TAG_UNRECOGNIZED#*:}'): $FILE_NAME"
-            SKIPPED=$(( SKIPPED + 1 ))
+            report_skip "unrecognized subtitle ${SKIP_KIND} '${SUB_TAG_UNRECOGNIZED#*:}'" "$FILE_NAME"
             continue
         fi
         WORKING_NAME="$SUB_TAG_STRIPPED_NAME"
@@ -1675,6 +1767,18 @@ while IFS= read -r -d '' FILE_PATH; do
     #    unconditionally, so a title containing a bare year is never
     #    misrouted into movie parsing (see is_episode_shaped's own comment).
     WORKING_NAME_STRIPPED="$(strip_junk_prefixes "$WORKING_NAME")"
+    # A subtitle named only by an unsupported language ("3 Arabic", "French") is
+    # deleted when the language word has three or more letters; a two-letter
+    # name ("no", "it") is too often an ordinary word, so it is left as it is.
+    if (( IS_SUBTITLE )) && [[ -z "$SUB_LANG_TAG" ]] \
+        && subtitle_is_language_name "$WORKING_NAME_STRIPPED" && ! is_supported_lang "$TRACK_LANG"; then
+        if (( ${#TRACK_WORD} >= 3 )); then
+            delete_subtitle "$FILE_PATH"
+        else
+            report_skip "unsupported-language subtitle named by a two-letter code; not renamed or deleted" "$FILE_NAME"
+        fi
+        continue
+    fi
     find_show_folder "$FILE_DIR"
     # A subtitle named only "<track> <language>" carries its episode in an
     # ancestor folder; plan_track_subtitle supplies the SxxEyy and the tag, and
@@ -1683,9 +1787,7 @@ while IFS= read -r -d '' FILE_PATH; do
     if (( IS_SUBTITLE )) && [[ -z "$SUB_LANG_TAG" && -n "$SHOW_DIR" ]]; then
         plan_track_subtitle "$WORKING_NAME_STRIPPED" "$FILE_DIR"
         if [[ "$TRACK_STATUS" == "skip" ]]; then
-            echo "SKIPPING ($TRACK_REASON): ${FILE_DIR##*/}/$FILE_NAME"
-            log "SKIPPED ($TRACK_REASON): ${FILE_DIR##*/}/$FILE_NAME"
-            SKIPPED=$(( SKIPPED + 1 ))
+            report_skip "$TRACK_REASON" "${FILE_DIR##*/}/$FILE_NAME"
             continue
         fi
         [[ "$TRACK_STATUS" == "ok" ]] && WORKING_NAME_STRIPPED="$TRACK_NAME"
@@ -1929,9 +2031,7 @@ for FILE_PATH in "${DEFERRED_SUBS[@]}"; do
                 0) SUB_LANG_TAG=".${TRACK_LANG}" ;;
                 1) SUB_LANG_TAG=".${TRACK_LANG}.cc" ;;
                 *)
-                    echo "SKIPPING (more than two '${TRACK_WORD}' subtitle tracks for one video): ${FILE_DIR##*/}/$FILE_NAME"
-                    log "SKIPPED (more than two '${TRACK_WORD}' subtitle tracks for one video): ${FILE_DIR##*/}/$FILE_NAME"
-                    SKIPPED=$(( SKIPPED + 1 ))
+                    report_skip "more than two '${TRACK_WORD}' subtitle tracks for one video" "${FILE_DIR##*/}/$FILE_NAME"
                     continue
                     ;;
             esac
@@ -2019,12 +2119,14 @@ echo ""
 echo "------------------------------------------"
 echo " Batch complete"
 echo "  Renamed:    $RENAMED"
+echo "  Deleted:    $DELETED  (subtitles in unsupported languages)"
+(( DRY_RUN )) && echo "  Would delete: $DELETE_PREVIEWED"
 (( DRY_RUN )) && echo "  Previewed:  $PREVIEWED  (dry run: nothing written; re-run without -n to rename)"
 echo "  Skipped:    $SKIPPED  (collisions or unrecognized language/modifier - review manually)"
 echo "  No match:   $NO_MATCH  (no usable year found, or no confirmed series; left untouched)"
 echo "  Failed:     $FAILED"
 echo "------------------------------------------"
-log "Batch complete: Renamed=$RENAMED Previewed=$PREVIEWED Skipped=$SKIPPED NoMatch=$NO_MATCH Failed=$FAILED"
+log "Batch complete: Renamed=$RENAMED Deleted=$DELETED DeletePreviewed=$DELETE_PREVIEWED Previewed=$PREVIEWED Skipped=$SKIPPED NoMatch=$NO_MATCH Failed=$FAILED"
 echo "Log saved to: $LOG_FILE"
 
 [[ $FAILED -eq 0 ]] || exit 1
