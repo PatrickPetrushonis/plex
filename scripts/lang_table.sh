@@ -39,7 +39,11 @@ declare -A LANG_LABEL_BASH=()
 declare -A LANG_ALIASES=()
 declare -A LANG_CANON=()
 
-while IFS=$'\t' read -r _code3 _code2 _label _aliases; do
+# The "|| [[ -n ... ]]" keeps a final row that has no trailing newline (read
+# returns non-zero for it), and the "%$'\r'" trims drop the carriage return of
+# a CRLF file, which would otherwise stay in the last field.
+while IFS=$'\t' read -r _code3 _code2 _label _aliases || [[ -n "$_code3" ]]; do
+    _label="${_label%$'\r'}"; _aliases="${_aliases%$'\r'}"
     [[ -z "$_code3" || "$_code3" == \#* ]] && continue
 
     LANG_TABLE["$_code3"]="${_code2}:${_label}"
