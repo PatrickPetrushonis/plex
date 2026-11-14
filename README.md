@@ -12,11 +12,9 @@ plex/
 ├── logs/                           Label pipeline logs (created on first run; not committed)
 └── scripts/
     ├── config.sh                   Shared paths, flags, and the concurrency lock (encode and rename only)
-    ├── encoder_dry.sh              Preview an encode batch (writes nothing)
-    ├── encoder.sh                  Run an encode batch for real
+    ├── encoder.sh                  Run an encode batch; -n previews it (writes nothing); prints [DRY RUN] or [LIVE] first
     ├── encoder_params.sh           Core batch encoder: copy/transcode decisions, HDR-to-SDR conversion, output verification (called by the two above; can also be run standalone)
-    ├── rename_dry.sh               Preview a rename batch (writes nothing)
-    ├── rename.sh                   Run a rename batch for real
+    ├── rename.sh                   Run a rename batch; -n previews it (nothing is renamed); prints [DRY RUN] or [LIVE] first
     ├── rename_params.sh            Plex-convention renamer for movies + TV episodes + subtitles (called by the two above; can also be run standalone)
     ├── subtitle_mux.sh             Shared: container-aware subtitle codec choice, sidecar discovery, external-subtitle ffmpeg arg building
     ├── subtitle_tag_strip.sh       Shared: strips leftover ASS override tags (e.g. {\an8}) from a plain-text subtitle file
@@ -79,11 +77,11 @@ Runs `shellcheck -x` on every `.sh` file under `scripts/` (installing shellcheck
 
 ```bash
 cd scripts
-./encoder_dry.sh    # preview — review the plan, nothing is written
-./encoder.sh         # run it for real
+./encoder.sh -n    # preview — review the plan, nothing is written
+./encoder.sh       # run it for real
 ```
 
-Both wrappers source `config.sh` for paths/flags and call the real work out to `encoder_params.sh`, targeting `$INPUT_DIR`. Never run `encoder_dry.sh` and `encoder.sh` at the same time against the same output directory — see [Concurrency lock](#concurrency-lock).
+`encoder.sh` takes `-n` and prints `[DRY RUN]` or `[LIVE]` first. It sources `config.sh` for paths/flags and calls the real work out to `encoder_params.sh`, targeting `$INPUT_DIR`. Never run `encoder.sh -n` and `encoder.sh` at the same time against the same output directory — see [Concurrency lock](#concurrency-lock).
 
 The dry run prints each file's decision, including whether an HDR source is tone-mapped to SDR (see [HEVC and HDR sources](#hevc-and-hdr-sources)).
 
@@ -91,18 +89,18 @@ To change quality, paths, or run against a different tree without editing any fi
 
 ```bash
 CRF=18 PRESET=slow ./encoder.sh
-VIDEOS_BASE=/mnt/scratch/Videos ./encoder_dry.sh
+VIDEOS_BASE=/mnt/scratch/Videos ./encoder.sh -n
 ```
 
 ### 2. Rename freshly downloaded files into Plex convention
 
 ```bash
 cd scripts
-./rename_dry.sh    # preview — review the plan, nothing is written
-./rename.sh          # run it for real
+./rename.sh -n    # preview — review the plan, nothing is written
+./rename.sh       # run it for real
 ```
 
-**This targets `$DOWNLOADS_INPUT_DIR` (`$DOWNLOADS_BASE/Complete`), not `$INPUT_DIR`.** Renaming is a pipeline stage *before* encoding: it runs against files fresh out of a download client's completed-downloads folder, not against the video library `encoder_dry.sh`/`encoder.sh` read from. The wrappers also pass `-O "$DOWNLOADS_BASE"`, which only sets where the lock and logs go (see [Concurrency lock](#concurrency-lock)).
+**This targets `$DOWNLOADS_INPUT_DIR` (`$DOWNLOADS_BASE/Complete`), not `$INPUT_DIR`.** Renaming is a pipeline stage *before* encoding: it runs against files fresh out of a download client's completed-downloads folder, not against the video library `encoder.sh` reads from. `rename.sh` takes `-n` and prints `[DRY RUN]` or `[LIVE]` first, and also passes `-O "$DOWNLOADS_BASE"`, which only sets where the lock and logs go (see [Concurrency lock](#concurrency-lock)).
 
 To rename a directory other than `$DOWNLOADS_INPUT_DIR`, call `rename_params.sh` directly with an explicit target instead of going through the wrappers.
 
@@ -112,7 +110,7 @@ Renaming and encoding read different directories, and no script moves files betw
 
 ```bash
 cd scripts
-./encoder_dry.sh    # preview
+./encoder.sh -n    # preview
 ./encoder.sh         # run it for real
 ```
 
@@ -160,7 +158,7 @@ Defines two independent variable groups, one for the video-library pipeline (fro
 | `DOWNLOADS_BASE` | `$HOME/Downloads` | `rename_params.sh` `-O` (lock/log location only, not the rename target) |
 | `DOWNLOADS_INPUT_DIR` | `$DOWNLOADS_BASE/Complete` | `rename_params.sh` positional arg (the actual rename target) |
 
-No paths or usernames are hardcoded — everything derives from `$HOME` unless overridden. `ENCODER_ARGS` is a prebuilt array (`-r -s -c "$CRF" -p "$PRESET" -o "$OUTPUT_DIR" -M "$ARCHIVE_DIR" -A "$BACKUP_DIR"`) that `encoder.sh`/`encoder_dry.sh` splice in ahead of `$INPUT_DIR`; there is no equivalent prebuilt array for rename, since `rename_params.sh` only ever needs the two raw directory values passed directly.
+No paths or usernames are hardcoded — everything derives from `$HOME` unless overridden. `ENCODER_ARGS` is a prebuilt array (`-r -s -c "$CRF" -p "$PRESET" -o "$OUTPUT_DIR" -M "$ARCHIVE_DIR" -A "$BACKUP_DIR"`) that `encoder.sh` splices in ahead of `$INPUT_DIR`; there is no equivalent prebuilt array for rename, since `rename_params.sh` only ever needs the two raw directory values passed directly.
 
 `config.sh` does not set the maximum output height. The encoder's `-H` flag does (default 1080), so the wrappers always use 1080; call `encoder_params.sh` directly to change it.
 
@@ -172,7 +170,7 @@ The label scripts do not source `config.sh`. They locate their own inputs and ou
 
 Neither script's lock (or logs) live inside the directory being processed — both route through an operational directory instead:
 - `encoder_params.sh` locks `OUTPUT_DIR/.media.lock` and logs to `OUTPUT_DIR/Logs`, since `OUTPUT_DIR` is a working/encoding area, not a curated library.
-- `rename_params.sh` takes an `-O DIR` flag (operational directory) for the same purpose: `rename.sh`/`rename_dry.sh` pass `-O "$DOWNLOADS_BASE"`, so its lock (`DOWNLOADS_BASE/.locks/<hash-of-target>.lock`) and logs (`DOWNLOADS_BASE/Logs`) stay out of the actual rename target. Since `rename_params.sh` can also run standalone against any target, `-O` defaults to the script's own directory when omitted.
+- `rename_params.sh` takes an `-O DIR` flag (operational directory) for the same purpose: `rename.sh` passes `-O "$DOWNLOADS_BASE"`, so its lock (`DOWNLOADS_BASE/.locks/<hash-of-target>.lock`) and logs (`DOWNLOADS_BASE/Logs`) stay out of the actual rename target. Since `rename_params.sh` can also run standalone against any target, `-O` defaults to the script's own directory when omitted.
 
 `config.sh` and the wrappers contain no locking logic — they're path/flag plumbing only. Every `_params.sh` script can be run standalone, without going through a wrapper, and is still protected.
 
