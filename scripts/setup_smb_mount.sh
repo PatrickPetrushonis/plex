@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# setup_smb_mount.sh: Mounts a CIFS/SMB share (e.g. a Synology NAS) as a
+# setup_smb_mount.sh: Mounts a CIFS/SMB share (e.g. a NAS) as a
 # stable local mountpoint, owned by a real (non-root) user, via
 # /etc/fstab - so batch tools in this project that refuse to run as root
-# (encoder_params.sh, subtitle_embed_params.sh, etc) can read/write it
+# (encoder_params.sh, rename_params.sh) can read/write it
 # directly.
 #
 # This is a one-time system-setup script and is the one place in this
@@ -16,7 +16,7 @@
 # Usage:  sudo ./setup_smb_mount.sh [OPTIONS] <server> <share> <mountpoint>
 #
 # Example:
-#   sudo ./setup_smb_mount.sh -p Movies synology.local plexmedia /mnt/synology/movies
+#   sudo ./setup_smb_mount.sh -p Movies nas.local media /mnt/nas/movies
 #
 # Options:
 #   -p PATH     Subpath within the share to mount, appended to the UNC path
@@ -31,6 +31,9 @@
 #   -f          Force: overwrite an existing /etc/fstab entry for this
 #               mountpoint, or an existing credentials file, instead of
 #               leaving it in place (default: leave it in place, skip).
+#               Asks for a typed "yes" before doing anything (not in a dry
+#               run); any other answer aborts the run. A replaced credentials
+#               file is backed up first, as /etc/fstab is.
 #   -n          Dry run: print every step's plan, modify nothing. Does not
 #               require root - a preview is safe to run as any user.
 #   -h          Show this help.
@@ -70,6 +73,7 @@ CRED_FILE=""
 VERS="3.0"
 FORCE=0
 DRY_RUN=0
+SKIP_MOUNT=0
 FSTAB_PATH="/etc/fstab"   # not exposed as a flag: overridden directly by tests, never by a real invocation
 
 usage() {
@@ -117,11 +121,22 @@ if (( ! DRY_RUN )) && [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# -f overwrites existing configuration, so it needs a typed answer at the moment
+# of the run: a flag alone can be typed ahead of time and fired without
+# re-reading it. Anything but "yes" (including end of input) aborts. A dry run
+# overwrites nothing and is not asked.
+if (( FORCE && ! DRY_RUN )); then
+    CONFIRM=""
+    read -r -p "-f overwrites the existing credentials file and fstab entry for this mount. Type 'yes' to continue: " CONFIRM || true
+    [[ "$CONFIRM" == "yes" ]] || { echo "Aborted." >&2; exit 1; }
+fi
+
 # -- Dependency check -----------------------------------------------------------
 require() { command -v "$1" &>/dev/null || { echo "ERROR: '$1' not found on PATH" >&2; exit 1; }; }
 require id
 require grep
 require sed
+require awk
 if ! command -v mount.cifs &>/dev/null; then
     require apt-get
 fi
@@ -153,17 +168,23 @@ fstab_has_entry() {
 }
 
 # Replaces an existing entry for MOUNTPOINT_ESCAPED in FSTAB_FILE with
-# NEW_LINE (written to a temp file, then renamed over the original -
-# atomic, so a failure partway never leaves a half-written fstab). Assumes
+# NEW_LINE (written to a temp file in the same directory, given the original's
+# mode and owner, then renamed over it - atomic, so a failure partway never
+# leaves a half-written fstab). Assumes
 # the caller already confirmed the entry exists and a backup was already
 # taken.
 replace_fstab_entry() {
     local fstab_file="$1" mountpoint_escaped="$2" new_line="$3"
     local tmp
-    tmp="$(mktemp)"
+    # Created beside the target: rename(2) is atomic only within one
+    # filesystem, and mktemp's default 0600 mode would replace the mode and
+    # owner of the original.
+    tmp="$(mktemp "${fstab_file}.XXXXXX")"
     awk -v mp="$mountpoint_escaped" -v newline="$new_line" \
         '$1 !~ /^#/ && $2 == mp { print newline; next } { print }' \
-        "$fstab_file" > "$tmp"
+        "$fstab_file" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+    chmod --reference="$fstab_file" -- "$tmp"
+    chown --reference="$fstab_file" -- "$tmp"
     mv -- "$tmp" "$fstab_file"
 }
 
@@ -206,6 +227,11 @@ if [[ -f "$CRED_FILE" ]] && (( ! FORCE )); then
 elif (( DRY_RUN )); then
     echo "  [DRY RUN] Would prompt for a username/password and write: $CRED_FILE (mode 600, root-owned)"
 else
+    if [[ -f "$CRED_FILE" ]]; then
+        CRED_BACKUP="${CRED_FILE}.bak.$(date '+%Y%m%d_%H%M%S')"
+        cp -- "$CRED_FILE" "$CRED_BACKUP"
+        echo "  Backed up to: $CRED_BACKUP"
+    fi
     read -r -p "  SMB username for //${SERVER}/${SHARE}: " SMB_USERNAME
     read -r -s -p "  SMB password: " SMB_PASSWORD
     echo ""
@@ -260,7 +286,7 @@ fi
 
 echo ""
 echo "== Step 5/6: mount =="
-if [[ "${SKIP_MOUNT:-0}" == "1" ]]; then
+if (( SKIP_MOUNT )); then
     echo "  Skipped (see above) - run manually once you've reconciled the existing fstab entry: mount \"$MOUNTPOINT\""
 elif (( DRY_RUN )); then
     echo "  [DRY RUN] Would run: mount \"$MOUNTPOINT\""
@@ -273,7 +299,7 @@ echo ""
 echo "== Step 6/6: confirm =="
 if (( DRY_RUN )); then
     echo "  [DRY RUN] Would run: mount | grep -F \"$MOUNTPOINT\"; ls -la \"$MOUNTPOINT\""
-elif [[ "${SKIP_MOUNT:-0}" == "1" ]]; then
+elif (( SKIP_MOUNT )); then
     echo "  Skipped (mount step skipped above)."
 else
     mount | grep -F "$MOUNTPOINT" || {

@@ -5,8 +5,8 @@
 # Needs MAL_CLIENT_ID, TMDB_API_KEY (not for --dry-run), PLEX_URL and PLEX_TOKEN;
 # PLEX_LIBRARY is optional (see apply_plex_labels.sh). All are checked before stage 1.
 #
-# Usage: update_plex_labels.sh [--dry-run] [--check-source-route]
-#   --dry-run             Every stage runs with --dry-run: nothing is looked up, written
+# Usage: update_plex_labels.sh [-n|--dry-run] [--check-source-route] [-h]
+#   -n, --dry-run           Every stage runs with --dry-run: nothing is looked up, written
 #                         or changed (the folder sync only reports what it would add or remove). The apply stage reads the
 #                         plex_labels.csv left by an earlier run, so it must exist.
 #   --check-source-route  Passes --check-source-route to the labels stage.
@@ -31,14 +31,21 @@ if [[ $EUID -eq 0 ]]; then
     exit 1
 fi
 
-DRY_RUN=false
-CHECK_ROUTE=false
+DRY_RUN=0
+CHECK_ROUTE=0
+
+usage() {
+    grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//' || true
+    exit 0
+}
+
 for arg in "$@"; do
     case "$arg" in
-        --dry-run) DRY_RUN=true ;;
-        --check-source-route) CHECK_ROUTE=true ;;
+        -n|--dry-run) DRY_RUN=1 ;;
+        --check-source-route) CHECK_ROUTE=1 ;;
+        -h|--help) usage ;;
         *) echo "ERROR: unknown argument: $arg" >&2
-           echo "Usage: ${0##*/} [--dry-run] [--check-source-route]" >&2
+           echo "Usage: ${0##*/} [-n|--dry-run] [--check-source-route] [-h]" >&2
            exit 1 ;;
     esac
 done
@@ -57,7 +64,7 @@ missing=()
 for var in MAL_CLIENT_ID PLEX_URL PLEX_TOKEN; do
     [[ -n "${!var:-}" ]] || missing+=("$var")
 done
-if [[ "$DRY_RUN" == false && -z "${TMDB_API_KEY:-}" ]]; then
+if (( ! DRY_RUN )) && [[ -z "${TMDB_API_KEY:-}" ]]; then
     missing+=("TMDB_API_KEY")
 fi
 if (( ${#missing[@]} )); then
@@ -65,7 +72,7 @@ if (( ${#missing[@]} )); then
     exit 1
 fi
 
-if [[ "$DRY_RUN" == true ]]; then
+if (( DRY_RUN )); then
     [[ -f "${DATA_DIR}/plex_labels.csv" ]] || { echo "ERROR: --dry-run needs ${DATA_DIR}/plex_labels.csv from an earlier run" >&2; exit 1; }
 fi
 
@@ -76,26 +83,26 @@ if ! flock -n 9; then
     echo "ERROR: another update_plex_labels.sh run is in progress (lock: $LOCK)" >&2
     exit 1
 fi
-trap 'rm -f "$LOCK"' EXIT
+trap 'rm -f -- "$LOCK"' EXIT
 
 DRY_ARGS=()
-[[ "$DRY_RUN" == true ]] && DRY_ARGS=(--dry-run)
+(( DRY_RUN )) && DRY_ARGS=(--dry-run)
 LABELS_ARGS=(--source mal-api --force)
-[[ "$CHECK_ROUTE" == true ]] && LABELS_ARGS+=(--check-source-route)
+(( CHECK_ROUTE )) && LABELS_ARGS+=(--check-source-route)
 
 # stage NAME LAST COMMAND...: runs one stage. Exit 2 from a stage means it completed but
 # some lookups or rows need attention (see its summary). For a stage before the last that
 # stops the pipeline, so a partial result is never applied to Plex; for the last stage
-# (LAST=true) the work is already done, so it is reported and the script exits 2 at the end.
-NEEDS_ATTENTION=false
+# (LAST=1) the work is already done, so it is reported and the script exits 2 at the end.
+NEEDS_ATTENTION=0
 stage() {
     local name="$1" last="$2"; shift 2
     echo "==> ${name}"
     local rc=0
     "$@" || rc=$?
-    if (( rc == 2 )) && [[ "$last" == true ]]; then
+    if (( rc == 2 )) && (( last )); then
         echo "NOTE: ${name} completed with items needing attention (exit 2); see its summary." >&2
-        NEEDS_ATTENTION=true
+        NEEDS_ATTENTION=1
     elif (( rc == 2 )); then
         echo "STOPPED: ${name} completed with failed lookups (exit 2); later stages were not run, so no partial result is applied." >&2
         exit 2
@@ -105,10 +112,10 @@ stage() {
     fi
 }
 
-stage "Stage 1/3: sync folder list" false "$SYNC_SH" ${DRY_ARGS[@]+"${DRY_ARGS[@]}"}
-stage "Stage 2/3: labels (MAL, then TMDB)" false "$LABELS_SH" "${LABELS_ARGS[@]}" ${DRY_ARGS[@]+"${DRY_ARGS[@]}"}
-stage "Stage 3/3: apply to Plex" true "$APPLY_SH" ${DRY_ARGS[@]+"${DRY_ARGS[@]}"}
-if [[ "$NEEDS_ATTENTION" == true ]]; then
+stage "Stage 1/3: sync folder list" 0 "$SYNC_SH" ${DRY_ARGS[@]+"${DRY_ARGS[@]}"}
+stage "Stage 2/3: labels (MAL, then TMDB)" 0 "$LABELS_SH" "${LABELS_ARGS[@]}" ${DRY_ARGS[@]+"${DRY_ARGS[@]}"}
+stage "Stage 3/3: apply to Plex" 1 "$APPLY_SH" ${DRY_ARGS[@]+"${DRY_ARGS[@]}"}
+if (( NEEDS_ATTENTION )); then
     echo "==> Done, with items needing attention"
     exit 2
 fi

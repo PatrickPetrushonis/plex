@@ -173,7 +173,7 @@ def setup_logging(log_path):
     log = logging.getLogger("labels")
     close_logging(log)
     log.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S")
+    fmt = logging.Formatter("[%(asctime)s] %(message)s", "%Y-%m-%d %H:%M:%S")
     handlers = [logging.StreamHandler(sys.stdout)]
     if log_path:
         os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)

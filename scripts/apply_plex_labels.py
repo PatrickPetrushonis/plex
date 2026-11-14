@@ -13,7 +13,7 @@ more than one library is reported as ambiguous and skipped.
 
 Usage:
     python3 apply_plex_labels.py LABELS.csv [--library NAME ...] [--url URL]
-                                 [--dry-run] [--log PATH]
+                                 [-n|--dry-run] [--log PATH]
 Environment:
     PLEX_TOKEN   Plex authentication token (required)
     PLEX_URL     server base URL including scheme and port, e.g. http://192.0.2.10:32400
@@ -377,7 +377,7 @@ def main(argv=None):
     p.add_argument("--library", action="append", default=None,
                    help="library title to search; repeatable (default: all show and movie libraries)")
     p.add_argument("--url", default=os.environ.get(URL_ENV, "").strip() or None)
-    p.add_argument("--dry-run", action="store_true", help="report changes; modify nothing")
+    p.add_argument("-n", "--dry-run", action="store_true", help="report changes; modify nothing")
     p.add_argument("--log", default=DEFAULT_LOG)
     a = p.parse_args(argv)
     token = os.environ.get(TOKEN_ENV, "").strip() or None

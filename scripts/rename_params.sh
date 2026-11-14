@@ -7,7 +7,8 @@
 # Usage:  ./rename_params.sh [OPTIONS] <target_dir>
 #
 # Options:
-#   -n              Dry run: print decisions, do not rename (default: off)
+#   -n              Dry run: print decisions, do not rename; takes no lock and
+#                   writes no log (default: off)
 #   -f              Force: overwrite destination if a rename target already
 #                   exists (default: off — collisions are skipped and logged).
 #                   Applies to files only: a directory-rename collision is
@@ -20,7 +21,8 @@
 #                   restructuring (default: off — see "Franchise-folder
 #                   restructuring" and "Episode folder layout" below)
 #   -O DIR          Operational directory: base for logs (OPDIR/Logs) and the
-#                   lock file (OPDIR/.locks), never <target_dir> itself.
+#                   lock file (OPDIR/.locks), never <target_dir> itself; used
+#                   by real runs only.
 #                   Default: this script's own directory
 #   -L DIR          Log directory, overriding OPDIR/Logs specifically
 #   -h              Show this help
@@ -30,10 +32,12 @@
 #     the user who owns the library
 #   • Requires bash 4.0+, a grep with PCRE support (-P; GNU grep on
 #     Ubuntu/Debian has this by default), and sha256sum
+#   • Exits 1 when any rename, move or deletion fails; skipped and unmatched
+#     files do not change the exit status
 #   • Only one run may target a given <target_dir> at a time; a second run
 #     against the same directory exits immediately instead of racing on
 #     shared rename targets (see "Concurrency lock" below)
-#   • Requires lang_table.sh and lang_table.tsv alongside this script.
+#   • Requires video_exts.sh, lang_table.sh and lang_table.tsv alongside this script.
 #     Subtitle language tags are normalized against them: .eng.srt and
 #     .fre.srt become .en.srt and .fr.srt
 #   • Subtitle modifiers are only ever written as cc, sdh, or forced, the
@@ -261,6 +265,7 @@ require() { command -v "$1" &>/dev/null || { echo "ERROR: '$1' not found on PATH
 require find
 require flock
 require grep
+require sed
 require sha256sum
 grep -oP 'x' <<< 'x' &>/dev/null || {
     echo "ERROR: grep must support -P (PCRE); GNU grep on Ubuntu/Debian has this by default" >&2
@@ -332,38 +337,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR_REAL="$(cd "$TARGET_DIR" && pwd)"   # canonicalize so different relative paths to the same directory hash identically, and so folder-nesting checks below are reliable
 [[ -z "$OPERATIONAL_DIR" ]] && OPERATIONAL_DIR="$SCRIPT_DIR"
 
-# Concurrency lock: only one run may target a given TARGET_DIR at a time. The
-# lock file lives under OPERATIONAL_DIR, never inside TARGET_DIR, so a library
-# holds no operational files. Its name is a hash of TARGET_DIR's canonical
-# path, so any spelling of the same directory collides and different
-# directories do not.
-LOCK_DIR="${OPERATIONAL_DIR}/.locks"
-mkdir -p -- "$LOCK_DIR"
-LOCK_HASH="$(printf '%s' "$TARGET_DIR_REAL" | sha256sum | cut -d' ' -f1)"
-LOCK_FILE="${LOCK_DIR}/${LOCK_HASH}.lock"
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-    echo "ERROR: another run is already active against $TARGET_DIR (lock: $LOCK_FILE)" >&2
-    exit 1
-fi
-# Registered only after the lock is acquired, so a failed acquisition never
-# deletes another process's lock file. Removes the lock file on any exit,
-# including SIGINT and SIGTERM (EXIT traps run on both; SIGKILL skips them).
-# Accepted race: a process that locks this path between the last real work
-# and this trap can have the file unlinked from under it; for a single-user
-# batch tool that window is negligible.
-trap 'rm -f -- "$LOCK_FILE" 2>/dev/null || true' EXIT
-
-# Extensions
-VIDEO_EXTS="mkv|mp4|avi|mov|m4v"
-SUB_EXTS="srt|vtt|ass|idx|sub"
-ALL_EXTS="${VIDEO_EXTS}|${SUB_EXTS}"
-
-# Subtitle languages kept: space-separated 2-letter codes, each a code2 in
-# lang_table.tsv. A subtitle in any other recognized language is deleted. To
-# keep another language, add its code here (SUPPORTED_SUB_LANGS="en fr").
-SUPPORTED_SUB_LANGS="en"
-
 # Language alias table (lang_table.sh, alongside this script).
 # shellcheck source=./lang_table.sh
 [[ -r "${SCRIPT_DIR}/lang_table.sh" ]] || {
@@ -371,6 +344,48 @@ SUPPORTED_SUB_LANGS="en"
     exit 1
 }
 source "${SCRIPT_DIR}/lang_table.sh"
+
+# Video extensions (video_exts.sh, alongside this script).
+# shellcheck source=./video_exts.sh
+[[ -r "${SCRIPT_DIR}/video_exts.sh" ]] || {
+    echo "ERROR: video_exts.sh not found next to this script (${SCRIPT_DIR})" >&2
+    exit 1
+}
+source "${SCRIPT_DIR}/video_exts.sh"
+
+# Concurrency lock: only one run may target a given TARGET_DIR at a time. The
+# lock file lives under OPERATIONAL_DIR, never inside TARGET_DIR, so a library
+# holds no operational files. Its name is a hash of TARGET_DIR's canonical
+# path, so any spelling of the same directory collides and different
+# directories do not.
+# A dry run only reads: it takes no lock and creates no directory or file.
+if (( ! DRY_RUN )); then
+    LOCK_DIR="${OPERATIONAL_DIR}/.locks"
+    mkdir -p -- "$LOCK_DIR"
+    LOCK_HASH="$(printf '%s' "$TARGET_DIR_REAL" | sha256sum | cut -d' ' -f1)"
+    LOCK_FILE="${LOCK_DIR}/${LOCK_HASH}.lock"
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        echo "ERROR: another run is already active against $TARGET_DIR (lock: $LOCK_FILE)" >&2
+        exit 1
+    fi
+    # Registered only after the lock is acquired, so a failed acquisition never
+    # deletes another process's lock file. Removes the lock file on any exit,
+    # including SIGINT and SIGTERM (EXIT traps run on both; SIGKILL skips them).
+    # Accepted race: a process that locks this path between the last real work
+    # and this trap can have the file unlinked from under it; for a single-user
+    # batch tool that window is negligible.
+    trap 'rm -f -- "$LOCK_FILE" 2>/dev/null || true' EXIT
+fi
+
+# Extensions
+SUB_EXTS="srt|vtt|ass|idx|sub"
+ALL_EXTS="${VIDEO_EXTS}|${SUB_EXTS}"
+
+# Subtitle languages kept: space-separated 2-letter codes, each a code2 in
+# lang_table.tsv. A subtitle in any other recognized language is deleted. To
+# keep another language, add its code here (SUPPORTED_SUB_LANGS="en fr").
+SUPPORTED_SUB_LANGS="en"
 
 # Prints the canonical language code for a raw subtitle language tag, or
 # nothing when the tag isn't in LANG_ALIASES (lang_table.sh).
@@ -1162,9 +1177,15 @@ DELETE_STATE=""
 # Log setup. The log is written directly to its final path: a rename pass is
 # idempotent (already-correct names are left alone on a re-run), so an
 # interrupted batch has no partial state worth keeping apart from the log.
-[[ -z "$LOG_DIR" ]] && LOG_DIR="${OPERATIONAL_DIR}/Logs"
-mkdir -p -- "$LOG_DIR"
-LOG_FILE="$LOG_DIR/Rename_$(date '+%Y-%m-%d_%H%M').txt"
+# A dry run writes no log, as in encoder_params.sh: every log() call goes to
+# /dev/null.
+if (( DRY_RUN )); then
+    LOG_FILE="/dev/null"
+else
+    [[ -z "$LOG_DIR" ]] && LOG_DIR="${OPERATIONAL_DIR}/Logs"
+    mkdir -p -- "$LOG_DIR"
+    LOG_FILE="$LOG_DIR/Rename_$(date '+%Y-%m-%d_%H%M').txt"
+fi
 # Appends one timestamped line to LOG_FILE. Sets nothing.
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
 
@@ -1742,7 +1763,7 @@ while IFS= read -r -d '' FILE_PATH; do
         extract_sub_lang_tag "$FILE_BASE"
         # A recognized language outside SUPPORTED_SUB_LANGS is deleted, not renamed,
         # when the name outside the tag has a year or an episode token, so a
-        # title that happens to end in a language code ("Dr.No") is never
+        # title that happens to end in a language code ("Some.Title.It") is never
         # taken for a tagged subtitle.
         if [[ -n "$SUB_LANG_CODE" ]] && ! is_supported_lang "$SUB_LANG_CODE"; then
             find_last_year "$SUB_TAG_STRIPPED_NAME"
@@ -2122,11 +2143,12 @@ echo "  Renamed:    $RENAMED"
 echo "  Deleted:    $DELETED  (subtitles in unsupported languages)"
 (( DRY_RUN )) && echo "  Would delete: $DELETE_PREVIEWED"
 (( DRY_RUN )) && echo "  Previewed:  $PREVIEWED  (dry run: nothing written; re-run without -n to rename)"
-echo "  Skipped:    $SKIPPED  (collisions or unrecognized language/modifier - review manually)"
+echo "  Skipped:    $SKIPPED  (collisions, unconfirmed deletions, unrecognized or surplus subtitle tracks - review manually)"
 echo "  No match:   $NO_MATCH  (no usable year found, or no confirmed series; left untouched)"
 echo "  Failed:     $FAILED"
 echo "------------------------------------------"
 log "Batch complete: Renamed=$RENAMED Deleted=$DELETED DeletePreviewed=$DELETE_PREVIEWED Previewed=$PREVIEWED Skipped=$SKIPPED NoMatch=$NO_MATCH Failed=$FAILED"
-echo "Log saved to: $LOG_FILE"
+(( DRY_RUN )) || echo "Log saved to: $LOG_FILE"
+(( FAILED == 0 )) || exit 1
 
 [[ $FAILED -eq 0 ]] || exit 1

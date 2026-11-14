@@ -3,7 +3,7 @@
 
 Usage:
     python3 sync_plex_folders.py CSV [--library NAME ...] [--url URL] [--dir PATH]
-                                     [--dry-run] [--force] [--log PATH]
+                                     [-n|--dry-run] [-f|--force] [--log PATH]
 
 Lists the folder of every show in the Plex show libraries (all of them, or the titles
 given with --library) and makes CSV match: folders new to the library are added,
@@ -249,8 +249,8 @@ def main(argv=None):
     p.add_argument("--url", default=os.environ.get(URL_ENV, "").strip() or None)
     p.add_argument("--dir", default=None, dest="directory",
                    help="list the sub-directories of this path instead of asking Plex")
-    p.add_argument("--dry-run", action="store_true", help="report changes; write nothing")
-    p.add_argument("--force", action="store_true",
+    p.add_argument("-n", "--dry-run", action="store_true", help="report changes; write nothing")
+    p.add_argument("-f", "--force", action="store_true",
                    help="allow removing more than half of the existing rows")
     p.add_argument("--log", default=DEFAULT_LOG)
     a = p.parse_args(argv)

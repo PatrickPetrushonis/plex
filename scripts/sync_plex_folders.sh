@@ -29,7 +29,7 @@ DST_CSV="${DATA_DIR}/plex_folders.csv"
 SYNC_SCRIPT="${SCRIPT_DIR}/sync_plex_folders.py"
 
 [[ -f "$SYNC_SCRIPT" ]] || { echo "ERROR: not found: $SYNC_SCRIPT" >&2; exit 1; }
-mkdir -p "$DATA_DIR"
+mkdir -p -- "$DATA_DIR"
 
 ARGS=()
 if [[ -n "${PLEX_LIBRARY:-}" ]]; then

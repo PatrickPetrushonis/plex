@@ -6,7 +6,7 @@ Usage:
     python3 get_plex_labels.py FOLDERS.csv LABELS.csv [--source jikan|mal-api] [--no-tmdb]
                          [--no-source-works] [--check-source-route] [--assess-genres]
                          [--no-idmap] [--refresh-idmap] [--idmap PATH]
-                         [--force] [--dry-run] [--cache PATH] [--log PATH]
+                         [-f|--force] [-n|--dry-run] [--cache PATH] [--log PATH]
 
 FOLDERS.csv  plex_folders.csv, written by sync_plex_folders.py. First column "Plex Folder"
           (header row required). Optional columns, all written by the sync from Plex's own
@@ -184,8 +184,8 @@ DEFAULT_CACHE = os.path.join(SCRIPT_DIR, "get_plex_labels_cache.json")
 DEFAULT_LOG = os.path.join(LOG_DIR, "get_plex_labels.log")
 # Sections of the cache file: one per MAL source, plus TMDB.
 TMDB_SECTION = "tmdb"
-# Caches written by the scripts this one replaces, imported once when the cache is absent.
-LEGACY_CACHES = (("jikan", "get_anime_labels_cache.json"),
+# Cache files imported into the cache when it does not exist yet.
+IMPORTED_CACHES = (("jikan", "get_anime_labels_cache.json"),
                  ("mal-api", "get_anime_labels_cache_mal_api.json"),
                  (TMDB_SECTION, "get_western_labels_cache.json"))
 FOLDER_COLUMN = "Plex Folder"
@@ -732,7 +732,7 @@ def load_idmap(path, refresh, dry_run, log, now=None):
 
 def load_store(path):
     """Returns (store, imported): the cache dict at path ({section: {key: record}}), and
-    the sections imported from the legacy cache files beside it when path does not exist.
+    the sections imported from the cache files named in IMPORTED_CACHES beside it when path does not exist.
     Exits on a corrupt file rather than silently discarding finished lookups."""
     if os.path.exists(path):
         try:
@@ -741,7 +741,7 @@ def load_store(path):
         except ValueError:
             sys.exit(f"ERROR: cache {path} is not valid JSON; fix or remove it")
     store, imported = {}, []
-    for section, name in LEGACY_CACHES:
+    for section, name in IMPORTED_CACHES:
         legacy = os.path.join(os.path.dirname(os.path.realpath(path)), name)
         if os.path.isfile(legacy):
             try:
@@ -1026,7 +1026,7 @@ def assess_genre_model(folders, keys, cache, log):
     """Scores genre-based Target prediction leave-one-out on anime whose own MAL demographic
     gives Male or Female, and logs the result. Compares the fixed rules (genre_target)
     with genre_bayes at each ASSESS_CUTOFFS probability. The labeled anime are those
-    adapted from manga; the anime that need a guess mostly are not, so these figures
+    adapted from manga; the anime that need a guess are not, so these figures
     are an optimistic bound for them, not their accuracy. Changes no output."""
     data = []
     for f in folders:
@@ -1353,8 +1353,8 @@ def main(argv=None):
                                             "and TMDB.")
     p.add_argument("src", help="plex_folders.csv")
     p.add_argument("dst", help="plex_labels.csv")
-    p.add_argument("--force", action="store_true", help="overwrite an existing DST")
-    p.add_argument("--dry-run", action="store_true", help="report only; touch nothing")
+    p.add_argument("-f", "--force", action="store_true", help="overwrite an existing DST")
+    p.add_argument("-n", "--dry-run", action="store_true", help="report only; touch nothing")
     p.add_argument("--source", choices=SOURCES, default="jikan")
     p.add_argument("--cache", default=DEFAULT_CACHE)
     p.add_argument("--log", default=DEFAULT_LOG)

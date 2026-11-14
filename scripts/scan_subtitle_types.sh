@@ -9,19 +9,20 @@
 #
 # Options:
 #   -r        Recurse into subdirectories
-#   -e EXTS   Comma-separated video extensions to scan (default: same list
-#             as encoder_params.sh's VIDEO_EXT_REGEX)
+#   -e EXTS   Comma-separated video extensions to scan (default: VIDEO_EXTS
+#             from video_exts.sh)
 #   -o FILE   Also write a TSV report (file, stream index, codec, language,
-#             class) to FILE; the stdout summary always prints regardless
+#             class) to FILE; the stdout summary always prints regardless.
+#             Refuses an existing FILE and, as root, any -o
 #   -h        Show this help
 #
 # Classification (embedded subtitle streams only - sidecar .srt files are
 # always TEXT_RISK by construction, see subtitle_tag_strip.sh, so are not
 # scanned here):
 #   TEXT_RISK   codec is subrip or mov_text: plain text, can carry a
-#               leftover ASS override tag as literal on-screen text. Run
-#               subtitle_extract_params.sh against a TEXT_RISK hit to turn
-#               it into a tag-stripped sidecar.
+#               leftover ASS override tag as literal on-screen text.
+#               encoder_params.sh -S sidecar extracts it as a tag-stripped
+#               sidecar; -S embed muxes a tag-stripped copy.
 #   ASS_NATIVE  codec is ass or ssa: override tags here are genuine
 #               positioning/styling, correctly rendered by an ASS-capable
 #               player - never a stripping candidate.
@@ -29,10 +30,9 @@
 #               image-based, no text tags possible.
 #   OTHER       any other codec_name ffprobe reports.
 #
-# Run this to find which files are worth running subtitle_extract_params.sh
-# against: if TEXT_RISK count is 0 (or every hit is already covered by a
-# sidecar .srt, which discover_sidecar_subs() in encoder_params.sh prefers
-# over the embedded track anyway), there's nothing to extract.
+# Run this before an encoder_params.sh run to see which files have TEXT_RISK
+# tracks. A TEXT_RISK track with a sidecar of the same language and type is not
+# muxed: the sidecar replaces it (discover_sidecar_subs() in encoder_params.sh).
 
 set -euo pipefail
 
@@ -44,6 +44,17 @@ fi
 require() { command -v "$1" &>/dev/null || { echo "ERROR: '$1' not found on PATH" >&2; exit 1; }; }
 require ffprobe
 require python3
+require find
+require grep
+require sed
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./video_exts.sh
+[[ -r "${SCRIPT_DIR}/video_exts.sh" ]] || {
+    echo "ERROR: video_exts.sh not found next to this script (${SCRIPT_DIR})" >&2
+    exit 1
+}
+source "${SCRIPT_DIR}/video_exts.sh"
 
 RECURSE=0
 CUSTOM_EXTS=""
@@ -67,26 +78,27 @@ done
 shift $(( OPTIND - 1 ))
 
 [[ $# -eq 1 ]] || {
-    echo "Usage: $0 [OPTIONS] <dir>"
-    echo "  Run $0 -h for full help."
+    echo "Usage: $0 [OPTIONS] <dir>" >&2
+    echo "  Run $0 -h for full help." >&2
     exit 1
 }
 TARGET_DIR="$1"
 [[ -d "$TARGET_DIR" ]] || { echo "ERROR: not a directory: $TARGET_DIR" >&2; exit 1; }
 
+# Checked before the scan starts: a report that cannot be written should not
+# cost a full scan, and an existing file is never truncated.
+if [[ -n "$REPORT_FILE" ]]; then
+    if [[ $EUID -eq 0 ]]; then
+        echo "ERROR: do not run this with sudo and -o, it creates a file a normal user needs to own." >&2
+        exit 1
+    fi
+    [[ ! -e "$REPORT_FILE" ]] || { echo "ERROR: report file already exists: $REPORT_FILE" >&2; exit 1; }
+fi
+
 if [[ -n "$CUSTOM_EXTS" ]]; then
     VIDEO_EXT_REGEX="$(echo "$CUSTOM_EXTS" | tr ',' '|' | tr -d ' ')"
 else
-    # Same literal default as encoder_params.sh's VIDEO_EXT_REGEX. Kept as a
-    # documented, hand-synced duplicate rather than pulled into a shared
-    # module: this is a single constant string, not shared logic, and this
-    # is the only other place that needs it. If the embedded-track
-    # extraction work (see header) gets built, that will also need
-    # encoder_params.sh's collect_files()/probe_file() shape and is the
-    # point where extracting a real shared module (this constant plus the
-    # file-collection and ffprobe-parsing logic) pays for itself - not
-    # worth it for one string today.
-    VIDEO_EXT_REGEX="mp4|mkv|avi|mov|ts|m4v|wmv|flv|webm|vob|ogv|3gp|mpg|mpeg|divx"
+    VIDEO_EXT_REGEX="$VIDEO_EXTS"
 fi
 
 DEPTH_FLAG=()
@@ -185,9 +197,8 @@ echo ""
 echo "  Files with >=1 TEXT_RISK (subrip/mov_text) embedded track: ${FILES_WITH_TEXT_RISK} / ${#ALL_FILES[@]}"
 echo "  Files with no embedded subtitle streams at all:            ${FILES_WITH_NO_SUBS} / ${#ALL_FILES[@]}"
 echo "-------------------------------------------------------------------------"
-echo "  Note: a file's sidecar .srt (if any) already wins over its embedded"
-echo "  track in encoder_params.sh - cross-check TEXT_RISK hits against your"
-echo "  library's sidecar coverage before sizing the extraction-pass work."
+echo "  Note: a file's sidecar subtitle of the same language and type replaces"
+echo "  its embedded track in encoder_params.sh."
 
 if [[ -n "$REPORT_FILE" ]]; then
     {

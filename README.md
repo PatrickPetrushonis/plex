@@ -23,6 +23,7 @@ plex/
     ├── scan_subtitle_types.sh      Standalone, read-only inventory of embedded subtitle codecs across a directory - no wrapper, no config.sh dependency
     ├── lang_table.sh               Shared language-code loader (bash side)
     ├── lang_table.tsv              Canonical language data (single source of truth)
+    ├── video_exts.sh               Shared: the video file extensions the encoder, renamer and scanner scan for
     ├── update_plex_labels.sh       Runs the three label stages below in order
     ├── sync_plex_folders.sh        Label stage 1: create/update data/plex_folders.csv from the Plex library (wrapper)
     ├── sync_plex_folders.py        Label stage 1: the folder listing and CSV merge themselves
@@ -41,12 +42,12 @@ plex/
 
 ### Mount the NAS share
 
-`setup_smb_mount.sh` mounts a CIFS/SMB share (for example a Synology NAS) at a stable local path, owned by a normal user, so the encoder and renamer, which refuse to run as root, can read and write it. It is the one script in this repo that must run as root: installing `cifs-utils`, writing `/etc/fstab` and mounting all need it.
+`setup_smb_mount.sh` mounts a CIFS/SMB share (for example a NAS) at a stable local path, owned by a normal user, so the encoder and renamer, which refuse to run as root, can read and write it. It is the one script in this repo that must run as root: installing `cifs-utils`, writing `/etc/fstab` and mounting all need it.
 
 ```bash
 cd scripts
-./setup_smb_mount.sh -n -p Movies synology.local plexmedia /mnt/synology/movies    # preview; needs no root
-sudo ./setup_smb_mount.sh -p Movies synology.local plexmedia /mnt/synology/movies  # do it
+./setup_smb_mount.sh -n -p Movies nas.local media /mnt/nas/movies    # preview; needs no root
+sudo ./setup_smb_mount.sh -p Movies nas.local media /mnt/nas/movies  # do it
 ```
 
 | Option | Meaning |
@@ -135,7 +136,7 @@ cd scripts
 export MAL_CLIENT_ID='...' TMDB_API_KEY='...'
 export PLEX_URL='http://<nas-ip>:32400' PLEX_TOKEN='...'
 ./update_plex_labels.sh                        # all three stages, in order
-./update_plex_labels.sh --dry-run              # every stage in dry-run (needs plex_labels.csv from an earlier run)
+./update_plex_labels.sh -n                     # every stage in dry-run (needs plex_labels.csv from an earlier run)
 ./update_plex_labels.sh --check-source-route   # also log whether source-work demographics agree with MAL's own
 ```
 
@@ -167,7 +168,7 @@ The label scripts do not source `config.sh`. They locate their own inputs and ou
 
 ## Concurrency lock
 
-`encoder_params.sh` and `rename_params.sh` each take their own exclusive, non-blocking `flock`, once the directory they work from is ready: `encoder_params.sh` creates `OUTPUT_DIR` first, and `rename_params.sh` resolves the target's canonical path. A second run against the same directory, from any invocation path (the wrappers, or either script called directly), exits immediately with an error instead of racing. The lock releases automatically when the process exits, including on Ctrl-C.
+`encoder_params.sh` and `rename_params.sh` each take their own exclusive, non-blocking `flock`, once the directory they work from is ready: `encoder_params.sh` creates `OUTPUT_DIR` first, and `rename_params.sh` resolves the target's canonical path. A dry run of `rename_params.sh` takes no lock and writes no log. A second run against the same directory, from any invocation path (the wrappers, or either script called directly), exits immediately with an error instead of racing. The lock releases automatically when the process exits, including on Ctrl-C.
 
 Neither script's lock (or logs) live inside the directory being processed — both route through an operational directory instead:
 - `encoder_params.sh` locks `OUTPUT_DIR/.media.lock` and logs to `OUTPUT_DIR/Logs`, since `OUTPUT_DIR` is a working/encoding area, not a curated library.
@@ -186,6 +187,7 @@ The label scripts keep their lock files in `scripts/` instead, and remove them w
 
 - `encoder_params.sh` sources `lang_table.sh` for its bash-side sidecar matching (`LANG_TABLE`, `LANG_3TO2`, `LANG_LABEL_BASH`), and its Python probe step reads `lang_table.tsv` directly for embedded-track display labels (which resolve aliases).
 - `rename_params.sh` sources `lang_table.sh` for its `LANG_ALIASES` lookup, used to normalize subtitle filename language tags (e.g. `.eng.srt` → `.en.srt`, `.fre.srt` → `.fr.srt`) to the 2-letter form `encoder_params.sh`'s sidecar matching expects.
+- `video_exts.sh` defines `VIDEO_EXTS`, the one video extension list `encoder_params.sh`, `rename_params.sh` and `scan_subtitle_types.sh` all read.
 - `subtitle_mux.sh` does not source `lang_table.sh`: it depends on `LANG_3TO2`/`LANG_LABEL_BASH` already being loaded by whichever script sourced it.
 
 Both `lang_table.sh` and `lang_table.tsv` resolve their own file locations relative to themselves, not the caller's working directory, so this works regardless of where a script is invoked from. `lang_table.sh` is also safe to source more than once in the same process (an include guard makes the second call a no-op).
@@ -212,7 +214,7 @@ Every encoded file's video stream is probed while it is still the `.tmp` file. A
 
 ### HEVC and HDR sources
 
-**HEVC sources** are always re-encoded to x264. The script prints a warning because transcoding HEVC to x264 typically produces a larger file.
+**HEVC sources** are always re-encoded to x264. The script prints a warning because transcoding HEVC to x264 can produce a larger file.
 
 **HDR sources are converted to SDR rather than carried through, and tagged explicitly, for these reasons:**
 
@@ -261,7 +263,7 @@ Skipped and logged rather than guessed: an unrecognized subtitle language or mod
 
 ## Subtitle tag stripping (`subtitle_tag_strip.sh`)
 
-Some subtitle files carry leftover ASS/SSA override tags (most commonly `{\an8}`, a positioning tag) as literal text, usually from a lazy ASS→SRT conversion somewhere upstream (a subtitle service, an encoder, etc). Most players, including Plex on TV clients, don't parse the tag and instead display it as on-screen text. `subtitle_tag_strip.sh` provides `strip_sidecar_sub()`, which strips any `{\...}` bracketed override sequence (structural match, not a tag-name keyword list) from a plain-text subtitle file, writing the result to a scratch copy — the original file is never modified.
+Some subtitle files carry leftover ASS/SSA override tags (for example `{\an8}`, a positioning tag) as literal text, from an ASS→SRT conversion that kept the tags. Most players, including Plex on TV clients, don't parse the tag and instead display it as on-screen text. `subtitle_tag_strip.sh` provides `strip_sidecar_sub()`, which strips any `{\...}` bracketed override sequence (structural match, not a tag-name keyword list) from a plain-text subtitle file, writing the result to a scratch copy — the original file is never modified.
 
 This is sidecar-file logic specifically (a real file already on disk); an *embedded* subtitle stream can't be edited in place the same way, and no script here repairs one.
 
@@ -286,7 +288,7 @@ Every item in the Plex library gets exactly one Age label and one Target label. 
 | 2 | `get_plex_labels.sh` | `data/plex_folders.csv` (and the ID map, downloaded) | `data/plex_labels.csv` | `MAL_CLIENT_ID` for `--source mal-api`; `TMDB_API_KEY` unless `--no-tmdb` |
 | 3 | `apply_plex_labels.sh` | `data/plex_labels.csv` | labels in Plex | `PLEX_URL`, `PLEX_TOKEN`; optional `PLEX_LIBRARY` |
 
-`update_plex_labels.sh [--dry-run] [--check-source-route]` runs all three, with `--source mal-api --force` for stage 2. It checks the environment variables before stage 1 and stops at the first of stages 1 and 2 that exits non-zero (`STOPPED` for exit 2, `FAILED` otherwise), so nothing is applied to Plex from a partial result. Exit 2 from stage 3 means the labels were applied but some folders were not found in Plex or some rows were skipped; the wrapper prints a `NOTE`, finishes with `Done, with items needing attention` and exits 2. With `--dry-run` every stage runs in dry-run and `plex_labels.csv` must already exist from an earlier run. Run alone, each wrapper passes extra arguments through to its Python script, and each Python script prints its usage with `-h`.
+`update_plex_labels.sh [-n|--dry-run] [--check-source-route] [-h]` runs all three, with `--source mal-api --force` for stage 2. It checks the environment variables before stage 1 and stops at the first of stages 1 and 2 that exits non-zero (`STOPPED` for exit 2, `FAILED` otherwise), so nothing is applied to Plex from a partial result. Exit 2 from stage 3 means the labels were applied but some folders were not found in Plex or some rows were skipped; the wrapper prints a `NOTE`, finishes with `Done, with items needing attention` and exits 2. With `--dry-run` every stage runs in dry-run and `plex_labels.csv` must already exist from an earlier run. Run alone, each wrapper passes extra arguments through to its Python script, and each Python script prints its usage with `-h`.
 
 Credentials come from the environment and are never written to a file or log. `PLEX_URL` is the server's address with scheme and port, for example `http://192.168.1.20:32400`. If the server's "Secure connections" setting is Required, plain `http://` is rejected.
 
@@ -359,7 +361,11 @@ Without `PLEX_LIBRARY` or `--library` every show and movie library on the server
 
 ### Logs and exit codes
 
-Logs go to `plex/logs/` (the `logs` directory beside `scripts/`): `get_plex_labels.log`, `apply_plex_labels.log`. Exit codes for stages 1 and 2: `0` complete, `1` aborted (outage, bad credentials, repeated failures, bad input), `2` complete but some lookups failed or rows went unmatched. A re-run retries only the failed lookups.
+Logs go to `plex/logs/` (the `logs` directory beside `scripts/`): `get_plex_labels.log`, `apply_plex_labels.log`. Exit codes for stages 1 and 2: `0` complete, `1` aborted (outage, bad credentials, repeated failures, bad input), `2` complete but some lookups failed or rows went unmatched. A re-run retries only the failed lookups. `encoder_params.sh` and `rename_params.sh` exit `0` when no file failed and `1` when any did; skipped and unmatched files do not change the status.
+
+### Flag conventions
+
+`-n` (or `--dry-run` on the Python tools and `update_plex_labels.sh`) is a dry run everywhere, and `-f` (or `--force`) is a force flag, except in `encoder_params.sh`, where `-f` selects the output container and `-F` selects flat output; in `rename_params.sh` and `setup_smb_mount.sh` `-f` forces and `-F` (renamer) restricts the run to files. `encoder_params.sh -o DIR` is the output directory and `rename_params.sh -O DIR` the operational directory.
 
 ### Known limitations
 

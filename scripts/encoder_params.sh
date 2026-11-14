@@ -14,7 +14,7 @@
 #                   codes from lang_table.tsv (default: eng)
 #   -a CODECS       Comma-separated audio codecs to copy without re-encode
 #                   (default: aac,ac3,eac3,dts,truehd,flac,opus)
-#   -e EXTS         Comma-separated input extensions to scan (default: see VIDEO_EXTS)
+#   -e EXTS         Comma-separated input extensions to scan (default: VIDEO_EXTS in video_exts.sh)
 #   -L DIR          Log directory (default: OUTPUT_DIR/Logs)
 #   -r              Recurse into subdirectories, mirroring folder structure in output
 #   -F              Flat output: do not mirror directory structure (default when
@@ -33,7 +33,7 @@
 #
 # Notes:
 #   * Requires bash 4.0+, ffmpeg (built with the zscale and tonemap filters),
-#     ffprobe, python3, flock, sed
+#     ffprobe, python3, flock, find, grep, sed, awk, iconv
 #   * Video is copied if already h264, 8-bit 4:2:0, SDR (colour transfer not PQ or
 #     HLG), and within MAX_HEIGHT; otherwise re-encoded to x264
 #   * PQ and HLG sources are tone-mapped to SDR BT.709 and tagged bt709, since
@@ -179,8 +179,8 @@ done
 shift $(( OPTIND - 1 ))
 
 [[ $# -lt 1 ]] && {
-    echo "Usage: $0 [OPTIONS] <input_file|dir|glob> ..."
-    echo "  Run $0 -h for full help."
+    echo "Usage: $0 [OPTIONS] <input_file|dir|glob> ..." >&2
+    echo "  Run $0 -h for full help." >&2
     exit 1
 }
 
@@ -245,6 +245,38 @@ require python3
 require flock
 require sed
 require iconv
+require find
+require grep
+require awk
+
+# Loaded before the lock and log exist, so a missing or mismatched file leaves
+# nothing behind.
+# -- Sidecar subtitle support (Plex-style Movie.en.srt / Movie.en.cc.vtt) ----------
+# LANG_TABLE, LANG_3TO2, LANG_LABEL_BASH, LANG_ALIASES, LANG_CANON and
+# canon_lang() come from the shared lang_table.sh / lang_table.tsv (same
+# directory), also the source the Python probe step's LANG_NAMES reads (see
+# probe_file()).
+# shellcheck source=./video_exts.sh
+source "$(dirname "${BASH_SOURCE[0]}")/video_exts.sh"
+# shellcheck source=./lang_table.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lang_table.sh"
+declare -F canon_lang >/dev/null || {
+    echo "ERROR: canon_lang is not defined; lang_table.sh is not the version this script requires" >&2
+    exit 1
+}
+
+# subtitle_output_codec(), sidecar_output_codec(), probe_sidecar_codec(),
+# sidecar_needs_tag_strip(), find_sidecar_file(), discover_sidecar_subs(),
+# report_unclaimed_sidecars(), subtitle_track_type(), subtitle_track_key(),
+# verify_subtitle_count() and build_external_subtitle_args() come from
+# subtitle_mux.sh (same directory).
+# shellcheck source=./subtitle_mux.sh
+source "$(dirname "${BASH_SOURCE[0]}")/subtitle_mux.sh"
+
+# TAG_STRIP_PATTERN, init_subtitle_tag_strip, cleanup_stripped_subs and
+# strip_sidecar_sub come from subtitle_tag_strip.sh (same directory).
+# shellcheck source=./subtitle_tag_strip.sh
+source "$(dirname "${BASH_SOURCE[0]}")/subtitle_tag_strip.sh"
 
 # zscale (libzimg) and tonemap convert HDR sources to SDR; checked here so a
 # batch fails before any work instead of on the first HDR file. The filter
@@ -290,7 +322,7 @@ fi
 #
 # Re-registered below, right after init_subtitle_tag_strip creates its temp
 # directory, so each trap is added immediately after the state it undoes.
-trap 'rm -f "$LOCK_FILE" 2>/dev/null || true' EXIT
+trap 'rm -f -- "$LOCK_FILE" 2>/dev/null || true' EXIT
 
 # A dry run writes no log: every log() call and the header block go to
 # /dev/null.
@@ -390,13 +422,13 @@ cleanup() {
     fi
     if [[ -n "$CURRENT_TMP" && -f "$CURRENT_TMP" ]]; then
         echo "  Removing partial output: $CURRENT_TMP" >&2
-        rm -f "$CURRENT_TMP"
+        rm -f -- "$CURRENT_TMP"
     fi
     local _t
     for _t in "${CURRENT_SIDECAR_TMPS[@]+"${CURRENT_SIDECAR_TMPS[@]}"}"; do
         rm -f -- "$_t"
     done
-    [[ -n "$CURRENT_STDERR_CAPTURE" && -f "$CURRENT_STDERR_CAPTURE" ]] && rm -f "$CURRENT_STDERR_CAPTURE"
+    [[ -n "$CURRENT_STDERR_CAPTURE" && -f "$CURRENT_STDERR_CAPTURE" ]] && rm -f -- "$CURRENT_STDERR_CAPTURE"
     print_summary "ABORTED by $SIG"
     (( DRY_RUN )) || echo "Log retained at: $LOG_FILE_TEMP" >&2
     exit 1
@@ -409,7 +441,7 @@ trap 'cleanup SIGTERM' TERM
 if [[ -n "$CUSTOM_EXTS" ]]; then
     VIDEO_EXT_REGEX="$(echo "$CUSTOM_EXTS" | tr ',' '|' | tr -d ' ')"
 else
-    VIDEO_EXT_REGEX="mp4|mkv|avi|mov|ts|m4v|wmv|flv|webm|vob|ogv|3gp|mpg|mpeg|divx"
+    VIDEO_EXT_REGEX="$VIDEO_EXTS"
 fi
 
 # -- File collection -----------------------------------------------------------------
@@ -705,31 +737,6 @@ for s in subs:
 PYEOF
 }
 
-# -- Sidecar subtitle support (Plex-style Movie.en.srt / Movie.en.cc.vtt) ----------
-# LANG_TABLE, LANG_3TO2, LANG_LABEL_BASH, LANG_ALIASES, LANG_CANON and
-# canon_lang() come from the shared lang_table.sh / lang_table.tsv (same
-# directory), also the source the Python probe step's LANG_NAMES reads (see
-# probe_file()).
-# shellcheck source=./lang_table.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lang_table.sh"
-declare -F canon_lang >/dev/null || {
-    echo "ERROR: canon_lang is not defined; lang_table.sh is not the version this script requires" >&2
-    exit 1
-}
-
-# subtitle_output_codec(), sidecar_output_codec(), probe_sidecar_codec(),
-# sidecar_needs_tag_strip(), find_sidecar_file(), discover_sidecar_subs(),
-# report_unclaimed_sidecars(), subtitle_track_type(), subtitle_track_key(),
-# verify_subtitle_count() and build_external_subtitle_args() come from
-# subtitle_mux.sh (same directory).
-# shellcheck source=./subtitle_mux.sh
-source "$(dirname "${BASH_SOURCE[0]}")/subtitle_mux.sh"
-
-# TAG_STRIP_PATTERN, init_subtitle_tag_strip, cleanup_stripped_subs and
-# strip_sidecar_sub come from subtitle_tag_strip.sh (same directory).
-# shellcheck source=./subtitle_tag_strip.sh
-source "$(dirname "${BASH_SOURCE[0]}")/subtitle_tag_strip.sh"
-
 # Runs once, after the concurrency lock above is held, and only for a real
 # run: a dry run prints decisions and touches nothing, so it must not create
 # even a scratch temp directory. A failure here aborts the run the same way
@@ -739,7 +746,7 @@ if (( ! DRY_RUN )); then
     init_subtitle_tag_strip || exit 1
     # Re-registers the EXIT trap now that the temp directory exists (see the
     # lock's trap above).
-    trap 'rm -f "$LOCK_FILE" 2>/dev/null || true; cleanup_stripped_subs' EXIT
+    trap 'rm -f -- "$LOCK_FILE" 2>/dev/null || true; cleanup_stripped_subs' EXIT
 fi
 
 # Removes empty directories from the one holding $1 upward, stopping before
@@ -757,7 +764,7 @@ cleanup_empty_dirs() {
 
     while [[ "$DIR" != "$STOP_AT" && "$DIR" != "/" && "$DIR" != "." ]]; do
         [[ "$(dirname "$DIR")" == "$STOP_AT" ]] && break
-        rmdir "$DIR" 2>/dev/null || break
+        rmdir -- "$DIR" 2>/dev/null || break
         DIR="$(dirname "$DIR")"
     done
 }
@@ -816,7 +823,7 @@ archive_output() {
     if [[ "$SRC_SIZE" != "$DEST_SIZE" ]]; then
         echo " WARNING: size mismatch after copy (src: ${SRC_SIZE}B, dest: ${DEST_SIZE}B); destination removed" >&2
         log "ARCHIVE FAILED (size mismatch): $SRC"
-        rm -f "$DEST"
+        rm -f -- "$DEST"
         return 1
     fi
 
@@ -1572,7 +1579,7 @@ execute_encode() {
             fi
         fi
 
-        [[ "$STDERR_CAPTURE" != "/dev/null" ]] && rm -f "$STDERR_CAPTURE"
+        [[ "$STDERR_CAPTURE" != "/dev/null" ]] && rm -f -- "$STDERR_CAPTURE"
         CURRENT_STDERR_CAPTURE=""
         return "$POST_RC"
 
@@ -1801,6 +1808,8 @@ if (( DRY_RUN )); then
     echo "Dry run: nothing was written."
 elif [[ $ENCODE_FAIL -eq 0 ]]; then
     LOG_FILE_FINAL="$LOG_DIR/Log_$(date '+%Y-%m-%d_%H%M').txt"
+    # Two runs finishing in one minute must not overwrite each other's log.
+    [[ -e "$LOG_FILE_FINAL" ]] && LOG_FILE_FINAL="$LOG_DIR/Log_$(date '+%Y-%m-%d_%H%M%S').txt"
     mv -- "$LOG_FILE_TEMP" "$LOG_FILE_FINAL"
     echo "Log saved to: $LOG_FILE_FINAL"
 else
