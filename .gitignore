@@ -10,3 +10,14 @@ Thumbs.db
 
 # Local secrets, if any script in this repo ever writes one out
 .env
+
+# Local files
+*.csv
+*.log
+*.pyc
+__pycache__/
+
+# Label pipeline: lookup caches and lock files written next to the scripts
+get_plex_labels_cache.json
+get_plex_labels_idmap.json
+*.lock
