@@ -26,22 +26,17 @@ bad token, repeated failures, bad input); 2 finished with unmatched rows or fail
 import argparse
 import csv
 import hashlib
-import json
-import ntpath
 import os
 import posixpath
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
 from contextlib import contextmanager
 
 from labels_common import ABORT_AFTER_FAILURES, LOG_DIR, close_logging, hold_lock, setup_logging
+from plex_api import (PAGE_SIZE, SECTION_TYPE_IDS, PlexError, env_token, env_url,
+                      find_sections, folder_basename, plex_request, require_credentials)
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_LOG = os.path.join(LOG_DIR, "apply_plex_labels.log")
-URL_ENV = "PLEX_URL"
-TOKEN_ENV = "PLEX_TOKEN"
 
 AGE_VALUES = ("Kids", "Teen", "Adult")
 TARGET_VALUES = ("Male", "Female", "Unspecified")
@@ -50,67 +45,6 @@ TARGET_PREFIX = "Target-"
 OWNED_PREFIXES = (AGE_PREFIX, TARGET_PREFIX)
 REQUIRED_COLUMNS = ("Plex Folder", "Age", "Target")
 
-SECTION_TYPE_IDS = {"show": 2, "movie": 1}   # Plex's numeric types in edit requests
-PAGE_SIZE = 200
-TIMEOUT_SECONDS = 30
-
-
-class PlexError(Exception):
-    """A request to Plex failed; the message never contains the token."""
-
-
-def folder_basename(path):
-    """Returns the last component of a Plex Location path, accepting both / and \\
-    separators because a Windows-hosted server reports backslash paths."""
-    return ntpath.basename(posixpath.normpath(path.replace("\\", "/")))
-
-
-def plex_request(base_url, token, method, path, params=None, headers=None):
-    """Sends one request to Plex and returns the decoded JSON body ({} when the body
-    is empty). The token travels in the X-Plex-Token header, never in the URL.
-    Raises PlexError on HTTP errors, network errors and undecodable bodies."""
-    url = base_url.rstrip("/") + path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    hdrs = {"X-Plex-Token": token, "Accept": "application/json"}
-    hdrs.update(headers or {})
-    req = urllib.request.Request(url, method=method, headers=hdrs)
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
-            body = resp.read()
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            raise PlexError(f"HTTP 401 for {method} {path}: the server rejected the token") from None
-        raise PlexError(f"HTTP {e.code} for {method} {path}") from None
-    except (urllib.error.URLError, OSError) as e:
-        raise PlexError(f"cannot reach {base_url}: {getattr(e, 'reason', e)}") from None
-    if not body.strip():
-        return {}
-    try:
-        return json.loads(body)
-    except ValueError:
-        raise PlexError(f"non-JSON response for {method} {path}") from None
-
-
-def find_sections(base_url, token, wanted):
-    """Returns [(key, title, type)] for the libraries to label, type being "show" or
-    "movie". wanted is a list of library titles or None; None selects every show and
-    movie library. Raises PlexError when a wanted title is not a show or movie library
-    or when the server has none."""
-    data = plex_request(base_url, token, "GET", "/library/sections")
-    sections = {d["title"]: d for d in data.get("MediaContainer", {}).get("Directory", [])
-                if d.get("type") in SECTION_TYPE_IDS}
-    if wanted:
-        for title in wanted:
-            if title not in sections:
-                raise PlexError(f"no show or movie library titled {title!r}; "
-                                f"available: {', '.join(repr(t) for t in sections) or 'none'}")
-        chosen = [sections[t] for t in dict.fromkeys(wanted)]
-    else:
-        chosen = list(sections.values())
-    if not chosen:
-        raise PlexError("the server has no show or movie libraries")
-    return [(str(d["key"]), d["title"], d["type"]) for d in chosen]
 
 
 def item_folders(meta, section_type):
@@ -262,12 +196,7 @@ def run(csv_path, base_url, token, libraries, dry_run, log_path):
     verify_mismatch (items whose labels differ from the plan after applying)."""
     if not os.path.isfile(csv_path):
         sys.exit(f"ERROR: labels file not found: {csv_path}")
-    if not base_url or urllib.parse.urlsplit(base_url).scheme not in ("http", "https") \
-            or not urllib.parse.urlsplit(base_url).netloc:
-        sys.exit(f"ERROR: set {URL_ENV} (or --url) to the server address with scheme and port, "
-                 "e.g. http://192.0.2.10:32400")
-    if not token:
-        sys.exit(f"ERROR: set the {TOKEN_ENV} environment variable to a Plex token")
+    require_credentials(base_url, token)
     rows, problems = read_rows(csv_path)
     if not rows:
         sys.exit(f"ERROR: no labelable rows in {csv_path}")
@@ -376,12 +305,11 @@ def main(argv=None):
     p.add_argument("csv", help="labels CSV with Plex Folder, Age, Target columns")
     p.add_argument("--library", action="append", default=None,
                    help="library title to search; repeatable (default: all show and movie libraries)")
-    p.add_argument("--url", default=os.environ.get(URL_ENV, "").strip() or None)
+    p.add_argument("--url", default=env_url())
     p.add_argument("-n", "--dry-run", action="store_true", help="report changes; modify nothing")
     p.add_argument("--log", default=DEFAULT_LOG)
     a = p.parse_args(argv)
-    token = os.environ.get(TOKEN_ENV, "").strip() or None
-    return run(a.csv, a.url, token, a.library, a.dry_run, a.log)
+    return run(a.csv, a.url, env_token(), a.library, a.dry_run, a.log)
 
 
 if __name__ == "__main__":

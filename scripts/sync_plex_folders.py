@@ -35,11 +35,10 @@ import csv
 import os
 import re
 import sys
-import urllib.parse
 
-from apply_plex_labels import (PAGE_SIZE, TOKEN_ENV, URL_ENV, PlexError, find_sections,
-                               folder_basename, plex_request)
 from labels_common import LOG_DIR, atomic_write, close_logging, hold_lock, setup_logging
+from plex_api import (PAGE_SIZE, PlexError, env_token, env_url, find_sections, folder_basename,
+                      plex_request, require_credentials)
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_LOG = os.path.join(LOG_DIR, "sync_plex_folders.log")
@@ -175,12 +174,7 @@ def run(csv_path, base_url, token, libraries, directory, dry_run, force, log_pat
     """Syncs csv_path with the library (or directory) listing and returns the exit
     code (0 or 1)."""
     if directory is None:
-        parts = urllib.parse.urlsplit(base_url or "")
-        if parts.scheme not in ("http", "https") or not parts.netloc:
-            sys.exit(f"ERROR: set {URL_ENV} (or --url) to the server address with scheme "
-                     "and port, e.g. http://192.0.2.10:32400")
-        if not token:
-            sys.exit(f"ERROR: set the {TOKEN_ENV} environment variable to a Plex token")
+        require_credentials(base_url, token)
     header, rows = read_csv(csv_path)
     log = setup_logging(None if dry_run else log_path)
     try:
@@ -246,7 +240,7 @@ def main(argv=None):
     p.add_argument("csv", help="folder list CSV; created when missing")
     p.add_argument("--library", action="append", default=None,
                    help="show library title to list; repeatable (default: all show libraries)")
-    p.add_argument("--url", default=os.environ.get(URL_ENV, "").strip() or None)
+    p.add_argument("--url", default=env_url())
     p.add_argument("--dir", default=None, dest="directory",
                    help="list the sub-directories of this path instead of asking Plex")
     p.add_argument("-n", "--dry-run", action="store_true", help="report changes; write nothing")
@@ -254,8 +248,7 @@ def main(argv=None):
                    help="allow removing more than half of the existing rows")
     p.add_argument("--log", default=DEFAULT_LOG)
     a = p.parse_args(argv)
-    token = os.environ.get(TOKEN_ENV, "").strip() or None
-    return run(a.csv, a.url, token, a.library, a.directory, a.dry_run, a.force, a.log)
+    return run(a.csv, a.url, env_token(), a.library, a.directory, a.dry_run, a.force, a.log)
 
 
 if __name__ == "__main__":

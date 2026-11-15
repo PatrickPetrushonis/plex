@@ -29,6 +29,7 @@ plex/
     ├── get_plex_labels.py          Label stage 2: the lookups themselves (MAL and TMDB, through Plex's IDs)
     ├── apply_plex_labels.sh        Label stage 3: write the labels to Plex (wrapper)
     ├── apply_plex_labels.py        Label stage 3: the Plex API calls themselves
+    ├── plex_api.py                 Shared by stages 1 and 3: Plex requests, library lookup, PLEX_URL/PLEX_TOKEN checks
     ├── labels_common.py            Shared by the three .py scripts: HTTP with retry and throttle, logging, locks, atomic writes
     ├── setup_smb_mount.sh          One-time: mount the NAS share through /etc/fstab (the one script that needs sudo)
     └── lint.sh                     shellcheck for every .sh file, a syntax check for every .py file
