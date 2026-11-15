@@ -22,13 +22,10 @@ plex/
     ├── lang_table.sh               Shared language-code loader (bash side)
     ├── lang_table.tsv              Canonical language data (single source of truth)
     ├── video_exts.sh               Shared: the video file extensions the encoder, renamer and scanner scan for
-    ├── update_plex_labels.sh       Runs the three label stages below in order
-    ├── sync_plex_folders.sh        Label stage 1: create/update data/plex_folders.csv from the Plex library (wrapper)
-    ├── sync_plex_folders.py        Label stage 1: the folder listing and CSV merge themselves
-    ├── get_plex_labels.sh          Label stage 2: Age/Target from MyAnimeList, then TMDB (wrapper)
-    ├── get_plex_labels.py          Label stage 2: the lookups themselves (MAL and TMDB, through Plex's IDs)
-    ├── apply_plex_labels.sh        Label stage 3: write the labels to Plex (wrapper)
-    ├── apply_plex_labels.py        Label stage 3: the Plex API calls themselves
+    ├── plex_labels.sh              Label pipeline entry point: all three stages in order, or one stage (sync, labels, apply)
+    ├── sync_plex_folders.py        Label stage 1: create/update data/plex_folders.csv from the Plex library
+    ├── get_plex_labels.py          Label stage 2: Age/Target from MyAnimeList, then TMDB (through Plex's IDs)
+    ├── apply_plex_labels.py        Label stage 3: write the labels to Plex
     ├── plex_api.py                 Shared by stages 1 and 3: Plex requests, library lookup, PLEX_URL/PLEX_TOKEN checks
     ├── labels_common.py            Shared by the three .py scripts: HTTP with retry and throttle, logging, locks, atomic writes
     ├── setup_smb_mount.sh          One-time: mount the NAS share through /etc/fstab (the one script that needs sudo)
@@ -134,9 +131,9 @@ Run this after Plex has scanned the files: labels are applied to items Plex alre
 cd scripts
 export MAL_CLIENT_ID='...' TMDB_API_KEY='...'
 export PLEX_URL='http://<nas-ip>:32400' PLEX_TOKEN='...'
-./update_plex_labels.sh                        # all three stages, in order
-./update_plex_labels.sh -n                     # every stage in dry-run (needs plex_labels.csv from an earlier run)
-./update_plex_labels.sh --check-source-route   # also log whether source-work demographics agree with MAL's own
+./plex_labels.sh                        # all three stages, in order
+./plex_labels.sh -n                     # every stage in dry-run (needs plex_labels.csv from an earlier run)
+./plex_labels.sh --check-source-route   # also log whether source-work demographics agree with MAL's own
 ```
 
 See [Plex labels](#plex-labels-age-and-target) for the rules, the inputs and each stage on its own.
@@ -176,7 +173,7 @@ Neither script's lock (or logs) live inside the directory being processed — bo
 `config.sh` and the wrappers contain no locking logic — they're path/flag plumbing only. Every `_params.sh` script can be run standalone, without going through a wrapper, and is still protected.
 
 The label scripts keep their lock files in `scripts/` instead, and remove them when a run ends:
-- `update_plex_labels.sh` takes `.update_plex_labels.lock`, so only one pipeline runs at a time.
+- `plex_labels.sh` takes `.plex_labels.lock` when it runs all three stages, so only one pipeline runs at a time.
 - `get_plex_labels.py` takes `.get_plex_labels_<hash>.lock`, scoped to its cache file, so a second run against the same cache exits while runs against another cache proceed.
 - `apply_plex_labels.py` takes `.apply_plex_labels_<hash>.lock`, scoped to the Plex server and library selection.
 
@@ -283,11 +280,11 @@ Every item in the Plex library gets exactly one Age label and one Target label. 
 
 | Stage | Script | Reads | Writes | Needs |
 |---|---|---|---|---|
-| 1 | `sync_plex_folders.sh` | the Plex library (or `--dir PATH`) | `data/plex_folders.csv` | `PLEX_URL`, `PLEX_TOKEN`; optional `PLEX_LIBRARY` |
-| 2 | `get_plex_labels.sh` | `data/plex_folders.csv` (and the ID map, downloaded) | `data/plex_labels.csv` | `MAL_CLIENT_ID` for `--source mal-api`; `TMDB_API_KEY` unless `--no-tmdb` |
-| 3 | `apply_plex_labels.sh` | `data/plex_labels.csv` | labels in Plex | `PLEX_URL`, `PLEX_TOKEN`; optional `PLEX_LIBRARY` |
+| 1 | `plex_labels.sh sync` | the Plex library (or `--dir PATH`) | `data/plex_folders.csv` | `PLEX_URL`, `PLEX_TOKEN`; optional `PLEX_LIBRARY` |
+| 2 | `plex_labels.sh labels` | `data/plex_folders.csv` (and the ID map, downloaded) | `data/plex_labels.csv` | `MAL_CLIENT_ID` for `--source mal-api`; `TMDB_API_KEY` unless `--no-tmdb` |
+| 3 | `plex_labels.sh apply` | `data/plex_labels.csv` | labels in Plex | `PLEX_URL`, `PLEX_TOKEN`; optional `PLEX_LIBRARY` |
 
-`update_plex_labels.sh [-n|--dry-run] [--check-source-route] [-h]` runs all three, with `--source mal-api --force` for stage 2. It checks the environment variables before stage 1 and stops at the first of stages 1 and 2 that exits non-zero (`STOPPED` for exit 2, `FAILED` otherwise), so nothing is applied to Plex from a partial result. Exit 2 from stage 3 means the labels were applied but some folders were not found in Plex or some rows were skipped; the wrapper prints a `NOTE`, finishes with `Done, with items needing attention` and exits 2. With `--dry-run` every stage runs in dry-run and `plex_labels.csv` must already exist from an earlier run. Run alone, each wrapper passes extra arguments through to its Python script, and each Python script prints its usage with `-h`.
+`plex_labels.sh [all] [-n|--dry-run] [--check-source-route] [-h]` runs all three, with `--source mal-api --force` for stage 2. It checks the environment variables before stage 1 and stops at the first of stages 1 and 2 that exits non-zero (`STOPPED` for exit 2, `FAILED` otherwise), so nothing is applied to Plex from a partial result. Exit 2 from stage 3 means the labels were applied but some folders were not found in Plex or some rows were skipped; the script prints a `NOTE`, finishes with `Done, with items needing attention` and exits 2. With `--dry-run` every stage runs in dry-run and `plex_labels.csv` must already exist from an earlier run. `plex_labels.sh sync|labels|apply [ARGS...]` runs one stage and passes ARGS through to its Python script, so `./plex_labels.sh labels --assess-genres` runs stage 2 with that flag, and each Python script prints its usage with `-h`.
 
 Credentials come from the environment and are never written to a file or log. `PLEX_URL` is the server's address with scheme and port, for example `http://192.168.1.20:32400`. If the server's "Secure connections" setting is Required, plain `http://` is rejected.
 
@@ -302,7 +299,7 @@ There are no override files. Stage 2 identifies each show from the IDs Plex alre
 
 ### Stage 1: Sync the folder list
 
-`sync_plex_folders.sh` lists the folder of every show in the Plex show libraries (the one named by `PLEX_LIBRARY`, or all of them) and makes `data/plex_folders.csv` match. It creates the file on the first run. Afterwards it adds folders new to the library and removes folders no longer in it, keeps the rows of folders that are still there unchanged (including any extra columns) and sorts by folder name ignoring case. It also rewrites the Plex columns from each show's metadata: its title, original title and the first TMDB, TVDB and IMDB ID among its `Guid` entries (or, on the legacy TheTVDB agent, its `guid`). The library listing is asked for IDs with `includeGuids`; a show's own metadata is requested only when the listing lacks its folder or IDs. Correcting a match in Plex therefore reaches the label stage on the next sync. It asks Plex over its API, so it needs no mounted share; `--dir PATH` has no Plex metadata, so it leaves the Plex columns as they are, and lists the sub-directories of a path (for example a mounted NAS share) instead, skipping names that start with `.`, `@` or `#` (hidden entries, Synology's `@eaDir` and `#recycle`). Movie libraries are not listed.
+`plex_labels.sh sync` lists the folder of every show in the Plex show libraries (the one named by `PLEX_LIBRARY`, or all of them) and makes `data/plex_folders.csv` match. It creates the file on the first run. Afterwards it adds folders new to the library and removes folders no longer in it, keeps the rows of folders that are still there unchanged (including any extra columns) and sorts by folder name ignoring case. It also rewrites the Plex columns from each show's metadata: its title, original title and the first TMDB, TVDB and IMDB ID among its `Guid` entries (or, on the legacy TheTVDB agent, its `guid`). The library listing is asked for IDs with `includeGuids`; a show's own metadata is requested only when the listing lacks its folder or IDs. Correcting a match in Plex therefore reaches the label stage on the next sync. It asks Plex over its API, so it needs no mounted share; `--dir PATH` has no Plex metadata, so it leaves the Plex columns as they are, and lists the sub-directories of a path (for example a mounted NAS share) instead, skipping names that start with `.`, `@` or `#` (hidden entries, Synology's `@eaDir` and `#recycle`). Movie libraries are not listed.
 
 Nothing is written when the listing is empty or would remove more than half of the existing rows, since that usually means the wrong library, a wrong path or an unmounted share; `--force` overrides the second check. `--dry-run` logs every `ADD` and `REMOVE` and writes nothing.
 
@@ -364,7 +361,7 @@ Logs go to `plex/logs/` (the `logs` directory beside `scripts/`): `get_plex_labe
 
 ### Flag conventions
 
-`-n` (or `--dry-run` on the Python tools and `update_plex_labels.sh`) is a dry run everywhere, and `-f` (or `--force`) is a force flag, except in `encoder_params.sh`, where `-f` selects the output container and `-F` selects flat output; in `rename_params.sh` and `setup_smb_mount.sh` `-f` forces and `-F` (renamer) restricts the run to files. `encoder_params.sh -o DIR` is the output directory and `rename_params.sh -O DIR` the operational directory.
+`-n` (or `--dry-run` on the Python tools and `plex_labels.sh`) is a dry run everywhere, and `-f` (or `--force`) is a force flag, except in `encoder_params.sh`, where `-f` selects the output container and `-F` selects flat output; in `rename_params.sh` and `setup_smb_mount.sh` `-f` forces and `-F` (renamer) restricts the run to files. `encoder_params.sh -o DIR` is the output directory and `rename_params.sh -O DIR` the operational directory.
 
 ### Known limitations
 
