@@ -53,7 +53,7 @@
 #     first ext in that order wins per language and type) are muxed. In MKV,
 #     webvtt and microdvd convert to srt and ass is copied; in MP4 all become
 #     mov_text. Subrip sidecars have leftover ASS override tags (e.g. {\an8})
-#     stripped before muxing (subtitle_tag_strip.sh); ass is left untouched.
+#     stripped before muxing (strip_subtitle_tags.py); ass is left untouched.
 #     A sidecar replaces an embedded track of the same
 #     language and the same type (standard, CC, forced); language codes are
 #     compared after alias resolution and an untagged track counts as eng
@@ -257,6 +257,8 @@ require awk
 # directory), also the source probe_streams.py reads for track labels.
 PROBE_PY="$(dirname "${BASH_SOURCE[0]}")/probe_streams.py"
 [[ -r "$PROBE_PY" ]] || { echo "ERROR: probe_streams.py not found next to this script ($PROBE_PY)" >&2; exit 1; }
+STRIP_PY="$(dirname "${BASH_SOURCE[0]}")/strip_subtitle_tags.py"
+[[ -r "$STRIP_PY" ]] || { echo "ERROR: strip_subtitle_tags.py not found next to this script ($STRIP_PY)" >&2; exit 1; }
 # shellcheck source=./video_exts.sh
 source "$(dirname "${BASH_SOURCE[0]}")/video_exts.sh"
 # shellcheck source=./lang_table.sh
@@ -273,11 +275,6 @@ declare -F canon_lang >/dev/null || {
 # subtitle_mux.sh (same directory).
 # shellcheck source=./subtitle_mux.sh
 source "$(dirname "${BASH_SOURCE[0]}")/subtitle_mux.sh"
-
-# TAG_STRIP_PATTERN, init_subtitle_tag_strip, cleanup_stripped_subs and
-# strip_sidecar_sub come from subtitle_tag_strip.sh (same directory).
-# shellcheck source=./subtitle_tag_strip.sh
-source "$(dirname "${BASH_SOURCE[0]}")/subtitle_tag_strip.sh"
 
 # is_hdr_transfer, build_video_args, build_audio_args and build_subtitle_args come
 # from encode_args.sh (same directory). They read the settings defined below when
@@ -327,8 +324,8 @@ fi
 # this trap firing can have the file unlinked from under it; negligible for a
 # single-user batch tool.
 #
-# Re-registered below, right after init_subtitle_tag_strip creates its temp
-# directory, so each trap is added immediately after the state it undoes.
+# Re-registered below, right after the subtitle scratch directory is created,
+# so each trap is added immediately after the state it undoes.
 trap 'rm -f -- "$LOCK_FILE" 2>/dev/null || true' EXIT
 
 # A dry run writes no log: every log() call and the header block go to
@@ -573,16 +570,77 @@ probe_file() {
     python3 "$PROBE_PY" encode "$1" "$SUB_LANGS" "$LANG_TABLE_TSV"
 }
 
-# Runs once, after the concurrency lock above is held, and only for a real
-# run: a dry run prints decisions and touches nothing, so it must not create
-# even a scratch temp directory. A failure here aborts the run the same way
-# a missing dependency does (require()) rather than falling back to muxing
-# unstripped sidecars silently.
+# Scratch directory for subtitle work: the tag-stripped copies of sidecar and
+# embedded subtitle tracks, and the temporary .srt extracted from each embedded
+# track to check it for override tags. Created once, after the concurrency lock
+# above is held, and only for a real run (see the guard below).
+SUB_TMP_DIR=""
+
+# Removes SUB_TMP_DIR and everything under it. Safe to call when it was never
+# created or is already gone, so the EXIT trap can call it unconditionally.
+# Wired into that trap alongside the lock-file removal, so an interrupted run
+# doesn't leave stripped copies behind - the same reasoning
+# Linux_Script_Style_Guide.md section 5 applies to restoring any state on exit,
+# not just locks.
+cleanup_sub_tmp() {
+    [[ -n "$SUB_TMP_DIR" && -d "$SUB_TMP_DIR" ]] || return 0
+    rm -rf -- "$SUB_TMP_DIR" 2>/dev/null || true
+    SUB_TMP_DIR=""
+}
+
+# Reads SRC (a plain sidecar .srt file), strips every {\...} override tag from
+# it with strip_subtitle_tags.py, and writes the result to a new file under
+# SUB_TMP_DIR. Sets STRIPPED_SUB_PATH to that new file's path. SRC itself is
+# never modified - the caller's original sidecar file (and its later backup
+# move) is unaffected by this function.
+#
+# Returns 1 (STRIPPED_SUB_PATH left empty) if SUB_TMP_DIR has not been created,
+# SRC doesn't exist, or the strip itself fails; the caller decides whether to
+# fall back to muxing the unstripped original or to skip the track.
+strip_sidecar_sub() {
+    local SRC="$1"
+    STRIPPED_SUB_PATH=""
+
+    if [[ -z "$SUB_TMP_DIR" ]]; then
+        echo "ERROR: strip_sidecar_sub called before the subtitle temp directory was created" >&2
+        return 1
+    fi
+    if [[ ! -f "$SRC" ]]; then
+        echo "ERROR: strip_sidecar_sub: source not found: $SRC" >&2
+        return 1
+    fi
+
+    local DEST
+    DEST="${SUB_TMP_DIR}/$(basename "$SRC")"
+    # Two sidecars from different source directories can share a basename
+    # (e.g. two different shows both shipping a plain "en.srt"); disambiguate
+    # rather than let the second strip silently overwrite the first inside
+    # the shared temp dir.
+    if [[ -e "$DEST" ]]; then
+        DEST="${SUB_TMP_DIR}/$(basename "$SRC").$$.${RANDOM}"
+    fi
+
+    if ! python3 "$STRIP_PY" strip "$SRC" "$DEST" 2>/dev/null; then
+        echo "ERROR: failed to strip override tags from: $SRC" >&2
+        rm -f -- "$DEST"
+        return 1
+    fi
+
+    STRIPPED_SUB_PATH="$DEST"
+}
+
+# Creates SUB_TMP_DIR, only for a real run: a dry run prints decisions and
+# touches nothing, so it must not create even a scratch temp directory. A
+# failure here aborts the run the same way a missing dependency does
+# (require()) rather than falling back to muxing unstripped sidecars silently.
 if (( ! DRY_RUN )); then
-    init_subtitle_tag_strip || exit 1
+    SUB_TMP_DIR="$(mktemp -d 2>/dev/null)" || {
+        echo "ERROR: could not create temp directory for subtitle tag stripping" >&2
+        exit 1
+    }
     # Re-registers the EXIT trap now that the temp directory exists (see the
     # lock's trap above).
-    trap 'rm -f -- "$LOCK_FILE" 2>/dev/null || true; cleanup_stripped_subs' EXIT
+    trap 'rm -f -- "$LOCK_FILE" 2>/dev/null || true; cleanup_sub_tmp' EXIT
 fi
 
 # Removes empty directories from the one holding $1 upward, stopping before
@@ -729,8 +787,8 @@ backup_input() {
 # mirrored relative to ROOT the same way backup_input() moves the source
 # video, so the backup tree keeps a video and its sidecar subs together.
 # Moves the ORIGINAL sidecar file, not the stripped mux copy used to feed
-# ffmpeg (that copy lives under subtitle_tag_strip.sh's temp dir and is
-# swept by cleanup_stripped_subs, not backed up).
+# ffmpeg (that copy lives under SUB_TMP_DIR and is swept by cleanup_sub_tmp,
+# not backed up).
 # Called only after a successful encode with -A set. Takes ROOT and
 # DEST_BASE as its last two args; preceding args are "LANG TYPE PATH" lines
 # from discover_sidecar_subs (may be zero of them). Returns 1 if any sidecar
@@ -800,8 +858,8 @@ strip_embedded_text_tracks() {
         fi
 
         EMBED_STRIP_SEQ=$(( EMBED_STRIP_SEQ + 1 ))
-        local raw="${STRIPPED_TMP_DIR}/raw/e${EMBED_STRIP_SEQ}_${idx}.srt"
-        mkdir -p -- "${STRIPPED_TMP_DIR}/raw"
+        local raw="${SUB_TMP_DIR}/raw/e${EMBED_STRIP_SEQ}_${idx}.srt"
+        mkdir -p -- "${SUB_TMP_DIR}/raw"
         if ! ffmpeg -nostdin -v error -y -analyzeduration "$PROBE_SIZE" -probesize "$PROBE_SIZE" \
                 -i "$INPUT" -map "0:${idx}" -c:s srt "$raw" 2>/dev/null || [[ ! -s "$raw" ]]; then
             echo " WARNING: could not read embedded subtitle src:$idx to check it for override tags; muxing it unchecked" >&2
@@ -811,7 +869,7 @@ strip_embedded_text_tracks() {
             continue
         fi
 
-        if ! grep -qE -- "$TAG_STRIP_PATTERN" "$raw"; then
+        if ! python3 "$STRIP_PY" has "$raw"; then
             rm -f -- "$raw"
             kept+=("$line")
             continue
@@ -1349,7 +1407,7 @@ process_file() {
     # moves later, so the stripped copy being scratch-only doesn't affect
     # the backup. On a dry run, stripping is skipped entirely (no temp
     # directory even exists - see the DRY_RUN guard around
-    # init_subtitle_tag_strip, above): the printed plan shows the original
+    # SUB_TMP_DIR's creation, above): the printed plan shows the original
     # sidecar path with a note, rather than a real disk mutation whose
     # output is then only used to print a message.
     local -a INPUT_ARGS=(-analyzeduration "$PROBE_SIZE" -probesize "$PROBE_SIZE" -i "$INPUT")

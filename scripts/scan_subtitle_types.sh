@@ -17,7 +17,7 @@
 #   -h        Show this help
 #
 # Classification (embedded subtitle streams only - sidecar .srt files are
-# always TEXT_RISK by construction, see subtitle_tag_strip.sh, so are not
+# always TEXT_RISK by construction, see strip_subtitle_tags.py, so are not
 # scanned here):
 #   TEXT_RISK   codec is subrip or mov_text: plain text, can carry a
 #               leftover ASS override tag as literal on-screen text.

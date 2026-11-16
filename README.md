@@ -18,7 +18,7 @@ plex/
     ├── rename.sh                   Plex-convention renamer for movies + TV episodes + subtitles (called by media.sh; can also be run standalone)
     ├── rename_parse.sh             Shared: rename.sh's name parsing (raw name to Plex name; edition, episode and subtitle-tag rules), no filesystem access
     ├── subtitle_mux.sh             Shared: container-aware subtitle codec choice, sidecar discovery, external-subtitle ffmpeg arg building
-    ├── subtitle_tag_strip.sh       Shared: strips leftover ASS override tags (e.g. {\an8}) from a plain-text subtitle file
+    ├── strip_subtitle_tags.py      Strips leftover ASS override tags (e.g. {\an8}) from a plain-text subtitle file; called by encode.sh
     ├── scan_subtitle_types.sh      Standalone, read-only inventory of embedded subtitle codecs across a directory - no wrapper, no config.sh dependency
     ├── lang_table.sh               Shared language-code loader (bash side)
     ├── lang_table.tsv              Canonical language data (single source of truth)
@@ -236,7 +236,7 @@ The conversion filter chain lives in one constant, `SDR_TONEMAP_CHAIN`, near the
 
 ### Subtitles
 
-Sidecar discovery, the container-aware subtitle codec choice and external-subtitle ffmpeg arg building live in the shared `subtitle_mux.sh`. Sidecars are tag-stripped before muxing (see [Subtitle tag stripping](#subtitle-tag-stripping-subtitle_tag_stripsh)).
+Sidecar discovery, the container-aware subtitle codec choice and external-subtitle ffmpeg arg building live in the shared `subtitle_mux.sh`. Sidecars are tag-stripped before muxing (see [Subtitle tag stripping](#subtitle-tag-stripping-strip_subtitle_tagspy)).
 
 ## `rename.sh`
 
@@ -259,9 +259,9 @@ Renames movie and TV-episode video and subtitle files into Plex convention. The 
 
 Skipped and logged rather than guessed: an unrecognized subtitle language or modifier, ranged or multi-episode numbering (`S01E01-E02`, `S01E01E02`), a movie name with no year, and a rename target that already exists (unless `-f`, which asks for a typed `yes` before overwriting). The script refuses to run as root, so the folders and logs it creates belong to the library's owner. The script's header comment has the full name-parsing rules and known limitations; `-h` has usage.
 
-## Subtitle tag stripping (`subtitle_tag_strip.sh`)
+## Subtitle tag stripping (`strip_subtitle_tags.py`)
 
-Some subtitle files carry leftover ASS/SSA override tags (for example `{\an8}`, a positioning tag) as literal text, from an ASS→SRT conversion that kept the tags. Most players, including Plex on TV clients, don't parse the tag and instead display it as on-screen text. `subtitle_tag_strip.sh` provides `strip_sidecar_sub()`, which strips any `{\...}` bracketed override sequence (structural match, not a tag-name keyword list) from a plain-text subtitle file, writing the result to a scratch copy — the original file is never modified.
+Some subtitle files carry leftover ASS/SSA override tags (for example `{\an8}`, a positioning tag) as literal text, from an ASS→SRT conversion that kept the tags. Most players, including Plex on TV clients, don't parse the tag and instead display it as on-screen text. `strip_subtitle_tags.py strip SRC DEST` strips any `{\...}` bracketed override sequence (structural match on a single line, not a tag-name keyword list) from a plain-text subtitle file, writing the result to a scratch copy — the original file is never modified. `encode.sh` calls it through `strip_sidecar_sub()` and owns the scratch directory, which is removed on exit. `strip_subtitle_tags.py has SRC` exits 0 when the file contains a tag, which is how `encode.sh` checks an extracted embedded track before deciding to strip it.
 
 This is sidecar-file logic specifically (a real file already on disk); an *embedded* subtitle stream can't be edited in place the same way, and no script here repairs one.
 

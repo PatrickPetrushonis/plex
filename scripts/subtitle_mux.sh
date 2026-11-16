@@ -303,7 +303,7 @@ build_external_subtitle_args() {
         OUT_SUB_CODEC="$(sidecar_output_codec "$SRC_CODEC")"
 
         # PATH may be a stripped copy or the original, unstripped file: the
-        # caller falls back to the latter if strip_sidecar_sub() failed and
+        # caller falls back to the latter if encode.sh's strip_sidecar_sub() failed and
         # prints its own WARNING at that point, so this line makes no claim
         # about stripping.
         echo " Subtitle[external:$(basename "$SIDECAR_PATH") -> out:${_OUT_IDX}]: INCLUDE: $SUB_TITLE ($SRC_CODEC -> $OUT_SUB_CODEC)"
