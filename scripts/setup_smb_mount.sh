@@ -2,8 +2,7 @@
 # setup_smb_mount.sh: Mounts a CIFS/SMB share (e.g. a NAS) as a
 # stable local mountpoint, owned by a real (non-root) user, via
 # /etc/fstab - so batch tools in this project that refuse to run as root
-# (encoder_params.sh, rename_params.sh) can read/write it
-# directly.
+# (encode.sh, rename.sh) can read/write it directly.
 #
 # This is a one-time system-setup script and is the one place in this
 # project that's SUPPOSED to run as root: installing a package, writing

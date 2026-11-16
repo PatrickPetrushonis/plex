@@ -10,7 +10,7 @@
 # sidecar_needs_tag_strip() in subtitle_mux.sh and only hands this module
 # such a path; ASS/SSA, WebVTT and MicroDVD sidecars never reach it.
 #
-# Embedded subtitle tracks are handled by the caller, encoder_params.sh, in
+# Embedded subtitle tracks are handled by the caller, encode.sh, in
 # -S embed mode: it extracts a SubRip or mov_text track to a temp .srt (ffmpeg
 # -map 0:IDX), and when that file carries override tags calls
 # strip_sidecar_sub() below on it exactly as on any other sidecar. A real
@@ -19,7 +19,7 @@
 # leftover conversion artifact - the caller gates on source codec
 # (subrip/mov_text only).
 #
-# Sourced by encoder_params.sh; not intended to be run standalone.
+# Sourced by encode.sh; not intended to be run standalone.
 
 # Directory holding this run's stripped-copy temp files. Set by
 # init_subtitle_tag_strip(); every temp file this module creates lives

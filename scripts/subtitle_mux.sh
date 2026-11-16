@@ -4,7 +4,7 @@
 # track matching, output stream-count verification, and ffmpeg arg-building
 # for muxing external subtitle files into a video.
 #
-# Sourced by encoder_params.sh.
+# Sourced by encode.sh.
 #
 # The caller provides, before sourcing this file and calling into it:
 #   OUT_FORMAT       "mkv" or "mp4" - read by subtitle_output_codec()
@@ -266,7 +266,7 @@ verify_subtitle_count() {
 # Builds ffmpeg -map/-c:s/-metadata/-disposition args for one or more
 # external subtitle files already opened as ffmpeg inputs. Shares the
 # _OUT_IDX counter with any other subtitle-arg builder the caller runs
-# first (e.g. encoder_params.sh's build_subtitle_args() for embedded
+# first (e.g. encode.sh's build_subtitle_args() for embedded
 # tracks), so external and embedded tracks are numbered continuously and
 # indistinguishable in the output.
 # Takes: ff_ref idx_ref, then "LANG TYPE INPUT_IDX PATH" lines, where PATH

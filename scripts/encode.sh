@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# encoder_params.sh: Batch video encoder with stream-aware copy/transcode decisions
+# encode.sh: Batch video encoder with stream-aware copy/transcode decisions
 #
-# Usage:  ./encoder_params.sh [OPTIONS] <input_file|dir|glob> [<input2> ...]
+# Usage:  ./encode.sh [OPTIONS] <input_file|dir|glob> [<input2> ...]
 #
 # Options:
 #   -o DIR          Output directory (default: <script directory>/encoded)
@@ -346,7 +346,7 @@ if [[ -f "$LOG_FILE_TEMP" ]]; then
 fi
 
 {
-    echo "encoder_params.sh Batch Processing Log: $(date)"
+    echo "encode.sh Batch Processing Log: $(date)"
     echo "Output:  $OUTPUT_DIR"
     echo "Logs:    $LOG_DIR"
     [[ -n "$ARCHIVE_DIR" ]] && echo "Archive: $ARCHIVE_DIR"
@@ -414,7 +414,7 @@ declare -a SIDECAR_EXTRACT_LINES=()
 cleanup() {
     local SIG="$1"
     echo "" >&2
-    echo "encoder_params.sh: caught $SIG, aborting." >&2
+    echo "encode.sh: caught $SIG, aborting." >&2
     if [[ -n "$CURRENT_FFMPEG_PID" ]]; then
         kill "$CURRENT_FFMPEG_PID" 2>/dev/null
         wait "$CURRENT_FFMPEG_PID" 2>/dev/null

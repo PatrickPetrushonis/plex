@@ -10,7 +10,7 @@
 #   LANG_LABEL_BASH code3 -> Label           (embedded/sidecar track titles)
 #   LANG_ALIASES    any lowercase code (2-letter, 3-letter, or listed alias)
 #                   or lowercase label -> code2
-#                                            (rename_params.sh normalization)
+#                                            (rename.sh normalization)
 #   LANG_CANON      any lowercase code3, code2, or listed alias -> primary
 #                   code3. The "und" row contributes only its own code3: its
 #                   code2 ("en") belongs to "eng".

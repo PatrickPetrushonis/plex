@@ -1,24 +1,26 @@
 #!/usr/bin/env bash
-# config.sh — shared by encoder_dry.sh, encoder.sh, rename_dry.sh, and
-# rename.sh. Source, don't run directly.
-# Override any value at call time, e.g.:
-#   VIDEOS_BASE=/mnt/scratch/Videos ./encoder.sh
-#   DOWNLOADS_BASE=/mnt/scratch/Downloads ./rename.sh
+# config.sh: Paths and encoder settings for media.sh. Source, don't run directly.
+# VIDEOS_BASE, DOWNLOADS_BASE, CRF and PRESET take overrides at call time, e.g.:
+#   VIDEOS_BASE=/mnt/scratch/Videos ./media.sh encode
+#   DOWNLOADS_BASE=/mnt/scratch/Downloads ./media.sh rename
+#   CRF=18 PRESET=slow ./media.sh encode
+# The directories below derive from the two base variables; a direct override is ignored.
+#
+# shellcheck disable=SC2034
+# File-wide: INPUT_DIR, DOWNLOADS_INPUT_DIR and ENCODER_ARGS are written here and
+# read by media.sh; shellcheck cannot see across that boundary standalone.
 
 : "${VIDEOS_BASE:=$HOME/Videos}"
 : "${DOWNLOADS_BASE:=$HOME/Downloads}"
 
-# shellcheck disable=SC2034  # consumed by encoder.sh/encoder_dry.sh (which source this file), not used within config.sh itself
 INPUT_DIR="$VIDEOS_BASE/input"
 OUTPUT_DIR="$VIDEOS_BASE/output"
 ARCHIVE_DIR="$VIDEOS_BASE/encoded"
 BACKUP_DIR="$VIDEOS_BASE/backup"
 
-# shellcheck disable=SC2034  # consumed by rename.sh/rename_dry.sh (which source this file), not used within config.sh itself
 DOWNLOADS_INPUT_DIR="$DOWNLOADS_BASE/Complete"
 
 CRF="${CRF:-22}"
 PRESET="${PRESET:-fast}"
 
-# shellcheck disable=SC2034  # consumed by encoder.sh/encoder_dry.sh (which source this file), not used within config.sh itself
 ENCODER_ARGS=(-r -s -c "$CRF" -p "$PRESET" -o "$OUTPUT_DIR" -M "$ARCHIVE_DIR" -A "$BACKUP_DIR")
