@@ -56,6 +56,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 }
 source "${SCRIPT_DIR}/video_exts.sh"
 
+PROBE_PY="${SCRIPT_DIR}/probe_streams.py"
+[[ -r "$PROBE_PY" ]] || {
+    echo "ERROR: probe_streams.py not found next to this script (${SCRIPT_DIR})" >&2
+    exit 1
+}
+
 RECURSE=0
 CUSTOM_EXTS=""
 REPORT_FILE=""
@@ -120,52 +126,12 @@ fi
 echo "Scanning ${#ALL_FILES[@]} video file(s) under: $TARGET_DIR"
 echo ""
 
-# Classifies embedded subtitle streams for one file via ffprobe. Prints
-# "FILE<TAB>INDEX<TAB>CODEC<TAB>LANG<TAB>CLASS" lines, one per subtitle
-# stream; nothing if the file has none. Unlike encode.sh's
-# probe_file(), this sets no globals and returns nothing but stdout - there
-# is no downstream step in this script that needs the values to outlive the
-# read loop that consumes them.
+# Classifies embedded subtitle streams for one file via probe_streams.py.
+# Prints "FILE<TAB>INDEX<TAB>CODEC<TAB>LANG<TAB>CLASS" lines, one per subtitle
+# stream; nothing if the file has none. Sets no globals: the read loop that
+# consumes the lines is the only reader.
 probe_subtitle_types() {
-    local INPUT="$1"
-    python3 - "$INPUT" << 'PYEOF'
-import json, sys, subprocess
-
-input_file = sys.argv[1]
-
-result = subprocess.run(
-    ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams',
-     '-select_streams', 's', input_file],
-    capture_output=True, text=True
-)
-if result.returncode != 0:
-    print(f"{input_file}\tERROR\tERROR\tERROR\tPROBE_FAILED:{result.stderr.strip()}")
-    sys.exit(0)
-
-try:
-    streams = json.loads(result.stdout).get('streams', [])
-except json.JSONDecodeError as e:
-    print(f"{input_file}\tERROR\tERROR\tERROR\tPARSE_FAILED:{e}")
-    sys.exit(0)
-
-TEXT_RISK  = {'subrip', 'mov_text'}
-ASS_NATIVE = {'ass', 'ssa'}
-BITMAP     = {'hdmv_pgs_subtitle', 'dvd_subtitle', 'dvbsub'}
-
-for s in streams:
-    idx   = s.get('index', 0)
-    codec = s.get('codec_name', 'unknown')
-    lang  = s.get('tags', {}).get('language', 'und')
-    if codec in TEXT_RISK:
-        cls = 'TEXT_RISK'
-    elif codec in ASS_NATIVE:
-        cls = 'ASS_NATIVE'
-    elif codec in BITMAP:
-        cls = 'BITMAP'
-    else:
-        cls = 'OTHER'
-    print(f"{input_file}\t{idx}\t{codec}\t{lang}\t{cls}")
-PYEOF
+    python3 "$PROBE_PY" scan "$1"
 }
 
 declare -A CLASS_COUNT=()

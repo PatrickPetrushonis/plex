@@ -70,7 +70,7 @@ unset _code3 _code2 _label _aliases _alias_list _a
 # Echoes the primary code3 for any code3, code2, or listed alias, so a file's
 # own language tag (commonly a bibliographic code such as "fre") compares
 # equal to a code typed for -l ("fra"). An untagged track ("und") resolves to
-# "eng", matching the probe step's treatment of untagged tracks. A code absent
+# "eng", matching probe_streams.py's treatment of untagged tracks. A code absent
 # from the table is echoed unchanged.
 canon_lang() {
     local code="${1,,}"

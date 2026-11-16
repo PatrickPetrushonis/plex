@@ -254,8 +254,9 @@ require awk
 # -- Sidecar subtitle support (Plex-style Movie.en.srt / Movie.en.cc.vtt) ----------
 # LANG_TABLE, LANG_3TO2, LANG_LABEL_BASH, LANG_ALIASES, LANG_CANON and
 # canon_lang() come from the shared lang_table.sh / lang_table.tsv (same
-# directory), also the source the Python probe step's LANG_NAMES reads (see
-# probe_file()).
+# directory), also the source probe_streams.py reads for track labels.
+PROBE_PY="$(dirname "${BASH_SOURCE[0]}")/probe_streams.py"
+[[ -r "$PROBE_PY" ]] || { echo "ERROR: probe_streams.py not found next to this script ($PROBE_PY)" >&2; exit 1; }
 # shellcheck source=./video_exts.sh
 source "$(dirname "${BASH_SOURCE[0]}")/video_exts.sh"
 # shellcheck source=./lang_table.sh
@@ -554,7 +555,7 @@ compute_output_path() {
 }
 
 # -- Stream probe ------------------------------------------------------------------
-# Prints one line per stream group for the caller to parse:
+# Runs probe_streams.py, which prints one line per stream group for the caller to parse:
 #   VIDEO <codec> <height> <fps> <label>
 #   VIDEOFMT <pix_fmt>                       ("unknown" when the probe reports none)
 #   VIDEOCOLOR <color_transfer> <has_dovi>   (transfer is "unknown" when untagged;
@@ -563,178 +564,7 @@ compute_output_path() {
 #   AUDIO ... / SUB ...
 #   ERROR <message>   (on probe failure)
 probe_file() {
-    local INPUT="$1"
-    python3 - "$INPUT" "$SUB_LANGS" "$LANG_TABLE_TSV" << 'PYEOF'
-import json, sys, subprocess
-
-input_file    = sys.argv[1]
-sub_langs     = set(sys.argv[2].split(','))
-lang_table_tsv = sys.argv[3]
-
-result = subprocess.run(
-    ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', input_file],
-    capture_output=True, text=True
-)
-
-if result.returncode != 0:
-    print(f"ERROR ffprobe exited {result.returncode}: {result.stderr.strip()}")
-    sys.exit(0)
-
-try:
-    streams = json.loads(result.stdout).get('streams', [])
-except json.JSONDecodeError as e:
-    print(f"ERROR failed to parse ffprobe output: {e}")
-    sys.exit(0)
-
-VIDEO_CODEC_NAMES = {
-    'h264':        'H.264',
-    'hevc':        'H.265',
-    'mpeg2video':  'MPEG-2',
-    'mpeg4':       'MPEG-4',
-    'vp8':         'VP8',
-    'vp9':         'VP9',
-    'av1':         'AV1',
-    'vc1':         'VC-1',
-    'theora':      'Theora',
-    'mjpeg':       'MJPEG',
-    'prores':      'ProRes',
-}
-
-AUDIO_CODEC_NAMES = {
-    'aac':         'AAC',
-    'ac3':         'Dolby Digital',
-    'eac3':        'Dolby Digital Plus',
-    'dts':         'DTS',
-    'truehd':      'TrueHD',
-    'flac':        'FLAC',
-    'opus':        'Opus',
-    'mp3':         'MP3',
-    'vorbis':      'Vorbis',
-    'pcm_s16le':   'PCM',
-    'pcm_s24le':   'PCM',
-    'pcm_s32le':   'PCM',
-}
-
-def load_lang_names(tsv_path):
-    """Reads the shared lang_table.tsv (also loaded by lang_table.sh for the
-    bash side). Maps every code3 and every listed alias to its display label."""
-    names = {}
-    try:
-        with open(tsv_path, encoding='utf-8') as f:
-            for line in f:
-                line = line.rstrip('\n')
-                if not line or line.startswith('#'):
-                    continue
-                parts = line.split('\t')
-                if len(parts) < 3:
-                    continue
-                code3, _code2, label = parts[0], parts[1], parts[2]
-                aliases = parts[3].split(',') if len(parts) > 3 and parts[3] != '-' else []
-                names[code3] = label
-                for alias in aliases:
-                    names[alias] = label
-    except OSError as e:
-        print(f"ERROR could not read lang_table_tsv ({tsv_path}): {e}", file=sys.stderr)
-    return names
-
-LANG_NAMES = load_lang_names(lang_table_tsv)
-
-def lang_name(code):
-    return LANG_NAMES.get(code.lower(), code.upper())
-
-def match_lang(code):
-    """und (untagged) tracks are treated as English for matching purposes."""
-    return 'eng' if code == 'und' else code
-
-video = [s for s in streams if s.get('codec_type') == 'video']
-audio = [s for s in streams if s.get('codec_type') == 'audio']
-subs  = [s for s in streams if s.get('codec_type') == 'subtitle']
-
-if not video:
-    print("ERROR no video stream found in file")
-else:
-    v = video[0]
-    fps = v.get('r_frame_rate', '24/1')
-    if fps in ('0/0', '0'):
-        fps = '24/1'
-    codec_raw   = v.get('codec_name', '')
-    codec_label = VIDEO_CODEC_NAMES.get(codec_raw, codec_raw.upper())
-    height      = v.get('height', 0)
-    print(f"VIDEO {codec_raw} {height} {fps} {codec_label}")
-
-    # Pixel format drives the copy/encode decision in build_video_args.
-    print(f"VIDEOFMT {v.get('pix_fmt', 'unknown')}")
-
-    # Colour transfer and Dolby Vision presence drive the HDR-to-SDR decision
-    # in build_video_args; an untagged transfer is reported as "unknown".
-    transfer = v.get('color_transfer', 'unknown')
-    has_dovi = int(any(sd.get('side_data_type') == 'DOVI configuration record'
-                       for sd in v.get('side_data_list', [])))
-    print(f"VIDEOCOLOR {transfer} {has_dovi}")
-
-CHANNEL_LAYOUTS = {
-    'mono':            'Mono',
-    'stereo':          'Stereo',
-    '2.1':             '2.1',
-    '3.0':             '3.0',
-    '3.0(back)':       '3.0',
-    'quad':            '4.0',
-    'quad(side)':      '4.0',
-    '4.0':             '4.0',
-    '4.1':             '4.1',
-    '5.0':             '5.0',
-    '5.0(side)':       '5.0',
-    '5.1':             '5.1',
-    '5.1(side)':       '5.1',
-    '6.0':             '6.0',
-    '6.1':             '6.1',
-    '7.0':             '7.0',
-    '7.1':             '7.1',
-    '7.1(wide)':       '7.1',
-    '7.1(wide-side)':  '7.1',
-    'hexagonal':       '6.0',
-    'octagonal':       '8.0',
-}
-
-for s in audio:
-    idx           = s.get('index', 0)
-    codec         = s.get('codec_name', 'unknown')
-    lang          = s.get('tags', {}).get('language', 'und')
-    out_lang      = match_lang(lang)
-    layout_raw    = s.get('channel_layout', '')
-    channels      = s.get('channels', 0)
-    codec_label   = AUDIO_CODEC_NAMES.get(codec, codec.upper())
-    lang_label    = lang_name(out_lang)
-    if layout_raw and layout_raw in CHANNEL_LAYOUTS:
-        layout_label = CHANNEL_LAYOUTS[layout_raw]
-    elif channels == 1:
-        layout_label = 'Mono'
-    elif channels == 2:
-        layout_label = 'Stereo'
-    elif channels > 0:
-        layout_label = f"{channels}ch"
-    else:
-        layout_label = ''
-    track_title = f"{codec_label} {lang_label} {layout_label}".strip()
-    print(f"AUDIO {idx} {codec} {out_lang} {track_title}")
-
-CC_TERMS = {'sdh', 'cc', 'hi', 'hearing impaired', 'closed caption', 'closed captions'}
-
-for s in subs:
-    idx        = s.get('index', 0)
-    codec      = s.get('codec_name', 'unknown')
-    lang       = s.get('tags', {}).get('language', 'und')
-    src_title  = s.get('tags', {}).get('title', '')
-    title_low  = src_title.lower()
-    disp       = s.get('disposition', {})
-    is_forced  = int(disp.get('forced', 0) == 1)
-    is_hi      = int(disp.get('hearing_impaired', 0) == 1)
-    is_target  = int(match_lang(lang) in sub_langs)
-    is_signs   = int(any(w in title_low for w in ('sign', 'song')))
-    is_cc      = int(is_hi or any(t in title_low for t in CC_TERMS))
-    lang_label = lang_name(lang)
-    print(f"SUB {idx} {codec} {lang} {is_target} {is_forced} {is_signs} {is_cc} {lang_label}")
-PYEOF
+    python3 "$PROBE_PY" encode "$1" "$SUB_LANGS" "$LANG_TABLE_TSV"
 }
 
 # Runs once, after the concurrency lock above is held, and only for a real

@@ -21,6 +21,7 @@ plex/
     ├── lang_table.sh               Shared language-code loader (bash side)
     ├── lang_table.tsv              Canonical language data (single source of truth)
     ├── video_exts.sh               Shared: the video file extensions the encoder, renamer and scanner scan for
+    ├── probe_streams.py            Shared: ffprobe stream reader for encode.sh (video, audio, subtitle lines) and scan_subtitle_types.sh (subtitle classes)
     ├── plex_labels.sh              Label pipeline entry point: all three stages in order, or one stage (sync, get, apply)
     ├── sync_plex_folders.py        Label stage 1: create/update data/plex_folders.csv from the Plex library
     ├── get_plex_labels.py          Label stage 2: Age/Target from MyAnimeList, then TMDB (through Plex's IDs)
@@ -180,7 +181,7 @@ The label scripts keep their lock files in `scripts/` instead, and remove them w
 
 `lang_table.tsv` is the single source of truth for every language code, alias, and display label used across the project — add a language once here and it's picked up everywhere. Each row has a primary 3-letter code (`code3`, ISO 639-2), a 2-letter code (`code2`, ISO 639-1, used in sidecar filenames), a display label, and a comma-separated alias list (e.g. `fra`'s alias is the bibliographic `fre`). **Pass the primary `code3` to `-l`.** Sidecar discovery looks each `-l` value up in `LANG_3TO2` and silently skips a value with no entry, and the encoder's own check only warns when a value is not 2–3 letters. Aliases are for matching a file's own language tag and for display; the lowercase label also resolves as a language name in subtitle file names; English is the supported one.
 
-- `encode.sh` sources `lang_table.sh` for its bash-side sidecar matching (`LANG_TABLE`, `LANG_3TO2`, `LANG_LABEL_BASH`), and its Python probe step reads `lang_table.tsv` directly for embedded-track display labels (which resolve aliases).
+- `encode.sh` sources `lang_table.sh` for its bash-side sidecar matching (`LANG_TABLE`, `LANG_3TO2`, `LANG_LABEL_BASH`), and `probe_streams.py`, which it calls to read each file's streams, reads `lang_table.tsv` directly for embedded-track display labels (which resolve aliases).
 - `rename.sh` sources `lang_table.sh` for its `LANG_ALIASES` lookup, used to normalize subtitle filename language tags (e.g. `.eng.srt` → `.en.srt`, `.fre.srt` → `.fr.srt`) to the 2-letter form `encode.sh`'s sidecar matching expects.
 - `video_exts.sh` defines `VIDEO_EXTS`, the one video extension list `encode.sh`, `rename.sh` and `scan_subtitle_types.sh` all read.
 - `subtitle_mux.sh` does not source `lang_table.sh`: it depends on `LANG_3TO2`/`LANG_LABEL_BASH` already being loaded by whichever script sourced it.
@@ -203,7 +204,7 @@ The core encoder is documented in full detail — every flag, the audio/subtitle
 | Any other codec, SDR | Re-encoded to x264 at native or `MAX_HEIGHT` height |
 | Any other codec, PQ or HLG | Tone-mapped to SDR, re-encoded to x264, tagged bt709 |
 
-An HDR source is identified by its colour *transfer function* (`smpte2084` for PQ, `arib-std-b67` for HLG), read by the probe step. Colour primaries are not used: they describe gamut, and BT.2020 primaries can accompany an SDR curve.
+An HDR source is identified by its colour *transfer function* (`smpte2084` for PQ, `arib-std-b67` for HLG), read by `probe_streams.py`. Colour primaries are not used: they describe gamut, and BT.2020 primaries can accompany an SDR curve.
 
 Every encoded file's video stream is probed while it is still the `.tmp` file. A file whose transfer function is still PQ or HLG is rejected: it is deleted, logged as `FAILED (HDR transfer in output)`, and never reaches `OUTPUT_DIR`. This ordering matters because `-M` copies the output to the archive and then deletes it, and `-A` moves the source to the backup directory; both run only after the probe passes. The encode can exit 0 with wrong tags, and those two steps are destructive.
 
