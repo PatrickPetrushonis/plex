@@ -14,7 +14,9 @@ plex/
     ├── config.sh                   Paths and encoder settings, sourced by media.sh
     ├── media.sh                    Run an encode or rename batch: `media.sh encode|rename [-n]`; -n previews it (nothing is written or renamed); prints [DRY RUN] or [LIVE] first
     ├── encode.sh                   Core batch encoder: copy/transcode decisions, HDR-to-SDR conversion, output verification (called by media.sh; can also be run standalone)
+    ├── encode_args.sh              Shared: encode.sh's ffmpeg argument builders for video, audio and embedded subtitle tracks
     ├── rename.sh                   Plex-convention renamer for movies + TV episodes + subtitles (called by media.sh; can also be run standalone)
+    ├── rename_parse.sh             Shared: rename.sh's name parsing (raw name to Plex name; edition, episode and subtitle-tag rules), no filesystem access
     ├── subtitle_mux.sh             Shared: container-aware subtitle codec choice, sidecar discovery, external-subtitle ffmpeg arg building
     ├── subtitle_tag_strip.sh       Shared: strips leftover ASS override tags (e.g. {\an8}) from a plain-text subtitle file
     ├── scan_subtitle_types.sh      Standalone, read-only inventory of embedded subtitle codecs across a directory - no wrapper, no config.sh dependency
@@ -182,7 +184,7 @@ The label scripts keep their lock files in `scripts/` instead, and remove them w
 `lang_table.tsv` is the single source of truth for every language code, alias, and display label used across the project — add a language once here and it's picked up everywhere. Each row has a primary 3-letter code (`code3`, ISO 639-2), a 2-letter code (`code2`, ISO 639-1, used in sidecar filenames), a display label, and a comma-separated alias list (e.g. `fra`'s alias is the bibliographic `fre`). **Pass the primary `code3` to `-l`.** Sidecar discovery looks each `-l` value up in `LANG_3TO2` and silently skips a value with no entry, and the encoder's own check only warns when a value is not 2–3 letters. Aliases are for matching a file's own language tag and for display; the lowercase label also resolves as a language name in subtitle file names; English is the supported one.
 
 - `encode.sh` sources `lang_table.sh` for its bash-side sidecar matching (`LANG_TABLE`, `LANG_3TO2`, `LANG_LABEL_BASH`), and `probe_streams.py`, which it calls to read each file's streams, reads `lang_table.tsv` directly for embedded-track display labels (which resolve aliases).
-- `rename.sh` sources `lang_table.sh` for its `LANG_ALIASES` lookup, used to normalize subtitle filename language tags (e.g. `.eng.srt` → `.en.srt`, `.fre.srt` → `.fr.srt`) to the 2-letter form `encode.sh`'s sidecar matching expects.
+- `rename.sh` sources `lang_table.sh` for the `LANG_ALIASES` lookup in `rename_parse.sh`, used to normalize subtitle filename language tags (e.g. `.eng.srt` → `.en.srt`, `.fre.srt` → `.fr.srt`) to the 2-letter form `encode.sh`'s sidecar matching expects.
 - `video_exts.sh` defines `VIDEO_EXTS`, the one video extension list `encode.sh`, `rename.sh` and `scan_subtitle_types.sh` all read.
 - `subtitle_mux.sh` does not source `lang_table.sh`: it depends on `LANG_3TO2`/`LANG_LABEL_BASH` already being loaded by whichever script sourced it.
 
@@ -190,7 +192,7 @@ Both `lang_table.sh` and `lang_table.tsv` resolve their own file locations relat
 
 ## `encode.sh`
 
-The core encoder is documented in full detail — every flag, the audio/subtitle decision logic, sidecar handling, and logging format — in its own header comment (`-h`). It can be run directly (bypassing `config.sh`; it still takes its own lock) for one-off jobs outside the standard `VIDEOS_BASE` layout. Run directly, its defaults are CRF 18, preset `slow` and output to `./encoded`; the wrappers override them through `config.sh` (22 and `fast`). It requires an ffmpeg build with the `zscale` and `tonemap` filters and exits before any work if either is missing.
+The core encoder is documented in full detail — every flag, the audio/subtitle decision logic, sidecar handling, and logging format — in its own header comment (`-h`). The ffmpeg argument builders for video, audio and embedded subtitle tracks are in `encode_args.sh`; the file handling, sidecars, verification, archiving and locking are in `encode.sh`. It can be run directly (bypassing `config.sh`; it still takes its own lock) for one-off jobs outside the standard `VIDEOS_BASE` layout. Run directly, its defaults are CRF 18, preset `slow` and output to `./encoded`; `media.sh` overrides them through `config.sh` (22 and `fast`). It requires an ffmpeg build with the `zscale` and `tonemap` filters and exits before any work if either is missing.
 
 ### Video decisions
 
@@ -238,7 +240,7 @@ Sidecar discovery, the container-aware subtitle codec choice and external-subtit
 
 ## `rename.sh`
 
-Renames movie and TV-episode video and subtitle files into Plex convention:
+Renames movie and TV-episode video and subtitle files into Plex convention. The name parsing (everything that turns a raw name into a Plex name, with no filesystem access) is in `rename_parse.sh`; the file and folder operations, collision handling, logging and locking are in `rename.sh`:
 
 - **Movies:** `Franchise/Movie Name (YYYY) {edition-A B}/Movie Name (YYYY) {edition-A B}.ext`. Several editions in one name are joined alphabetically with Remastered last.
 - **Episodes:** `Series Name (YYYY)/Season XX/Series Name - SxxEyy[ - Title].ext`.

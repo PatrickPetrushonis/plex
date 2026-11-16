@@ -266,7 +266,7 @@ verify_subtitle_count() {
 # Builds ffmpeg -map/-c:s/-metadata/-disposition args for one or more
 # external subtitle files already opened as ffmpeg inputs. Shares the
 # _OUT_IDX counter with any other subtitle-arg builder the caller runs
-# first (e.g. encode.sh's build_subtitle_args() for embedded
+# first (e.g. encode_args.sh's build_subtitle_args() for embedded
 # tracks), so external and embedded tracks are numbered continuously and
 # indistinguishable in the output.
 # Takes: ff_ref idx_ref, then "LANG TYPE INPUT_IDX PATH" lines, where PATH

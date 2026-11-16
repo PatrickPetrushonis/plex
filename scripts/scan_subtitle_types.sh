@@ -49,11 +49,11 @@ require grep
 require sed
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=./video_exts.sh
 [[ -r "${SCRIPT_DIR}/video_exts.sh" ]] || {
     echo "ERROR: video_exts.sh not found next to this script (${SCRIPT_DIR})" >&2
     exit 1
 }
+# shellcheck source=./video_exts.sh
 source "${SCRIPT_DIR}/video_exts.sh"
 
 PROBE_PY="${SCRIPT_DIR}/probe_streams.py"
