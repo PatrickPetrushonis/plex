@@ -160,21 +160,37 @@ byte_to_char_offset() {
     printf '%s' "${#prefix}"
 }
 
+# Finds the first match of PCRE PATTERN in TEXT, or the last when a third
+# argument "last" is given. Sets PCRE_MATCH (the matched text) and PCRE_OFFSET
+# (its character offset within TEXT, see byte_to_char_offset); both are empty
+# when there is no match. Prefix the pattern with "(?i)" to match without
+# regard to case. `|| true` keeps grep's exit 1 on no match from tripping
+# set -e/pipefail. Always returns 0, so it is safe to call as a bare
+# statement. Call it directly, not inside $(...), or its results are lost.
+pcre_locate() {
+    local pattern="$1" text="$2" pick="${3:-first}" hit
+    PCRE_MATCH=""; PCRE_OFFSET=""
+    if [[ "$pick" == last ]]; then
+        hit="$(grep -boP "$pattern" <<< "$text" | tail -1)" || true
+    else
+        hit="$(grep -boP "$pattern" <<< "$text" | head -1)" || true
+    fi
+    [[ -n "$hit" ]] || return 0
+    PCRE_MATCH="${hit#*:}"
+    PCRE_OFFSET="$(byte_to_char_offset "$text" "${hit%%:*}")"
+}
+
 # Finds the LAST standalone 4-digit year (1900-2099) in a string: not
 # immediately preceded or followed by another alphanumeric character, so
 # "2160p" and "x265" never match. Sets YEAR_MATCH and YEAR_OFFSET (character
-# offset within the input); both are empty when there is none. `|| true`
-# keeps grep's exit 1 on no match from tripping set -e/pipefail. Shared by
+# offset within the input); both are empty when there is none. Shared by
 # the movie parser, the episode parser and the bare-number episode check.
+# Clobbers PCRE_MATCH and PCRE_OFFSET.
 find_last_year() {
     local raw="$1"
     YEAR_MATCH=""; YEAR_OFFSET=""
-    YEAR_MATCH="$(grep -oP '(?<![0-9A-Za-z])(19[0-9]{2}|20[0-9]{2})(?![0-9A-Za-z])' <<< "$raw" | tail -1)" || true
-    [[ -z "$YEAR_MATCH" ]] && return
-    local off
-    off="$(grep -boP '(?<![0-9A-Za-z])'"$YEAR_MATCH"'(?![0-9A-Za-z])' <<< "$raw" | tail -1)" || true
-    [[ -z "$off" ]] && { YEAR_MATCH=""; return; }
-    YEAR_OFFSET="$(byte_to_char_offset "$raw" "${off%%:*}")"
+    pcre_locate '(?<![0-9A-Za-z])(19[0-9]{2}|20[0-9]{2})(?![0-9A-Za-z])' "$raw" last
+    YEAR_MATCH="$PCRE_MATCH"; YEAR_OFFSET="$PCRE_OFFSET"
 }
 
 # Cleans a title fragment: dots, underscores and slashes become spaces, runs
@@ -430,6 +446,43 @@ EPISODE_TOKEN_PATTERN='(?<![0-9A-Za-z])[Ss][0-9]{1,2}[Ee][0-9]{1,3}(?:\.[0-9]{1,
 # "09" aren't read as invalid octal. Prints the result.
 pad2() { printf '%02d' "$((10#$1))"; }
 
+# PCRE for a standalone "NxMM" episode token: 1-2 digit season, "x" or "X",
+# 2-3 digit episode, bounded by non-alphanumerics on both sides. The episode
+# needs at least two digits and the season at most two, and the boundaries
+# reject anything inside a longer alphanumeric run, so a resolution
+# ("1920x1080", "720x480") and a codec ("x265") are never read as one.
+NXMM_TOKEN_PATTERN='(?<![0-9A-Za-z])[0-9]{1,2}[xX][0-9]{2,3}(?![0-9A-Za-z])'
+
+# PCRE for an SxxEyy token split by one space, dot or underscore ("S01 E01",
+# "S01.E01", "S01_E01"), with the same digit counts, optional ".N" suffix and
+# boundaries as EPISODE_TOKEN_PATTERN. Captures: 1 = season, 2 = episode, 3 =
+# ".N" suffix or empty.
+SPLIT_EPISODE_PATTERN='(?<![0-9A-Za-z])[Ss]([0-9]{1,2})[ ._][Ee]([0-9]{1,3})(\.[0-9]{1,2})?(?![0-9A-Za-z])'
+
+# Rewrites the first alternate episode token in NAME into SxxEyy form and sets
+# EPISODE_TOKEN_NAME to the result: "1x01" becomes "S01E01", "10x105" becomes
+# "S10E105", and a split token "S01 E01" becomes "S01E01". EPISODE_TOKEN_NAME
+# is NAME unchanged when it has no such token or already carries an SxxEyy
+# token, so the SxxEyy form always wins. These forms name their season and
+# episode outright, unlike the inferred forms read by abs_locate, so they need
+# no sibling files. Always returns 0, so it is safe to call as a bare
+# statement under set -e.
+normalize_episode_token() {
+    local name="$1"
+    EPISODE_TOKEN_NAME="$name"
+    is_episode_shaped "$name" && return 0
+    pcre_locate "$SPLIT_EPISODE_PATTERN" "$name"
+    if [[ -n "$PCRE_MATCH" ]]; then
+        [[ "$PCRE_MATCH" =~ ^[Ss]([0-9]{1,2})[\ ._][Ee]([0-9]{1,3})(\.[0-9]{1,2})?$ ]] || return 0
+        EPISODE_TOKEN_NAME="${name:0:$PCRE_OFFSET}S$(pad2 "${BASH_REMATCH[1]}")E$(pad2 "${BASH_REMATCH[2]}")${BASH_REMATCH[3]}${name:$(( PCRE_OFFSET + ${#PCRE_MATCH} ))}"
+        return 0
+    fi
+    pcre_locate "$NXMM_TOKEN_PATTERN" "$name"
+    [[ -n "$PCRE_MATCH" ]] || return 0
+    [[ "$PCRE_MATCH" =~ ^([0-9]{1,2})[xX]([0-9]{2,3})$ ]] || return 0
+    EPISODE_TOKEN_NAME="${name:0:$PCRE_OFFSET}S$(pad2 "${BASH_REMATCH[1]}")E$(pad2 "${BASH_REMATCH[2]}")${name:$(( PCRE_OFFSET + ${#PCRE_MATCH} ))}"
+}
+
 # Returns 0 when NAME (a folder's basename) is a "Season NN" folder -
 # "Season", an optional separator, then digits ("Season 1", "Season.02"),
 # optionally followed by a hyphen and a descriptor ("Season 02 - Descriptor"),
@@ -522,11 +575,11 @@ ABS_DELIM_PATTERN='^([^[:space:]]*[A-Za-z][^[:space:]]*[^[:space:]._-])[._-]([0-
 # still share a stem. Clobbers YEAR_MATCH and YEAR_OFFSET. Always returns 0,
 # so it is safe to call as a bare statement under set -e.
 abs_locate() {
-    local name="$1" hit off match trailing
+    local name="$1" off match trailing
     ABS_FOUND=0; ABS_PRE=""; ABS_REST=""; ABS_TAIL=""; ABS_EP=""; ABS_SEASON=""; ABS_FORM=""
-    hit="$(grep -boiP "$ABS_EP_PATTERN" <<< "$name" | head -1)" || true
-    if [[ -n "$hit" ]]; then
-        off="$(byte_to_char_offset "$name" "${hit%%:*}")"; match="${hit#*:}"
+    pcre_locate "(?i)${ABS_EP_PATTERN}" "$name"
+    if [[ -n "$PCRE_MATCH" ]]; then
+        off="$PCRE_OFFSET"; match="$PCRE_MATCH"
         [[ "$match" =~ ([0-9]{1,3})$ ]] || return 0
         ABS_EP="${BASH_REMATCH[1]}"
         if [[ "$match" =~ ^[Ss][Ee][Aa][Ss][Oo][Nn][\ ._-]*([0-9]{1,2}) ]]; then
@@ -628,6 +681,8 @@ split_title_season() {
 # one folder are two series, not copies of one episode. When nothing
 # precedes the token, the title is the show folder's name (the parent of a
 # "Season NN" folder, otherwise the folder itself).
+# An "NxMM" token ("1x01") or a split "S01 E01" is rewritten first, by
+# normalize_episode_token, and needs no siblings.
 # Sets ABS_NAME; unchanged from the input when the name already has an
 # SxxEyy token, carries no inferred token, or has no confirming siblings.
 # Clobbers ABS_* and PARSED_*.
@@ -636,6 +691,11 @@ normalize_absolute_episode() {
     local pre rest trailing ep season show_dir ep_int ep_frac
     ABS_NAME="$name"
     is_episode_shaped "$name" && return 0
+    normalize_episode_token "$name"
+    if [[ "$EPISODE_TOKEN_NAME" != "$name" ]]; then
+        ABS_NAME="$EPISODE_TOKEN_NAME"
+        return 0
+    fi
     abs_locate "$name"
     (( ABS_FOUND )) || return 0
     pre="$ABS_PRE"; rest="$ABS_REST"; trailing="$ABS_TAIL"; ep="$ABS_EP"; season="$ABS_SEASON"
@@ -664,6 +724,40 @@ normalize_absolute_episode() {
     ABS_NAME="$pre S$(pad2 "$season")E$(pad2 "$ep_int")${ep_frac}${rest}${trailing}"
 }
 
+# PCRE for the tokens that start the release tags after an episode title:
+# resolution, source, codec, audio, HDR and streaming-service tags. No
+# structural signal separates an episode title from these ("Title 1080p
+# WEB-DL x264-GRP"), so they are listed explicitly (see cut_release_tags).
+# Two groups, because a token that is also an ordinary word must not end a
+# title when it appears in normal case:
+#   - the case-insensitive group holds tokens no title word looks like: a
+#     digit-bearing token (1080p, x265, DDP5.1) or a coined one (WEB-DL,
+#     BluRay, HEVC, AAC);
+#   - the case-sensitive group holds tokens that match only in capitals
+#     (WEB, DV, REPACK, MULTI, AMZN), so "Web" or "Dual" in a title survives.
+# Every token is bounded by non-alphanumerics, as years are. Known limitation:
+# a release group with no tag before it ("Series S01E01 Title-GRP") ends no
+# title, and a tag spelled in normal case outside the first group ("Repack")
+# is kept as title text.
+RELEASE_TAG_PATTERN='(?<![0-9A-Za-z])(?:(?i:[0-9]{3,4}[pi]|[48]k|uhd|web-?dl|web-?rip|bd-?rip|br-?rip|dvd-?rip|hd-?rip|nf-?rip|hdtv|pdtv|blu-?ray|remux|[xh]\.?26[45]|hevc|xvid|divx|10-?bit|aac[0-9.]*|e?-?ac-?3|dd[p+]?[0-9](?:\.[0-9])?|dts(?:-?hd)?|truehd|flac|hdr(?:10\+?)?|dovi|sdr|repack)|WEB|DV|PROPER|INTERNAL|MULTI|DUAL|VOSTFR|SUBBED|DUBBED|AMZN|NF|DSNP|HMAX|ATVP|HULU|CR)(?![0-9A-Za-z])'
+
+# Prints TEXT up to the first release-tag token (RELEASE_TAG_PATTERN), then
+# drops any run of upper-case 3-letter language codes left directly before it
+# ("Title ITA KOR 1080p" gives "Title"). The codes must be capitals and known
+# to normalize_lang, so a title word such as "Man" is never taken for one.
+# TEXT is returned whole when it holds no tag. Reads LANG_ALIASES through
+# normalize_lang(); sets nothing.
+cut_release_tags() {
+    local s="$1"
+    local lang_run='^(.*[^A-Za-z]|)([A-Z]{3})[[:space:]._-]*$'
+    pcre_locate "$RELEASE_TAG_PATTERN" "$s"
+    [[ -z "$PCRE_MATCH" ]] || s="${s:0:$PCRE_OFFSET}"
+    while [[ "$s" =~ $lang_run ]] && [[ -n "$(normalize_lang "${BASH_REMATCH[2]}")" ]]; do
+        s="${BASH_REMATCH[1]}"
+    done
+    printf '%s' "$s"
+}
+
 # Core name parser for TV EPISODES. Sets PARSED_OK, PARSED_SERIES,
 # PARSED_SEASON, PARSED_EPISODE, PARSED_EPTITLE, PARSED_EDITION and
 # PARSED_YEAR from a cleaned name with no extension. Call only after
@@ -672,30 +766,34 @@ normalize_absolute_episode() {
 # title, minus a redundant year (Plex episode names never carry one; a guard
 # below keeps a show titled with a year). Season and episode are zero-padded;
 # the 10# prefix forces base 10 so "08" and "09" are not read as octal.
-# The episode title is whatever follows a separator run containing a literal
-# hyphen; without one, everything after the token is discarded as junk.
-# SxxEyy gives no structural signal for where a title ends and release tags
-# begin, so this is a heuristic (see the hyphen-delimited title limitation in
-# rename.sh's header comment).
+# The episode title is whatever follows the token, with or without a hyphen
+# between them, cut at the first release tag by cut_release_tags(); an empty
+# result leaves PARSED_EPTITLE empty. SxxEyy gives no structural signal for
+# where a title ends and release tags begin, so the cut is a vocabulary
+# match (see RELEASE_TAG_PATTERN for its limitation).
 parse_episode_name() {
     local raw="$1"
     PARSED_OK=0; PARSED_SERIES=""; PARSED_SEASON=""; PARSED_EPISODE=""
     PARSED_EPTITLE=""; PARSED_EDITION=""; PARSED_YEAR=""
 
-    # Edition markers on either side of SxxEyy ("Show Name Director's Cut
-    # S01E01", "Show Name S01E01 - Uncut") are captured here; a literal
-    # "{edition-X}" in the episode title is read further below.
+    # An explicit "{edition-X}" tag wins and is read and removed first, so the
+    # known-edition pass below cannot strip a word inside it ("{edition-Uncut}"
+    # would lose "Uncut" and leave "{edition-}"). Otherwise edition markers on
+    # either side of SxxEyy ("Show Name Director's Cut S01E01", "Show Name
+    # S01E01 - Uncut") are captured by that pass.
+    local literal_edition=""
+    if [[ "$raw" =~ \{edition-([^}]+)\} ]]; then
+        literal_edition="${BASH_REMATCH[1]}"
+        raw="${raw/"${BASH_REMATCH[0]}"/}"
+    fi
     extract_known_edition "$raw"
-    PARSED_EDITION="$EDITION_LABEL"
+    PARSED_EDITION="${literal_edition:-$EDITION_LABEL}"
     raw="$EDITION_RAW"
 
     local match offset
-    match="$(grep -oP "${EPISODE_TOKEN_PATTERN}(?![0-9A-Za-z])" <<< "$raw" | head -1)" || true
+    pcre_locate "${EPISODE_TOKEN_PATTERN}(?![0-9A-Za-z])" "$raw"
+    match="$PCRE_MATCH"; offset="$PCRE_OFFSET"
     [[ -z "$match" ]] && return
-
-    offset="$(grep -boP '(?<![0-9A-Za-z])'"${match//./\\.}"'(?![0-9A-Za-z])' <<< "$raw" | head -1)" || true
-    [[ -z "$offset" ]] && return
-    offset="$(byte_to_char_offset "$raw" "${offset%%:*}")"
 
     [[ "$match" =~ ^[Ss]([0-9]{1,2})[Ee]([0-9]{1,3})(\.[0-9]{1,2})?$ ]] || return
     local season="${BASH_REMATCH[1]}" episode="${BASH_REMATCH[2]}" special="${BASH_REMATCH[3]}"
@@ -720,18 +818,19 @@ parse_episode_name() {
     series_part="$(strip_and_clean "$series_raw")"
     [[ -z "$series_part" ]] && return
 
-    local rest_part="${raw:$(( offset + ${#match} ))}"
-    if [[ "$rest_part" =~ ^[[:space:]._]*-[[:space:]._]*(.+)$ ]]; then
-        local ep_title="${BASH_REMATCH[1]}"
-        if [[ "$ep_title" =~ \{edition-([^}]+)\} ]]; then
-            PARSED_EDITION="${BASH_REMATCH[1]}"
-            ep_title="${ep_title/${BASH_REMATCH[0]}/}"
-        fi
-        if [[ "$raw" == *[[:space:]]* ]]; then
-            PARSED_EPTITLE="$(fix_small_word_case "$(clean_spaced_title "$ep_title")")"
-        else
-            PARSED_EPTITLE="$(fix_small_word_case "$(strip_and_clean "$ep_title")")"
-        fi
+    # The episode title is whatever follows the token, with or without a
+    # hyphen between them, up to the first release tag.
+    local ep_title="${raw:$(( offset + ${#match} ))}"
+    if [[ "$ep_title" =~ ^[[:space:]._]*-[[:space:]._]*(.+)$ ]]; then
+        ep_title="${BASH_REMATCH[1]}"
+    else
+        ep_title="${ep_title#"${ep_title%%[![:space:]._]*}"}"
+    fi
+    ep_title="$(cut_release_tags "$(strip_delimited_groups "$ep_title")")"
+    if [[ "$raw" == *[[:space:]]* ]]; then
+        PARSED_EPTITLE="$(fix_small_word_case "$(clean_spaced_title "$ep_title")")"
+    else
+        PARSED_EPTITLE="$(fix_small_word_case "$(strip_and_clean "$ep_title")")"
     fi
 
     PARSED_SERIES="$(fix_small_word_case "$series_part")"

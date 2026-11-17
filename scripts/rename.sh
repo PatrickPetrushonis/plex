@@ -130,12 +130,16 @@
 #   movie. Everything before the token is the series title; season and
 #   episode are zero-padded from the token. Output: "Series - SxxEyy -
 #   Episode Title.ext", or "Series - SxxEyy.ext" with no title.
-#   A hyphen in the separator right after SxxEyy marks an episode title
-#   ("S03E01 - Real Title" keeps everything after it); without one,
-#   everything after is discarded as junk ("S03E01.1080p.WEB-DL.x264-GROUP").
-#   Known limitation: a hyphen-delimited title followed by quality tags
-#   ("S03E01 - Title 1080p WEB-DL x264-GROUP") is kept whole, since telling
-#   them apart needs tag vocabulary or an episode-title database.
+#   The text after SxxEyy is the episode title, with or without a hyphen
+#   between them ("S03E01 - Real Title", "S03E01.Real.Title"), cut at the
+#   first release tag: a resolution, source, codec, audio, HDR or streaming
+#   tag from RELEASE_TAG_PATTERN in rename_parse.sh, plus any upper-case
+#   language codes right before it ("Real.Title.ITA.KOR.1080p.x265-GROUP"
+#   gives "Real Title"). A name with a tag straight after SxxEyy has no title
+#   ("S03E01.1080p.WEB-DL.x264-GROUP"). No structural signal separates a title
+#   from release tags, so the cut is a vocabulary match. Known limitation: a
+#   release group with no tag before it ("S03E01.Real.Title-GROUP") stays in
+#   the title.
 #   Spec blocks are stripped from series and episode titles as for movies.
 #   A name that already has spaces keeps the periods in its episode title
 #   ("Hero Vs. Villain!"), trimming only trailing ones; a dot-delimited
@@ -143,6 +147,13 @@
 #   A ".N" suffix marks a special, recap or similar extra ("S01E17.5"); it is
 #   kept as written: "Series - S01E17.5 - Title.ext". Multi-episode numbering
 #   (S01E01E02, S01E01-E02) is NO_MATCH, not guessed at.
+#   An "NxMM" token (1-2 digit season, "x" or "X", 2-3 digit episode, bounded
+#   by non-alphanumerics: "1x01", "10x105") or an SxxEyy token split by one
+#   space, dot or underscore ("S01 E01", "S01.E01") is rewritten to SxxEyy
+#   first ("S01E01", "S10E105") and then parsed as above. Each names its
+#   season and episode outright, so it needs no sibling files. A name that
+#   already has an SxxEyy token is left alone, and a resolution ("1920x1080")
+#   or a one-digit episode ("1x1") is not read as one.
 #
 #   Inferred episode numbering: a name with no SxxEyy token is read as an
 #   episode when it contains one of the following AND at least two videos in
@@ -157,8 +168,8 @@
 #   - a dot, underscore or hyphen plus two or three digits, in a name with
 #     no whitespace ("Show.Name.01", "Show-Name-01"), optionally followed by
 #     "(...)" groups ("Show_Name_01_(720p)"; a year in one marks a movie).
-#   A title after "Episode N" or " - NN - " is dropped, except after a hyphen
-#   following "Episode N" ("Show - Episode 01 - Title"), which is kept.
+#   A title after "Episode N" is kept as for SxxEyy ("Show Episode 01 Title
+#   1080p" gives "Show - S01E01 - Title"); a title after " - NN - " is dropped.
 #   Siblings are counted once before any rename (build_episode_stems), so the
 #   whole series stays confirmed as its files are renamed. A lone numbered
 #   file is never inferred to be an episode, since a bare number is equally a
@@ -602,12 +613,23 @@ check_root() {
     return $rc
 }
 
+# Prints the files under DIR whose extension is one of EXTS (a "|"-separated
+# list such as VIDEO_EXTS), NUL-delimited and sorted, so callers can read the
+# complete list before any rename changes the tree. MAXDEPTH, when given,
+# limits the search ("1" is DIR's own files). Sets nothing.
+list_ext_files() {
+    local exts="$1" dir="$2" maxdepth="${3:-}"
+    local -a depth=()
+    [[ -z "$maxdepth" ]] || depth=(-maxdepth "$maxdepth")
+    find "$dir" ${depth[@]+"${depth[@]}"} -type f -regextype posix-extended \
+        -iregex ".*\.(${exts})$" -print0 | sort -z
+}
+
 # Counts the video files directly inside DIR (not recursive). Sets nothing;
 # prints the count. Used to decide whether a folder name can stand in for a
 # year-less file's own name: only a folder holding exactly one video can.
 count_videos_in() {
-    find "$1" -maxdepth 1 -type f -regextype posix-extended \
-        -iregex ".*\.(${VIDEO_EXTS})$" | wc -l
+    list_ext_files "$VIDEO_EXTS" "$1" 1 | tr -cd '\0' | wc -c
 }
 
 # Reduces a title to lowercase alphanumerics, for comparing a folder's title
@@ -663,7 +685,7 @@ folder_has_episodes() {
         base="$(basename "$f")"
         normalize_absolute_episode "$(strip_junk_prefixes "${base%.*}")" "$(dirname "$f")"
         is_episode_shaped "$ABS_NAME" && return 0
-    done < <(find "$dir" -type f -regextype posix-extended -iregex ".*\.(${VIDEO_EXTS})$" -print0 | sort -z)
+    done < <(list_ext_files "$VIDEO_EXTS" "$dir")
     return 1
 }
 
@@ -721,16 +743,20 @@ clean_extra_name() {
     printf '%s' "$(fix_small_word_case "$s")"
 }
 
-# Reads the SxxEyy token from the nearest folder name between DIR (inclusive)
-# and STOP (exclusive). Sets ANC_TOKEN to e.g. "S01E07", zero-padded to two
-# digits, or "" when no folder in that range carries one. Always returns 0.
+# Reads the episode token from the nearest folder name between DIR (inclusive)
+# and STOP (exclusive), in any form normalize_episode_token accepts (SxxEyy,
+# NxMM, a split "S01 E01"). Sets ANC_TOKEN to e.g. "S01E07", zero-padded to
+# two digits, or "" when no folder in that range carries one. Clobbers
+# EPISODE_TOKEN_NAME and PCRE_*. Always returns 0.
 ancestor_episode_token() {
     local d="$1" stop="$2" base
     ANC_TOKEN=""
     while [[ "$d" != "$stop" && "$d" != "/" && "$d" != "." ]]; do
         base="$(basename -- "$d")"
-        if [[ "$base" =~ (^|[^0-9A-Za-z])[Ss]([0-9]{1,2})[Ee]([0-9]{1,3})([^0-9A-Za-z]|$) ]]; then
-            printf -v ANC_TOKEN 'S%02dE%02d' "$((10#${BASH_REMATCH[2]}))" "$((10#${BASH_REMATCH[3]}))"
+        normalize_episode_token "$base"
+        pcre_locate "${EPISODE_TOKEN_PATTERN}(?![0-9A-Za-z])" "$EPISODE_TOKEN_NAME"
+        if [[ "$PCRE_MATCH" =~ ^[Ss]([0-9]{1,2})[Ee]([0-9]{1,3}) ]]; then
+            printf -v ANC_TOKEN 'S%02dE%02d' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))"
             return 0
         fi
         d="$(dirname -- "$d")"
@@ -827,8 +853,7 @@ find_companion_video() {
     local -a vids
     COMPANION_VIDEO=""
     while [[ "$d" != "$TARGET_DIR" && "$d" != "/" && "$d" != "." ]]; do
-        mapfile -d '' vids < <(find "$d" -maxdepth 1 -type f -regextype posix-extended \
-            -iregex ".*\.(${VIDEO_EXTS})$" -print0)
+        mapfile -d '' vids < <(list_ext_files "$VIDEO_EXTS" "$d" 1)
         if (( ${#vids[@]} )); then
             (( ${#vids[@]} == 1 )) && COMPANION_VIDEO="${vids[0]}"
             return 0
@@ -952,9 +977,8 @@ echo "----------------------------------------------------------------"
 log "Rename pass started: $TARGET_DIR"
 
 # Prints every video and subtitle file under the target directory,
-# NUL-delimited and sorted, so callers can read the complete list before
-# any rename changes the tree.
-list_media_files() { find "$TARGET_DIR" -type f -regextype posix-extended -iregex ".*\.(${ALL_EXTS})$" -print0 | sort -z; }
+# NUL-delimited and sorted (see list_ext_files).
+list_media_files() { list_ext_files "$ALL_EXTS" "$TARGET_DIR"; }
 build_episode_stems < <(list_media_files)
 
 declare -A SHOW_FALLBACK_NAME=()   # show folder -> "Series (YYYY)" to rename it to when its own name has no year but an episode's file name did
@@ -1001,7 +1025,8 @@ while IFS= read -r -d '' FILE_PATH; do
         # taken for a tagged subtitle.
         if [[ -n "$SUB_LANG_CODE" ]] && ! is_supported_lang "$SUB_LANG_CODE"; then
             find_last_year "$SUB_TAG_STRIPPED_NAME"
-            if [[ -n "$YEAR_MATCH" ]] || is_episode_shaped "$(strip_junk_prefixes "$SUB_TAG_STRIPPED_NAME")"; then
+            normalize_episode_token "$(strip_junk_prefixes "$SUB_TAG_STRIPPED_NAME")"
+            if [[ -n "$YEAR_MATCH" ]] || is_episode_shaped "$EPISODE_TOKEN_NAME"; then
                 delete_subtitle "$FILE_PATH"
             else
                 report_skip "unsupported-language subtitle with no year or episode in its name; not renamed or deleted" "$FILE_NAME"
@@ -1022,6 +1047,11 @@ while IFS= read -r -d '' FILE_PATH; do
     #    unconditionally, so a title containing a bare year is never
     #    misrouted into movie parsing (see is_episode_shaped's own comment).
     WORKING_NAME_STRIPPED="$(strip_junk_prefixes "$WORKING_NAME")"
+    # "1x01" and "S01 E01" name their season and episode outright, so both
+    # become "S01E01" here, before any check below asks whether the name is an
+    # episode.
+    normalize_episode_token "$WORKING_NAME_STRIPPED"
+    WORKING_NAME_STRIPPED="$EPISODE_TOKEN_NAME"
     # A subtitle named only by an unsupported language ("3 Arabic", "French") is
     # deleted when the language word has three or more letters; a two-letter
     # name ("no", "it") is too often an ordinary word, so it is left as it is.
