@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # lint.sh: Checks every script in this repo's scripts/ directory: runs
-# shellcheck against each .sh file (installing the tool itself via apt first
+# the linter shellcheck against each .sh file (installing it via apt first
 # if it isn't already present) and a syntax check against each .py file
 # (Python's own compiler, no extra packages; nothing is written to disk).
 #

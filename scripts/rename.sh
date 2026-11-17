@@ -25,6 +25,10 @@
 #                   by real runs only.
 #                   Default: this script's own directory
 #   -L DIR          Log directory, overriding OPDIR/Logs specifically
+#   -x              Attention exit: exit 2 when nothing failed but at least one
+#                   file was skipped, left unmatched or (dry run) would be
+#                   deleted, so a caller can tell a clean run from one that
+#                   needs a person (default: off)
 #   -h              Show this help
 #
 # Notes:
@@ -32,8 +36,8 @@
 #     the user who owns the library
 #   • Requires bash 4.0+, a grep with PCRE support (-P; GNU grep on
 #     Ubuntu/Debian has this by default), and sha256sum
-#   • Exits 1 when any rename, move or deletion fails; skipped and unmatched
-#     files do not change the exit status
+#   • Exits 1 when any rename, move or deletion fails; without -x, skipped and
+#     unmatched files do not change the exit status
 #   • Only one run may target a given <target_dir> at a time; a second run
 #     against the same directory exits immediately instead of racing on
 #     shared rename targets (see "Concurrency lock" below)
@@ -296,6 +300,7 @@ FORCE=0
 RENAME_DIRS=1
 LOG_DIR=""
 OPERATIONAL_DIR=""
+ATTENTION_EXIT=0
 
 # Usage
 usage() {
@@ -304,13 +309,14 @@ usage() {
 }
 
 # Arg parsing
-while getopts ":L:O:nfFh" opt; do
+while getopts ":L:O:nfFxh" opt; do
     case $opt in
         L) LOG_DIR="$OPTARG" ;;
         O) OPERATIONAL_DIR="$OPTARG" ;;
         n) DRY_RUN=1 ;;
         f) FORCE=1 ;;
         F) RENAME_DIRS=0 ;;
+        x) ATTENTION_EXIT=1 ;;
         h) usage ;;
         :) echo "ERROR: Option -$OPTARG requires an argument." >&2; exit 1 ;;
         \?) echo "ERROR: Unknown option: -$OPTARG" >&2; exit 1 ;;
@@ -1299,7 +1305,7 @@ done < <(list_media_files)
 for FILE_PATH in "${DEFERRED_SUBS[@]}"; do
     FILE_NAME="$(basename "$FILE_PATH")"
     FILE_DIR="$(dirname "$FILE_PATH")"
-    FILE_EXT_LOWER="$(tr 'A-Z' 'a-z' <<< "${FILE_NAME##*.}")"
+    FILE_EXT_LOWER="$(tr '[:upper:]' '[:lower:]' <<< "${FILE_NAME##*.}")"
     VIDEO_FINAL="${FINAL_VIDEO_PATH[${DEFERRED_VIDEO[$FILE_PATH]}]:-}"
     if [[ -z "$VIDEO_FINAL" ]]; then
         report_no_match "companion video was not renamed" "${FILE_DIR##*/}/$FILE_NAME"
@@ -1414,5 +1420,5 @@ echo "------------------------------------------"
 log "Batch complete: Renamed=$RENAMED Deleted=$DELETED DeletePreviewed=$DELETE_PREVIEWED Previewed=$PREVIEWED Skipped=$SKIPPED NoMatch=$NO_MATCH Failed=$FAILED"
 (( DRY_RUN )) || echo "Log saved to: $LOG_FILE"
 (( FAILED == 0 )) || exit 1
-
-[[ $FAILED -eq 0 ]] || exit 1
+# With -x, a run that failed nothing but left work for a person exits 2.
+(( ! ATTENTION_EXIT || SKIPPED + NO_MATCH + DELETE_PREVIEWED == 0 )) || exit 2

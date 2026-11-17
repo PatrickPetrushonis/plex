@@ -879,7 +879,7 @@ strip_embedded_text_tracks() {
             echo " Subtitle[src:$idx]: ASS override tags found, muxing a tag-stripped copy"
             _REPL+=("$(canon_lang "$lang") ${type} ${STRIPPED_SUB_PATH}")
         else
-            echo " WARNING: tag-strip failed for embedded subtitle src:$idx; muxing the original (may still show {\\an8}-style text on screen)" >&2
+            printf ' WARNING: tag-strip failed for embedded subtitle src:%s; muxing the original (may still show {\\an8}-style text on screen)\n' "$idx" >&2
             log "SUBTITLE TAG STRIP FAILED: $INPUT src:$idx (muxed unstripped)"
             kept+=("$line")
         fi
@@ -976,10 +976,10 @@ prepare_sidecars() {
 # move into it). On a failed move, removes the sidecars already moved and returns 1.
 promote_sidecars() {
     local -n _MJOBS="$1"
-    local job m_strip m_tmp m_final
+    local job m_tmp m_final
     local -a moved=()
     for job in "${_MJOBS[@]+"${_MJOBS[@]}"}"; do
-        IFS=$'\t' read -r m_strip m_tmp m_final <<< "$job"
+        IFS=$'\t' read -r _ m_tmp m_final <<< "$job"
         if ! mv -T -- "$m_tmp" "$m_final"; then
             echo " ERROR: could not move sidecar into place: $m_final" >&2
             local f
@@ -993,9 +993,9 @@ promote_sidecars() {
 # Removes the final sidecar files named by the job array (arg 1).
 remove_sidecar_finals() {
     local -n _RJOBS="$1"
-    local job r_strip r_tmp r_final
+    local job r_final
     for job in "${_RJOBS[@]+"${_RJOBS[@]}"}"; do
-        IFS=$'\t' read -r r_strip r_tmp r_final <<< "$job"
+        IFS=$'\t' read -r _ _ r_final <<< "$job"
         rm -f -- "$r_final"
     done
 }
@@ -1069,7 +1069,9 @@ execute_encode() {
     local -n _CF="$8"
     local -n _EXTSUB="$9"
     local EXPECTED_SUBS="${10}"
+    # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
     local -n _SFF="${11}"
+    # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
     local -n _JOBS="${12}"
 
     if (( DRY_RUN )); then
@@ -1134,7 +1136,7 @@ execute_encode() {
     CURRENT_FFMPEG_PID=$FFMPEG_PID
 
     local SPIN_IDX=0 ELAPSED=0 MINS=0 SECS=0
-    local SPIN_CHARS='|/-\'
+    local SPIN_CHARS='|/-'"\\"
     while kill -0 "$FFMPEG_PID" 2>/dev/null; do
         MINS=$(( ELAPSED / 60 ))
         SECS=$(( ELAPSED % 60 ))
@@ -1425,7 +1427,7 @@ process_file() {
         elif strip_sidecar_sub "$_e_path"; then
             _e_mux_path="$STRIPPED_SUB_PATH"
         else
-            echo " WARNING: tag-strip failed for $(basename "$_e_path"); using original (may still show {\\an8}-style text on screen)" >&2
+            printf ' WARNING: tag-strip failed for %s; using original (may still show {\\an8}-style text on screen)\n' "$(basename "$_e_path")" >&2
             log "SUBTITLE TAG STRIP FAILED: $_e_path (used unstripped)"
         fi
 

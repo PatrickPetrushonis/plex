@@ -219,8 +219,8 @@ strip_and_clean() {
     local s="$1" trim_char="${2:-}" trim_side="${3:-}"
     s="$(strip_delimited_groups "$s")"
     case "$trim_side" in
-        trailing) s="${s%$trim_char}" ;;
-        leading)  s="${s#$trim_char}" ;;
+        trailing) s="${s%"$trim_char"}" ;;
+        leading)  s="${s#"$trim_char"}" ;;
     esac
     clean_fragment "$s"
 }

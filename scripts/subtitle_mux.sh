@@ -7,15 +7,17 @@
 # Sourced by encode.sh.
 #
 # The caller provides, before sourcing this file and calling into it:
-#   OUT_FORMAT       "mkv" or "mp4" - read by subtitle_output_codec()
+#   OUT_FORMAT       "mkv" or "mp4" - read by subtitle_output_codec() and
+#                     sidecar_output_codec()
 #   SUB_LANGS        comma-separated 3-letter codes - read by
 #                     discover_sidecar_subs()
 #   LANG_3TO2        assoc array, 3-letter -> 2-letter code - from
-#                     lang_table.sh, read by discover_sidecar_subs()
+#                     lang_table.sh, read by discover_sidecar_subs() and
+#                     sidecar_file_name()
 #   LANG_LABEL_BASH  assoc array, code -> display label - from
 #                     lang_table.sh, read by build_external_subtitle_args()
 #   canon_lang       function from lang_table.sh, read by
-#                     subtitle_track_key()
+#                     subtitle_track_key() and sidecar_file_name()
 # lang_table.sh is sourced by the caller before this module's functions are
 # called; this module does not source it itself, so sourcing stays at the
 # call site.
@@ -176,11 +178,12 @@ discover_sidecar_subs() {
     DIR="$(dirname "$INPUT")"
     BASENAME="$(basename "${INPUT%.*}")"
 
-    local -a _TARGET_LANGS
+    local -a _TARGET_LANGS=()
+    # shellcheck disable=SC2153  # SUB_LANGS is the caller-provided global named in the header; SUB_LANG is a separate local in build_external_subtitle_args
     IFS=',' read -ra _TARGET_LANGS <<< "$SUB_LANGS"
 
     local lang3 lang2 f
-    for lang3 in "${_TARGET_LANGS[@]}"; do
+    for lang3 in "${_TARGET_LANGS[@]+"${_TARGET_LANGS[@]}"}"; do
         lang2="${LANG_3TO2[$lang3]:-}"
         [[ -z "$lang2" ]] && continue
 
@@ -209,11 +212,11 @@ SUBTITLE_SIDECAR_EXTS="srt sub idx ass ssa vtt sup smi"
 # the remaining arguments (the output of discover_sidecar_subs). These are the
 # files discovery does not embed: formats outside SUBTITLE_MUX_EXTS (.idx,
 # .sup, .smi), a file whose probed codec is not muxed (a bitmap .sub) or whose
-# text is not valid UTF-8, a
-# language outside SUB_LANGS, an unrecognized modifier (.en.hi.srt), a lower
-# precedence format of a claimed language and type (.en.ass beside .en.srt),
-# and an .sdh file shadowed by a .cc file. Matching is by string prefix, never by glob,
-# so brackets in a filename are literal and S01E1 never matches S01E10.
+# text is not valid UTF-8, a language outside SUB_LANGS, an unrecognized
+# modifier (.en.hi.srt), a lower precedence format of a claimed language and
+# type (.en.ass beside .en.srt), and an .sdh file shadowed by a .cc file.
+# Matching is by string prefix, never by glob, so brackets in a filename are
+# literal and S01E1 never matches S01E10.
 report_unclaimed_sidecars() {
     local INPUT="$1"
     shift

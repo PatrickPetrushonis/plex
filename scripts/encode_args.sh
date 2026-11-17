@@ -22,7 +22,8 @@
 #
 # shellcheck disable=SC2034
 # File-wide: SIDECAR_EXTRACT_LINES is appended to here and read by encode.sh;
-# shellcheck cannot see across that boundary standalone.
+# the checker cannot see across that boundary when this file is checked
+# standalone.
 
 # -- is_hdr_transfer ---------------------------------------------------------------
 # Returns 0 if the given colour transfer name is an HDR curve (PQ or HLG),
@@ -111,6 +112,13 @@ build_video_args() {
 }
 
 # -- build_audio_args ---------------------------------------------------------------
+# Appends the audio-stream ffmpeg args to the array named by $1: a -map, a codec
+# setting and language and title metadata per stream. Args: array name, then one
+# line per source audio stream "IGNORED SRC_IDX CODEC LANG TITLE", where TITLE is
+# the rest of the line. A stream whose codec is in AUDIO_COPY_CODECS
+# (comma-separated) is copied; any other is encoded to aac at AUDIO_BITRATE and
+# its title's first word is replaced with "AAC". Prints each stream's decision;
+# with no lines it prints that no streams were found and appends nothing.
 build_audio_args() {
     # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
     local -n _FF="$1"
@@ -126,7 +134,7 @@ build_audio_args() {
 
     local -A COPY_SET=()
     IFS=',' read -ra _CODECS <<< "$AUDIO_COPY_CODECS"
-    for c in "${_CODECS[@]}"; do COPY_SET["$c"]=1; done
+    for c in "${_CODECS[@]+"${_CODECS[@]}"}"; do COPY_SET["$c"]=1; done
 
     local OUT_AUDIO_IDX=0
     for line in "${AUDIO_LINES[@]}"; do
@@ -158,6 +166,10 @@ build_audio_args() {
 # stripped copy before this function runs.
 # A second standard (non-CC, non-forced) embedded track of the same primary
 # language is dropped; the language is compared after alias resolution.
+# Args: array name, the name of the output subtitle index counter (increased by
+# one per embedded track appended), then one line per source subtitle track
+# "IGNORED SRC_IDX CODEC LANG IS_TARGET IS_FORCED IS_SIGNS IS_CC LABEL", where
+# LABEL is the rest of the line. Prints each track's decision.
 build_subtitle_args() {
     # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
     local -n _FF="$1"
@@ -205,6 +217,7 @@ build_subtitle_args() {
             SUB_TITLE="${LANG_LABEL}"
         fi
 
+        # shellcheck disable=SC2153  # SUB_MODE is the caller-provided global named in the header; SUB_CODEC is a separate local
         if [[ "$SUB_MODE" == "sidecar" ]] && sidecar_output_spec "$SUB_CODEC" >/dev/null; then
             echo " Subtitle[src:$SRC_IDX]: SIDECAR: $SUB_TITLE ($SUB_CODEC)"
             SIDECAR_EXTRACT_LINES+=("${SRC_IDX} ${SUB_CODEC} $(subtitle_track_type "$IS_FORCED" "$IS_CC") ${SUB_LANG}")
