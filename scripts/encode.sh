@@ -813,42 +813,86 @@ backup_sidecar_subs() {
     return "$FAILED"
 }
 
+# -- spin_until_exit -----------------------------------------------------------------
+# Shows a spinner and the elapsed time on stderr, redrawn once a second, until the
+# background process PID exits, then clears the line. It neither waits for the
+# process nor reads its status; the caller does both with `wait`. Args: pid.
+spin_until_exit() {
+    local PID="$1"
+    local SPIN_IDX=0 ELAPSED=0
+    local SPIN_CHARS='|/-'"\\"
+    while kill -0 "$PID" 2>/dev/null; do
+        printf "\r %s  %02d:%02d elapsed" "${SPIN_CHARS:$SPIN_IDX:1}" "$(( ELAPSED / 60 ))" "$(( ELAPSED % 60 ))" >&2
+        SPIN_IDX=$(( (SPIN_IDX + 1) % 4 ))
+        sleep 1
+        ELAPSED=$(( ELAPSED + 1 ))
+    done
+    printf "\r%30s\r" "" >&2
+}
+
+# -- extract_embedded_srt -------------------------------------------------------------
+# Extracts the embedded text tracks with the given source indexes to scratch files
+# "${SUB_TMP_DIR}/raw/e<index>.srt" in a single ffmpeg run. Extracting even one
+# track reads the whole input file, so a run per file costs one read of it and a
+# run per track costs one read each. Args: input video, then the source indexes.
+# Shows the spinner while it runs and registers the process in CURRENT_FFMPEG_PID
+# so the SIGINT/SIGTERM handler stops it. Returns ffmpeg's exit status; after a
+# failure the files may be missing or partial.
+extract_embedded_srt() {
+    local INPUT="$1"
+    shift
+    local -a MAPS=()
+    local idx RC=0
+    mkdir -p -- "${SUB_TMP_DIR}/raw"
+    for idx in "$@"; do
+        MAPS+=(-map "0:${idx}" -c:s srt "${SUB_TMP_DIR}/raw/e${idx}.srt")
+    done
+    ffmpeg -nostdin -v error -y -analyzeduration "$PROBE_SIZE" -probesize "$PROBE_SIZE" \
+        -i "$INPUT" "${MAPS[@]}" 2>/dev/null &
+    CURRENT_FFMPEG_PID=$!
+    spin_until_exit "$CURRENT_FFMPEG_PID"
+    wait "$CURRENT_FFMPEG_PID" || RC=$?
+    CURRENT_FFMPEG_PID=""
+    return "$RC"
+}
+
 # -- strip_embedded_text_tracks -------------------------------------------------------
-# -S embed mode, real runs only. Extracts each embedded SubRip or mov_text track
-# that build_subtitle_args() would keep to a scratch .srt file. A track whose text
-# carries ASS override tags (e.g. {\an8}) is removed from the SUB_LINES array and
-# replaced by a tag-stripped copy, which the caller muxes as an external input; a
-# track without tags, or one that cannot be extracted (warning), stays in
-# SUB_LINES and is muxed from the source. Args: input video, the name of the
-# SUB_LINES array, the name of the output array. Appends to the output array one
-# "LANG3 TYPE PATH" line per replaced track, LANG3 being the primary code. A
-# track that loses its language-and-type group in select_subtitle_winners(), the
-# choice build_subtitle_args() also makes, is dropped here, so a dropped
-# duplicate is never extracted and removing a replaced track cannot promote a
-# duplicate behind it.
-EMBED_STRIP_SEQ=0
+# -S embed mode, real runs only. Extracts every embedded SubRip or mov_text track
+# that build_subtitle_args() would keep to a scratch .srt file, all in one pass over
+# the input (extract_embedded_srt). A track whose text carries ASS override tags
+# (e.g. {\an8}) is removed from the SUB_LINES array and replaced by a tag-stripped
+# copy, which the caller muxes as an external input; a track without tags, or one
+# that cannot be extracted (warning), stays in SUB_LINES and is muxed from the
+# source. Args: input video, the name of the SUB_LINES array, the name of the
+# output array. Appends to the output array one "LANG3 TYPE PATH" line per replaced
+# track, LANG3 being the primary code. A track that loses its language-and-type
+# group in select_subtitle_winners(), the choice build_subtitle_args() also makes,
+# is dropped here, so a dropped duplicate is never extracted and removing a
+# replaced track cannot promote a duplicate behind it.
 strip_embedded_text_tracks() {
     local INPUT="$1"
     # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
     local -n _SL="$2"
     local -n _REPL="$3"
-    local -a kept=()
-    local -A winner=()
-    local line
+    local -a kept=() plan=() cands=()
+    local -A winner=() extracted=()
+    local line entry idx raw type key list
 
     select_subtitle_winners winner "${_SL[@]+"${_SL[@]}"}"
 
+    # Pass 1: drop the losers, set aside everything that needs no check, and
+    # collect the SubRip and mov_text winners. plan keeps source order, each entry
+    # prefixed "K " (keep as is) or "C " (check for override tags).
     for line in "${_SL[@]+"${_SL[@]}"}"; do
-        local _ idx codec lang is_target is_forced is_signs is_cc rest
+        local _ codec lang is_target is_forced is_signs is_cc rest
         read -r _ idx codec lang is_target is_forced is_signs is_cc rest <<< "$line"
 
         if [[ "$is_target" != "1" || "$is_signs" == "1" \
               || "$(subtitle_output_codec "$codec")" == "DROP" ]]; then
-            kept+=("$line")
+            plan+=("K $line")
             continue
         fi
 
-        local type key
         type="$(subtitle_track_type "$is_forced" "$is_cc")"
         key="$(subtitle_track_key "$lang" "$type")"
         if [[ "${winner[$key]}" != "$idx" ]]; then
@@ -857,28 +901,61 @@ strip_embedded_text_tracks() {
         fi
 
         if [[ "$codec" != "subrip" && "$codec" != "mov_text" ]]; then
+            plan+=("K $line")
+            continue
+        fi
+
+        plan+=("C $line")
+        cands+=("$idx")
+    done
+
+    if (( ${#cands[@]} > 0 )); then
+        list=""
+        for idx in "${cands[@]}"; do list+="${list:+, }src:${idx}"; done
+        echo " Subtitles: checking ${list} for ASS override tags (reads the whole file once)"
+
+        if ! extract_embedded_srt "$INPUT" "${cands[@]}"; then
+            # A track ffmpeg cannot convert fails the whole run. Discard what it
+            # wrote and retry each track alone, so only the unreadable one goes
+            # unchecked.
+            rm -f -- "${SUB_TMP_DIR}"/raw/e*.srt
+            if (( ${#cands[@]} > 1 )); then
+                for idx in "${cands[@]}"; do
+                    extract_embedded_srt "$INPUT" "$idx" || rm -f -- "${SUB_TMP_DIR}/raw/e${idx}.srt"
+                done
+            fi
+        fi
+        for idx in "${cands[@]}"; do
+            [[ -s "${SUB_TMP_DIR}/raw/e${idx}.srt" ]] && extracted["$idx"]=1
+        done
+    fi
+
+    # Pass 2: resolve each candidate in source order, so the kept tracks keep
+    # their output order.
+    for entry in "${plan[@]+"${plan[@]}"}"; do
+        line="${entry:2}"
+        if [[ "${entry:0:1}" == "K" ]]; then
             kept+=("$line")
             continue
         fi
 
-        EMBED_STRIP_SEQ=$(( EMBED_STRIP_SEQ + 1 ))
-        local raw="${SUB_TMP_DIR}/raw/e${EMBED_STRIP_SEQ}_${idx}.srt"
-        mkdir -p -- "${SUB_TMP_DIR}/raw"
-        if ! ffmpeg -nostdin -v error -y -analyzeduration "$PROBE_SIZE" -probesize "$PROBE_SIZE" \
-                -i "$INPUT" -map "0:${idx}" -c:s srt "$raw" 2>/dev/null || [[ ! -s "$raw" ]]; then
+        local _ codec lang is_target is_forced is_signs is_cc rest
+        read -r _ idx codec lang is_target is_forced is_signs is_cc rest <<< "$line"
+        raw="${SUB_TMP_DIR}/raw/e${idx}.srt"
+
+        if [[ -z "${extracted[$idx]+_}" ]]; then
             echo " WARNING: could not read embedded subtitle src:$idx to check it for override tags; muxing it unchecked" >&2
             log "SUBTITLE TAG CHECK FAILED: $INPUT src:$idx (muxed unchecked)"
-            rm -f -- "$raw"
             kept+=("$line")
             continue
         fi
 
         if ! python3 "$STRIP_PY" has "$raw"; then
-            rm -f -- "$raw"
             kept+=("$line")
             continue
         fi
 
+        type="$(subtitle_track_type "$is_forced" "$is_cc")"
         if strip_sidecar_sub "$raw"; then
             echo " Subtitle[src:$idx]: ASS override tags found, muxing a tag-stripped copy"
             _REPL+=("$(canon_lang "$lang") ${type} ${STRIPPED_SUB_PATH}")
@@ -887,8 +964,8 @@ strip_embedded_text_tracks() {
             log "SUBTITLE TAG STRIP FAILED: $INPUT src:$idx (muxed unstripped)"
             kept+=("$line")
         fi
-        rm -f -- "$raw"
     done
+    rm -f -- "${SUB_TMP_DIR}"/raw/e*.srt
 
     _SL=("${kept[@]+"${kept[@]}"}")
 }
@@ -1181,17 +1258,7 @@ execute_encode() {
     local FFMPEG_PID=$!
     CURRENT_FFMPEG_PID=$FFMPEG_PID
 
-    local SPIN_IDX=0 ELAPSED=0 MINS=0 SECS=0
-    local SPIN_CHARS='|/-'"\\"
-    while kill -0 "$FFMPEG_PID" 2>/dev/null; do
-        MINS=$(( ELAPSED / 60 ))
-        SECS=$(( ELAPSED % 60 ))
-        printf "\r %s  %02d:%02d elapsed" "${SPIN_CHARS:$SPIN_IDX:1}" "$MINS" "$SECS" >&2
-        SPIN_IDX=$(( (SPIN_IDX + 1) % 4 ))
-        sleep 1
-        ELAPSED=$(( ELAPSED + 1 ))
-    done
-    printf "\r%30s\r" "" >&2
+    spin_until_exit "$FFMPEG_PID"
 
     wait "$FFMPEG_PID"
     local FFMPEG_RC=$?
