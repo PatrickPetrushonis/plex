@@ -3,12 +3,12 @@
 not carry, from the US TV Parental Guidelines rating on The Movie Database (TMDB).
 
 Usage:
-    python3 get_plex_labels.py FOLDERS.csv LABELS.csv [--source jikan|mal-api] [--no-tmdb]
+    python3 plex_get_labels.py FOLDERS.csv LABELS.csv [--source jikan|mal-api] [--no-tmdb]
                          [--no-source-works] [--check-source-route] [--assess-genres]
                          [--no-idmap] [--refresh-idmap] [--idmap PATH]
                          [-f|--force] [-n|--dry-run] [--cache PATH] [--log PATH]
 
-FOLDERS.csv  plex_folders.csv, written by sync_plex_folders.py. First column "Plex Folder"
+FOLDERS.csv  plex_folders.csv, written by plex_sync_folders.py. First column "Plex Folder"
           (header row required). Optional columns, all written by the sync from Plex's own
           match and never edited by hand: Plex Title, Plex Original Title, Plex TMDB ID,
           Plex TVDB ID, Plex IMDB ID. Any other column is ignored. A wrong match is fixed
@@ -29,10 +29,10 @@ LABELS.csv   plex_labels.csv, the output. An existing file is never replaced unl
           anime that already have a demographic (mal-api only; output unchanged).
 --no-idmap  Does not use the ID map (see Rules); every folder is found by title search.
 --refresh-idmap  Downloads the ID map again even when the saved copy is recent.
---idmap   Where the ID map is saved (default: get_plex_labels_idmap.json next to this script).
+--idmap   Where the ID map is saved (default: data/cache/plex_get_labels_idmap.json).
 --cache   One JSON file for every finished lookup, with a section per source (jikan,
           mal-api, tmdb), so records from one are never read as another's. Default:
-          get_plex_labels_cache.json next to this script. When the file does not exist,
+          data/cache/plex_get_labels_cache.json. When the file does not exist,
           get_anime_labels_cache*.json and get_western_labels_cache.json beside it are
           imported into it once; they are not modified. Delete it to refresh everything.
 --dry-run Reports what would be looked up and written; makes no network calls and
@@ -131,7 +131,7 @@ import sys
 import time
 import urllib.parse
 
-from labels_common import (ABORT_AFTER_FAILURES, LOG_DIR, ApiError, atomic_write,
+from plex_labels_common import (ABORT_AFTER_FAILURES, LOG_DIR, ApiError, atomic_write,
                            close_logging, fetch_json, hold_lock, normalize_title,
                            setup_logging, split_folder_name)
 
@@ -180,8 +180,8 @@ TMDB_KEY_ENV = "TMDB_API_KEY"
 RATING_AGE = {"TV-Y": "Kids", "TV-Y7": "Kids", "TV-Y7-FV": "Kids", "TV-G": "Kids",
               "TV-PG": "Teen", "TV-14": "Teen", "TV-MA": "Adult"}
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-DEFAULT_CACHE = os.path.join(SCRIPT_DIR, "get_plex_labels_cache.json")
-DEFAULT_LOG = os.path.join(LOG_DIR, "get_plex_labels.log")
+DEFAULT_CACHE = os.path.join(os.path.dirname(SCRIPT_DIR), "data", "cache", "plex_get_labels_cache.json")
+DEFAULT_LOG = os.path.join(LOG_DIR, "plex_get_labels.log")
 # Sections of the cache file: one per MAL source, plus TMDB.
 TMDB_SECTION = "tmdb"
 # Cache files imported into the cache when it does not exist yet.
@@ -189,11 +189,11 @@ IMPORTED_CACHES = (("jikan", "get_anime_labels_cache.json"),
                  ("mal-api", "get_anime_labels_cache_mal_api.json"),
                  (TMDB_SECTION, "get_western_labels_cache.json"))
 FOLDER_COLUMN = "Plex Folder"
-# Columns written by sync_plex_folders.py from Plex's own metadata.
+# Columns written by plex_sync_folders.py from Plex's own metadata.
 PLEX_COLUMNS = {"title": "Plex Title", "original": "Plex Original Title",
                 "tmdb": "Plex TMDB ID", "tvdb": "Plex TVDB ID", "imdb": "Plex IMDB ID"}
 IDMAP_URL = "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json"
-DEFAULT_IDMAP = os.path.join(SCRIPT_DIR, "get_plex_labels_idmap.json")
+DEFAULT_IDMAP = os.path.join(os.path.dirname(SCRIPT_DIR), "data", "cache", "plex_get_labels_idmap.json")
 IDMAP_MAX_AGE_DAYS = 7
 HEADER = ["Plex Folder", "Age", "Target", "Basis", "Match Check", "MAL Title",
           "MAL Demographic", "MAL Rating", "Source Demographic", "Source Basis",
@@ -764,7 +764,7 @@ def exclusive_lock(cache_path):
     same cache exits while runs against other caches proceed. See hold_lock."""
     real = os.path.realpath(cache_path)
     digest = hashlib.sha256(real.encode()).hexdigest()[:16]
-    lock_path = os.path.join(os.path.dirname(real), f".get_plex_labels_{digest}.lock")
+    lock_path = os.path.join(os.path.dirname(real), f".plex_get_labels_{digest}.lock")
     with hold_lock(lock_path, f"ERROR: another run is already using cache {real}"):
         yield
 

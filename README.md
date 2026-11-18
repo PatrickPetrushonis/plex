@@ -16,25 +16,25 @@ plex/
     ├── ingest.sh                   Unattended stage from the completed-downloads directory to the holding directory: settle check, rename preview, real rename only when the preview is clean, then move (called by media.sh; can also be run standalone)
     ├── release.sh                  Moves held entries from the holding directory to the encoder's input directory (called by media.sh; can also be run standalone)
     ├── archive.sh                  Moves encoded files from the local archive directory to the NAS archive directory, category by category, with copy verification (called by media.sh; can also be run standalone)
-    ├── install_units.sh            Writes the systemd user timer that runs `media.sh ingest` or `media.sh archive`
+    ├── systemd_install_units.sh    Writes the systemd user timer that runs `media.sh ingest` or `media.sh archive`
     ├── encode.sh                   Core batch encoder: copy/transcode decisions, HDR-to-SDR conversion, output verification (called by media.sh; can also be run standalone)
     ├── encode_args.sh              Shared: encode.sh's ffmpeg argument builders for video, audio and embedded subtitle tracks
     ├── rename.sh                   Plex-convention renamer for movies + TV episodes + subtitles (called by media.sh; can also be run standalone)
     ├── rename_parse.sh             Shared: rename.sh's name parsing (raw name to Plex name; edition, episode and subtitle-tag rules), no filesystem access
     ├── subtitle_mux.sh             Shared: container-aware subtitle codec choice, sidecar discovery, external-subtitle ffmpeg arg building
-    ├── strip_subtitle_tags.py      Strips leftover ASS override tags (e.g. {\an8}) from a plain-text subtitle file; called by encode.sh
-    ├── scan_subtitle_types.sh      Standalone, read-only inventory of embedded subtitle codecs across a directory - no wrapper, no config.sh dependency
+    ├── subtitle_strip_tags.py      Strips leftover ASS override tags (e.g. {\an8}) from a plain-text subtitle file; called by encode.sh
+    ├── subtitle_scan_types.sh      Standalone, read-only inventory of embedded subtitle codecs across a directory - no wrapper, no config.sh dependency
     ├── lang_table.sh               Shared language-code loader (bash side)
     ├── lang_table.tsv              Canonical language data (single source of truth)
     ├── video_exts.sh               Shared: the video file extensions the encoder, renamer and scanner scan for
-    ├── probe_streams.py            Shared: ffprobe stream reader for encode.sh (video, audio, subtitle lines) and scan_subtitle_types.sh (subtitle classes)
+    ├── probe_streams.py            Shared: ffprobe stream reader for encode.sh (video, audio, subtitle lines) and subtitle_scan_types.sh (subtitle classes)
     ├── plex_labels.sh              Label pipeline entry point: all three stages in order, or one stage (sync, get, apply)
-    ├── sync_plex_folders.py        Label stage 1: create/update data/plex_folders.csv from the Plex library
-    ├── get_plex_labels.py          Label stage 2: Age/Target from MyAnimeList, then TMDB (through Plex's IDs)
-    ├── apply_plex_labels.py        Label stage 3: write the labels to Plex
+    ├── plex_sync_folders.py        Label stage 1: create/update data/plex_folders.csv from the Plex library
+    ├── plex_get_labels.py          Label stage 2: Age/Target from MyAnimeList, then TMDB (through Plex's IDs)
+    ├── plex_apply_labels.py        Label stage 3: write the labels to Plex
     ├── plex_api.py                 Shared by stages 1 and 3: Plex requests, library lookup, PLEX_URL/PLEX_TOKEN checks
-    ├── labels_common.py            Shared by the three .py scripts: HTTP with retry and throttle, logging, locks, atomic writes
-    ├── setup_smb_mount.sh          One-time: mount the NAS share through /etc/fstab (the one script that needs sudo)
+    ├── plex_labels_common.py       Shared by the three .py scripts: HTTP with retry and throttle, logging, locks, atomic writes
+    ├── nas_setup_mount.sh          One-time: mount the NAS share through /etc/fstab (the one script that needs sudo)
     └── lint.sh                     shellcheck for every .sh file, a syntax check for every .py file
 ```
 
@@ -44,18 +44,18 @@ plex/
 
 ### Mount the NAS share
 
-`setup_smb_mount.sh` mounts a CIFS/SMB share (for example a NAS) at a stable local path, owned by a normal user, so the pipeline scripts, which refuse to run as root, can read and write it. `archive.sh` is the stage that writes to it by default. It is the one script in this repo that must run as root: installing `cifs-utils`, writing `/etc/fstab` and mounting all need it.
+`nas_setup_mount.sh` mounts a CIFS/SMB share (for example a NAS) at a stable local path, owned by a normal user, so the pipeline scripts, which refuse to run as root, can read and write it. `archive.sh` is the stage that writes to it by default. It is the one script in this repo that must run as root: installing `cifs-utils`, writing `/etc/fstab` and mounting all need it.
 
 ```bash
 cd scripts
-./setup_smb_mount.sh -n -p Movies nas.local media /mnt/nas/movies    # preview; needs no root
-sudo ./setup_smb_mount.sh -p Movies nas.local media /mnt/nas/movies  # do it
+./nas_setup_mount.sh -n -p Movies nas.local media /mnt/nas/movies    # preview; needs no root
+sudo ./nas_setup_mount.sh -p Movies nas.local media /mnt/nas/movies  # do it
 ```
 
-For the archive stage, mount the whole share (no `-p`) and let `NAS_ARCHIVE_DIR` add the `#archive` folder, since `setup_smb_mount.sh` refuses a `#` in a subpath:
+For the archive stage, mount the whole share (no `-p`) and let `NAS_ARCHIVE_DIR` add the `#archive` folder, since `nas_setup_mount.sh` refuses a `#` in a subpath:
 
 ```bash
-sudo ./setup_smb_mount.sh nas.local plexmedia /mnt/nas/plexmedia
+sudo ./nas_setup_mount.sh nas.local plexmedia /mnt/nas/plexmedia
 ```
 
 | Option | Meaning |
@@ -116,8 +116,8 @@ To run it on a timer:
 
 ```bash
 cd scripts
-./install_units.sh -n   # preview the two unit files
-./install_units.sh      # write them to ~/.config/systemd/user
+./systemd_install_units.sh -n   # preview the two unit files
+./systemd_install_units.sh      # write them to ~/.config/systemd/user
 systemctl --user daemon-reload
 systemctl --user enable --now media_ingest.timer
 ```
@@ -175,8 +175,8 @@ To run it on a timer, use the same installer with the archive stage:
 
 ```bash
 cd scripts
-./install_units.sh -s archive -n   # preview the two unit files
-./install_units.sh -s archive      # write them to ~/.config/systemd/user
+./systemd_install_units.sh -s archive -n   # preview the two unit files
+./systemd_install_units.sh -s archive      # write them to ~/.config/systemd/user
 systemctl --user daemon-reload
 systemctl --user enable --now media_archive.timer
 ```
@@ -185,7 +185,7 @@ systemctl --user enable --now media_archive.timer
 
 ```bash
 cd scripts
-./scan_subtitle_types.sh -r "$INPUT_DIR"
+./subtitle_scan_types.sh -r "$INPUT_DIR"
 ```
 
 Inventories every embedded subtitle stream under a directory, classified by whether its codec can carry a leftover ASS override tag as literal on-screen text (`subrip`/`mov_text`) or not (`ass`/`ssa`, bitmap). It takes its target directory as a plain argument and writes nothing beyond an optional `-o` report file.
@@ -250,8 +250,8 @@ No script's lock (or logs) live inside the directory being processed — each ro
 
 The label scripts keep their lock files in `scripts/` instead, and remove them when a run ends:
 - `plex_labels.sh` takes `.plex_labels.lock` when it runs all three stages, so only one pipeline runs at a time.
-- `get_plex_labels.py` takes `.get_plex_labels_<hash>.lock`, scoped to its cache file, so a second run against the same cache exits while runs against another cache proceed.
-- `apply_plex_labels.py` takes `.apply_plex_labels_<hash>.lock`, scoped to the Plex server and library selection.
+- `plex_get_labels.py` takes `.plex_get_labels_<hash>.lock`, scoped to its cache file, so a second run against the same cache exits while runs against another cache proceed.
+- `plex_apply_labels.py` takes `.plex_apply_labels_<hash>.lock`, scoped to the Plex server and library selection.
 
 ## Centralized language table
 
@@ -259,7 +259,7 @@ The label scripts keep their lock files in `scripts/` instead, and remove them w
 
 - `encode.sh` sources `lang_table.sh` for its bash-side sidecar matching (`LANG_TABLE`, `LANG_3TO2`, `LANG_LABEL_BASH`), and `probe_streams.py`, which it calls to read each file's streams, reads `lang_table.tsv` directly for embedded-track display labels (which resolve aliases).
 - `rename.sh` sources `lang_table.sh` for the `LANG_ALIASES` lookup in `rename_parse.sh`, used to normalize subtitle filename language tags (e.g. `.eng.srt` → `.en.srt`, `.fre.srt` → `.fr.srt`) to the 2-letter form `encode.sh`'s sidecar matching expects.
-- `video_exts.sh` defines `VIDEO_EXTS`, the one video extension list `encode.sh`, `rename.sh` and `scan_subtitle_types.sh` all read.
+- `video_exts.sh` defines `VIDEO_EXTS`, the one video extension list `encode.sh`, `rename.sh` and `subtitle_scan_types.sh` all read.
 - `subtitle_mux.sh` does not source `lang_table.sh`: it depends on `LANG_3TO2`/`LANG_LABEL_BASH` already being loaded by whichever script sourced it.
 
 Both `lang_table.sh` and `lang_table.tsv` resolve their own file locations relative to themselves, not the caller's working directory, so this works regardless of where a script is invoked from. `lang_table.sh` is also safe to source more than once in the same process (an include guard makes the second call a no-op).
@@ -311,7 +311,7 @@ The conversion filter chain lives in one constant, `SDR_TONEMAP_CHAIN`, near the
 
 ### Subtitles
 
-Sidecar discovery, the container-aware subtitle codec choice and external-subtitle ffmpeg arg building live in the shared `subtitle_mux.sh`. Sidecars are tag-stripped before muxing (see [Subtitle tag stripping](#subtitle-tag-stripping-strip_subtitle_tagspy)).
+Sidecar discovery, the container-aware subtitle codec choice and external-subtitle ffmpeg arg building live in the shared `subtitle_mux.sh`. Sidecars are tag-stripped before muxing (see [Subtitle tag stripping](#subtitle-tag-stripping-subtitle_strip_tagspy)).
 
 ## `rename.sh`
 
@@ -357,7 +357,7 @@ Exit codes: `0` nothing to do, not settled yet, or every entry moved; `1` a fail
 
 ### Timer units
 
-`install_units.sh` writes `media_<stage>.service` and `media_<stage>.timer` under `~/.config/systemd/user`, where `-s` picks the stage (`ingest` by default, or `archive`). The service runs `<scripts directory>/media.sh <stage>` once (`Type=oneshot`). The timer starts it 2 minutes after the user manager starts (`OnStartupSec`) and `-i` minutes (default 5) after each run ends (`OnUnitInactiveSec`), so runs never overlap. An existing unit file is left in place unless `-f` is given. It prints the `systemctl` commands that enable the timer and does not run them. It refuses a scripts path containing whitespace, `%`, `$`, a quote or a backslash, since systemd would misread it in `ExecStart`.
+`systemd_install_units.sh` writes `media_<stage>.service` and `media_<stage>.timer` under `~/.config/systemd/user`, where `-s` picks the stage (`ingest` by default, or `archive`). The service runs `<scripts directory>/media.sh <stage>` once (`Type=oneshot`). The timer starts it 2 minutes after the user manager starts (`OnStartupSec`) and `-i` minutes (default 5) after each run ends (`OnUnitInactiveSec`), so runs never overlap. An existing unit file is left in place unless `-f` is given. It prints the `systemctl` commands that enable the timer and does not run them. It refuses a scripts path containing whitespace, `%`, `$`, a quote or a backslash, since systemd would misread it in `ExecStart`.
 
 ## `release.sh`
 
@@ -385,11 +385,11 @@ A real run writes `OPDIR/Logs/Archive_<date>_<time>.txt`. Exit codes: `0` nothin
 
 Known limitation: a writer that stalls for longer than the settle window leaves a partial file that looks finished. The size and modification-time recheck catches a file that grows during the copy, not one that has stopped growing short of its full size.
 
-Known limitation: a file whose name the share rejects fails the copy, stays in the source, and is reported again by every run. The mount options decide which names are rejected (`mapposix` and `mapchars` in `mount.cifs(8)`, passed with `setup_smb_mount.sh -o`); the default translates none of the reserved characters.
+Known limitation: a file whose name the share rejects fails the copy, stays in the source, and is reported again by every run. The mount options decide which names are rejected (`mapposix` and `mapchars` in `mount.cifs(8)`, passed with `nas_setup_mount.sh -o`); the default translates none of the reserved characters.
 
-## Subtitle tag stripping (`strip_subtitle_tags.py`)
+## Subtitle tag stripping (`subtitle_strip_tags.py`)
 
-Some subtitle files carry leftover ASS/SSA override tags (for example `{\an8}`, a positioning tag) as literal text, from an ASS→SRT conversion that kept the tags. Most players, including Plex on TV clients, don't parse the tag and instead display it as on-screen text. `strip_subtitle_tags.py strip SRC DEST` strips any `{\...}` bracketed override sequence (structural match on a single line, not a tag-name keyword list) from a plain-text subtitle file, writing the result to a scratch copy — the original file is never modified. `encode.sh` calls it through `strip_sidecar_sub()` and owns the scratch directory, which is removed on exit. `strip_subtitle_tags.py has SRC` exits 0 when the file contains a tag, which is how `encode.sh` checks an extracted embedded track before deciding to strip it.
+Some subtitle files carry leftover ASS/SSA override tags (for example `{\an8}`, a positioning tag) as literal text, from an ASS→SRT conversion that kept the tags. Most players, including Plex on TV clients, don't parse the tag and instead display it as on-screen text. `subtitle_strip_tags.py strip SRC DEST` strips any `{\...}` bracketed override sequence (structural match on a single line, not a tag-name keyword list) from a plain-text subtitle file, writing the result to a scratch copy — the original file is never modified. `encode.sh` calls it through `strip_sidecar_sub()` and owns the scratch directory, which is removed on exit. `subtitle_strip_tags.py has SRC` exits 0 when the file contains a tag, which is how `encode.sh` checks an extracted embedded track before deciding to strip it.
 
 This is sidecar-file logic specifically (a real file already on disk); an *embedded* subtitle stream can't be edited in place the same way, and no script here repairs one.
 
@@ -437,7 +437,7 @@ Nothing is written when the listing is empty or would remove more than half of t
 
 Every folder goes to MAL first. A folder with no MAL match is then looked up on TMDB, and a folder neither knows is listed at the end of the run with the reason, so no separate stage or file is needed for Western shows. MAL rules first, TMDB rules after them.
 
-**ID map.** MAL does not accept TVDB, TMDB or IMDB IDs, so the stage downloads the community list [Fribb/anime-lists](https://github.com/Fribb/anime-lists) (`anime-list-full.json`, `master` branch), which maps them to MAL IDs, and saves a reduced copy as `get_plex_labels_idmap.json` next to the scripts. It is downloaded again when the copy is older than 7 days (`--refresh-idmap` forces it, `--no-idmap` skips it). If the download fails, a saved copy is used however old it is; with none, the log says so and every folder is found by title search. Corrections to that list are made in its source projects, not here.
+**ID map.** MAL does not accept TVDB, TMDB or IMDB IDs, so the stage downloads the community list [Fribb/anime-lists](https://github.com/Fribb/anime-lists) (`anime-list-full.json`, `master` branch), which maps them to MAL IDs, and saves a reduced copy as `plex_get_labels_idmap.json` in `data/cache/`. It is downloaded again when the copy is older than 7 days (`--refresh-idmap` forces it, `--no-idmap` skips it). If the download fails, a saved copy is used however old it is; with none, the log says so and every folder is found by title search. Corrections to that list are made in its source projects, not here.
 
 #### MAL
 
@@ -471,7 +471,7 @@ A folder with no MAL match on either source, an API failure, or no rating gets `
 
 **Output columns:** `Plex Folder, Age, Target, Basis, Match Check, MAL Title, MAL Demographic, MAL Rating, Source Demographic, Source Basis, Target Basis, Source Magazine, Source`. Source Demographic and Source Basis are filled only when the anime has no demographic of its own. Target Basis reads `Magazine: <names>` or `Genre: <tags>` when Target was inferred. `Source Magazine` lists the source work's serialization names and changes nothing. `Source` is `MAL`, `TMDB`, or `None` when neither resolved the folder; for a `TMDB` row, `Basis` is the TMDB page and `MAL Rating` holds the US rating.
 
-**Cache.** Finished lookups are cached in one file, `get_plex_labels_cache.json` next to the scripts, with a section per source (`jikan`, `mal-api`, `tmdb`), so a re-run makes no requests for them. The ID map has its own file. When the cache file does not exist, the old `get_anime_labels_cache*.json` and `get_western_labels_cache.json` beside it are imported into it once and left untouched, so no lookup is repeated after the merge. A cached source-work result from an older query version is looked up again. Delete the file to refresh everything.
+**Cache.** Finished lookups are cached in one file, `plex_get_labels_cache.json` in `data/cache/`, with a section per source (`jikan`, `mal-api`, `tmdb`), so a re-run makes no requests for them. The ID map has its own file. When the cache file does not exist, the old `get_anime_labels_cache*.json` and `get_western_labels_cache.json` beside it are imported into it once and left untouched, so no lookup is repeated after the merge. A cached source-work result from an older query version is looked up again. Delete the file to refresh everything.
 
 #### TMDB (folders MAL has no entry for)
 
@@ -487,11 +487,11 @@ Without `PLEX_LIBRARY` or `--library` every show and movie library on the server
 
 ### Logs and exit codes
 
-Logs go to `plex/logs/` (the `logs` directory beside `scripts/`): `get_plex_labels.log`, `apply_plex_labels.log`. Exit codes for stages 1 and 2: `0` complete, `1` aborted (outage, bad credentials, repeated failures, bad input), `2` complete but some lookups failed or rows went unmatched. A re-run retries only the failed lookups. `encode.sh` and `rename.sh` exit `0` when no file failed and `1` when any did, and `encode.sh` also exits `1` with "No video files found." when its input holds none; skipped and unmatched files do not change the status, except with `rename.sh -x`, which then exits `2`. `ingest.sh`, `release.sh` and `archive.sh` exit as described in their sections.
+Logs go to `plex/logs/` (the `logs` directory beside `scripts/`): `plex_get_labels.log`, `plex_apply_labels.log`. Exit codes for stages 1 and 2: `0` complete, `1` aborted (outage, bad credentials, repeated failures, bad input), `2` complete but some lookups failed or rows went unmatched. A re-run retries only the failed lookups. `encode.sh` and `rename.sh` exit `0` when no file failed and `1` when any did, and `encode.sh` also exits `1` with "No video files found." when its input holds none; skipped and unmatched files do not change the status, except with `rename.sh -x`, which then exits `2`. `ingest.sh`, `release.sh` and `archive.sh` exit as described in their sections.
 
 ### Flag conventions
 
-`-n` (or `--dry-run` on the Python tools and `plex_labels.sh`) is a dry run everywhere, and `-f` (or `--force`) is a force flag, except in `encode.sh`, where `-f` selects the output container and `-F` selects flat output; in `rename.sh` and `setup_smb_mount.sh` `-f` forces and `-F` (renamer) restricts the run to files. `encode.sh -o DIR` is the output directory and `rename.sh -O DIR` the operational directory; `ingest.sh` and `release.sh` take `-O DIR` with the same meaning. `rename.sh -x` is the attention exit. `ingest.sh -w` is the settle window. `release.sh -S` and `-D` name the holding and input directories and `-a` releases everything. `setup_smb_mount.sh -o` is extra mount options, as in `mount -o`. `archive.sh -m` is the NAS mount point it requires, `-w` its settle window and `-s` size-only verification. `install_units.sh -s` is the stage (`ingest` or `archive`), `-i` the interval in minutes and `-f` overwrites existing unit files.
+`-n` (or `--dry-run` on the Python tools and `plex_labels.sh`) is a dry run everywhere, and `-f` (or `--force`) is a force flag, except in `encode.sh`, where `-f` selects the output container and `-F` selects flat output; in `rename.sh` and `nas_setup_mount.sh` `-f` forces and `-F` (renamer) restricts the run to files. `encode.sh -o DIR` is the output directory and `rename.sh -O DIR` the operational directory; `ingest.sh` and `release.sh` take `-O DIR` with the same meaning. `rename.sh -x` is the attention exit. `ingest.sh -w` is the settle window. `release.sh -S` and `-D` name the holding and input directories and `-a` releases everything. `nas_setup_mount.sh -o` is extra mount options, as in `mount -o`. `archive.sh -m` is the NAS mount point it requires, `-w` its settle window and `-s` size-only verification. `systemd_install_units.sh -s` is the stage (`ingest` or `archive`), `-i` the interval in minutes and `-f` overwrites existing unit files.
 
 ### Known limitations
 

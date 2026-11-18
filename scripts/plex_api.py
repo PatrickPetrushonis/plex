@@ -1,4 +1,4 @@
-"""Plex server access shared by sync_plex_folders.py and apply_plex_labels.py.
+"""Plex server access shared by plex_sync_folders.py and plex_apply_labels.py.
 
 One JSON request function that keeps the token out of URLs and error messages, the
 library lookup, folder-name parsing for Plex Location paths, and the PLEX_URL /

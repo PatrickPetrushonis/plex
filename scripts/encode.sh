@@ -61,7 +61,7 @@
 #     first ext in that order wins per language and type) are muxed. In MKV,
 #     webvtt and microdvd convert to srt and ass is copied; in MP4 all become
 #     mov_text. Subrip sidecars have leftover ASS override tags (e.g. {\an8})
-#     stripped before muxing (strip_subtitle_tags.py); ass is left untouched.
+#     stripped before muxing (subtitle_strip_tags.py); ass is left untouched.
 #     A sidecar replaces an embedded track of the same
 #     language and the same type (standard, CC, forced); language codes are
 #     compared after alias resolution and an untagged track counts as eng
@@ -274,8 +274,8 @@ require awk
 # directory), also the source probe_streams.py reads for track labels.
 PROBE_PY="$(dirname "${BASH_SOURCE[0]}")/probe_streams.py"
 [[ -r "$PROBE_PY" ]] || { echo "ERROR: probe_streams.py not found next to this script ($PROBE_PY)" >&2; exit 1; }
-STRIP_PY="$(dirname "${BASH_SOURCE[0]}")/strip_subtitle_tags.py"
-[[ -r "$STRIP_PY" ]] || { echo "ERROR: strip_subtitle_tags.py not found next to this script ($STRIP_PY)" >&2; exit 1; }
+STRIP_PY="$(dirname "${BASH_SOURCE[0]}")/subtitle_strip_tags.py"
+[[ -r "$STRIP_PY" ]] || { echo "ERROR: subtitle_strip_tags.py not found next to this script ($STRIP_PY)" >&2; exit 1; }
 # shellcheck source=./video_exts.sh
 source "$(dirname "${BASH_SOURCE[0]}")/video_exts.sh"
 # shellcheck source=./lang_table.sh
@@ -625,7 +625,7 @@ cleanup_sub_tmp() {
 }
 
 # Reads SRC (a plain sidecar .srt file), strips every {\...} override tag from
-# it with strip_subtitle_tags.py, and writes the result to a new file under
+# it with subtitle_strip_tags.py, and writes the result to a new file under
 # SUB_TMP_DIR. Sets STRIPPED_SUB_PATH to that new file's path. SRC itself is
 # never modified - the caller's original sidecar file (and its later backup
 # move) is unaffected by this function.

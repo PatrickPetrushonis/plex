@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# scan_subtitle_types.sh: Inventories embedded subtitle tracks across a
+# subtitle_scan_types.sh: Inventories embedded subtitle tracks across a
 # directory of video files, classified by whether the track's codec can
 # carry leftover ASS override tags as literal text (e.g. "{\an8}" showing
 # on screen) or not. Read-only: runs ffprobe only, never ffmpeg; never
 # writes into the scanned directory.
 #
-# Usage: ./scan_subtitle_types.sh [OPTIONS] <dir>
+# Usage: ./subtitle_scan_types.sh [OPTIONS] <dir>
 #
 # Options:
 #   -r        Recurse into subdirectories
@@ -17,7 +17,7 @@
 #   -h        Show this help
 #
 # Classification (embedded subtitle streams only - sidecar .srt files are
-# always TEXT_RISK by construction, see strip_subtitle_tags.py, so are not
+# always TEXT_RISK by construction, see subtitle_strip_tags.py, so are not
 # scanned here):
 #   TEXT_RISK   codec is subrip or mov_text: plain text, can carry a
 #               leftover ASS override tag as literal on-screen text.

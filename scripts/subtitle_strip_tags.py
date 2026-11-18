@@ -2,8 +2,8 @@
 """Strips leftover ASS/SSA override tags from a plain-text subtitle file.
 
 Usage:
-    python3 strip_subtitle_tags.py has SRC
-    python3 strip_subtitle_tags.py strip SRC DEST
+    python3 subtitle_strip_tags.py has SRC
+    python3 subtitle_strip_tags.py strip SRC DEST
 
 Override tags (e.g. {\\an8}, {\\pos(400,300)}, {\\c&HFF0000&}) are valid ASS/SSA syntax but
 are not part of the SRT spec. When a subtitle service converts ASS to SRT and keeps the

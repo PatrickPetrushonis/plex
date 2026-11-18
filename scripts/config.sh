@@ -17,8 +17,8 @@
 
 : "${VIDEOS_BASE:=$HOME/Videos}"
 : "${DOWNLOADS_BASE:=$HOME/Downloads}"
-# Mount point of the NAS share (see setup_smb_mount.sh). The share root, not a
-# subpath: setup_smb_mount.sh refuses a "#" in a subpath, so the "#archive"
+# Mount point of the NAS share (see nas_setup_mount.sh). The share root, not a
+# subpath: nas_setup_mount.sh refuses a "#" in a subpath, so the "#archive"
 # folder name is added below instead.
 : "${NAS_MOUNT:=/mnt/nas/plexmedia}"
 

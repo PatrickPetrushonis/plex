@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # video_exts.sh: Defines VIDEO_EXTS, the pipe-delimited video file extensions
-# every plex script scans for (encode.sh, rename.sh, scan_subtitle_types.sh).
+# every plex script scans for (encode.sh, rename.sh, subtitle_scan_types.sh).
 # Source, don't run directly.
 #
 # Adding an extension: add it here; no consumer needs to change.

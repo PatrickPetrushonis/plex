@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# install_units.sh: Write the systemd user units that run `media.sh ingest` or
+# systemd_install_units.sh: Write the systemd user units that run `media.sh ingest` or
 #                   `media.sh archive` on a timer. Prints the commands that
 #                   enable the timer; does not run them.
 #
-# Usage:  ./install_units.sh [OPTIONS]
+# Usage:  ./systemd_install_units.sh [OPTIONS]
 #
 # Options:
 #   -s STAGE        Stage the timer runs: ingest or archive (default: ingest).
@@ -153,7 +153,7 @@ write_unit() {
 }
 
 if (( DRY_RUN )); then
-    echo "[DRY RUN] install_units.sh"
+    echo "[DRY RUN] systemd_install_units.sh"
 else
     mkdir -p -- "$UNIT_DIR"
 fi

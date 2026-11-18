@@ -18,7 +18,7 @@
 #     (finished lookups are cached). Exit code 2 from apply means the labels were applied
 #     but some folders were not found in Plex or some rows were skipped.
 #
-#   sync                  Runs sync_plex_folders.py on ../data/plex_folders.csv: creates it
+#   sync                  Runs plex_sync_folders.py on ../data/plex_folders.csv: creates it
 #                         on the first run, and afterwards adds the folders new to the Plex
 #                         library and removes the ones no longer in it. Needs PLEX_TOKEN and
 #                         PLEX_URL (server address with scheme and port, e.g.
@@ -26,7 +26,7 @@
 #                         PLEX_LIBRARY (one library title; omit to list every show library).
 #                         ARGS pass through: --dry-run, --force, --dir, --library, --url, --log.
 #
-#   get                   Runs get_plex_labels.py on ../data/plex_folders.csv and writes
+#   get                   Runs plex_get_labels.py on ../data/plex_folders.csv and writes
 #                         ../data/plex_labels.csv. Matching uses the Plex IDs and titles the
 #                         sync stage wrote into plex_folders.csv; to correct a folder, fix its
 #                         match in Plex and sync again. Source-work demographics need
@@ -35,7 +35,7 @@
 #                         --no-tmdb, --no-idmap, --refresh-idmap, --idmap, --no-source-works,
 #                         --check-source-route, --assess-genres.
 #
-#   apply                 Runs apply_plex_labels.py on ../data/plex_labels.csv (the output of
+#   apply                 Runs plex_apply_labels.py on ../data/plex_labels.csv (the output of
 #                         the get stage). Needs PLEX_TOKEN and PLEX_URL. Optional:
 #                         PLEX_LIBRARY (one library title; omit to search all show and movie
 #                         libraries). ARGS pass through: --dry-run, --library, --url, --log.
@@ -59,9 +59,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="${SCRIPT_DIR}/../data"
 FOLDERS_CSV="${DATA_DIR}/plex_folders.csv"
 LABELS_CSV="${DATA_DIR}/plex_labels.csv"
-SYNC_PY="${SCRIPT_DIR}/sync_plex_folders.py"
-LABELS_PY="${SCRIPT_DIR}/get_plex_labels.py"
-APPLY_PY="${SCRIPT_DIR}/apply_plex_labels.py"
+SYNC_PY="${SCRIPT_DIR}/plex_sync_folders.py"
+LABELS_PY="${SCRIPT_DIR}/plex_get_labels.py"
+APPLY_PY="${SCRIPT_DIR}/plex_apply_labels.py"
 
 usage() {
     grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//' || true

@@ -12,7 +12,7 @@ Without --library every show and movie library on the server is searched; --libr
 more than one library is reported as ambiguous and skipped.
 
 Usage:
-    python3 apply_plex_labels.py LABELS.csv [--library NAME ...] [--url URL]
+    python3 plex_apply_labels.py LABELS.csv [--library NAME ...] [--url URL]
                                  [-n|--dry-run] [--log PATH]
 Environment:
     PLEX_TOKEN   Plex authentication token (required)
@@ -31,12 +31,12 @@ import posixpath
 import sys
 from contextlib import contextmanager
 
-from labels_common import ABORT_AFTER_FAILURES, LOG_DIR, close_logging, hold_lock, setup_logging
+from plex_labels_common import ABORT_AFTER_FAILURES, LOG_DIR, close_logging, hold_lock, setup_logging
 from plex_api import (PAGE_SIZE, SECTION_TYPE_IDS, PlexError, env_token, env_url,
                       find_sections, folder_basename, plex_request, require_credentials)
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-DEFAULT_LOG = os.path.join(LOG_DIR, "apply_plex_labels.log")
+DEFAULT_LOG = os.path.join(LOG_DIR, "plex_apply_labels.log")
 
 AGE_VALUES = ("Kids", "Teen", "Adult")
 TARGET_VALUES = ("Male", "Female", "Unspecified")
@@ -180,7 +180,7 @@ def exclusive_lock(base_url, scope):
     proceed. See hold_lock."""
     key = f"{base_url.rstrip('/')}|{scope}"
     digest = hashlib.sha256(key.encode()).hexdigest()[:16]
-    lock_path = os.path.join(SCRIPT_DIR, f".apply_plex_labels_{digest}.lock")
+    lock_path = os.path.join(SCRIPT_DIR, f".plex_apply_labels_{digest}.lock")
     busy = f"ERROR: another run is already labeling libraries {scope} on {base_url}"
     with hold_lock(lock_path, busy):
         yield

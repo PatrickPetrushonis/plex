@@ -2,7 +2,7 @@
 """Creates or updates the folder list that starts the label pipeline.
 
 Usage:
-    python3 sync_plex_folders.py CSV [--library NAME ...] [--url URL] [--dir PATH]
+    python3 plex_sync_folders.py CSV [--library NAME ...] [--url URL] [--dir PATH]
                                      [-n|--dry-run] [-f|--force] [--log PATH]
 
 Lists the folder of every show in the Plex show libraries (all of them, or the titles
@@ -36,12 +36,12 @@ import os
 import re
 import sys
 
-from labels_common import LOG_DIR, atomic_write, close_logging, hold_lock, setup_logging
+from plex_labels_common import LOG_DIR, atomic_write, close_logging, hold_lock, setup_logging
 from plex_api import (PAGE_SIZE, PlexError, env_token, env_url, find_sections, folder_basename,
                       plex_request, require_credentials)
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-DEFAULT_LOG = os.path.join(LOG_DIR, "sync_plex_folders.log")
+DEFAULT_LOG = os.path.join(LOG_DIR, "plex_sync_folders.log")
 FOLDER_COLUMN = "Plex Folder"
 SKIP_PREFIXES = (".", "@", "#")
 MAX_REMOVE_FRACTION = 0.5
@@ -220,8 +220,8 @@ def run(csv_path, base_url, token, libraries, directory, dry_run, force, log_pat
                      "%d total", "create" if created else "update", csv_path, len(added),
                      len(removed), changed, len(merged))
             return 0
-        lock = os.path.join(SCRIPT_DIR, ".sync_plex_folders.lock")
-        with hold_lock(lock, "ERROR: another sync_plex_folders.py run is in progress"):
+        lock = os.path.join(SCRIPT_DIR, ".plex_sync_folders.lock")
+        with hold_lock(lock, "ERROR: another plex_sync_folders.py run is in progress"):
             def write(f):
                 w = csv.writer(f)
                 w.writerow(header)

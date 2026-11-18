@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup_smb_mount.sh: Mounts a CIFS/SMB share (e.g. a NAS) as a
+# nas_setup_mount.sh: Mounts a CIFS/SMB share (e.g. a NAS) as a
 # stable local mountpoint, owned by a real (non-root) user, via
 # /etc/fstab - so batch tools in this project that refuse to run as root
 # (archive.sh by default; the others when pointed at the share) can
@@ -13,11 +13,11 @@
 # creates the mount, and a normal user only interacts with what's inside
 # it afterward.
 #
-# Usage:  sudo ./setup_smb_mount.sh [OPTIONS] <server> <share> <mountpoint>
+# Usage:  sudo ./nas_setup_mount.sh [OPTIONS] <server> <share> <mountpoint>
 #
 # Examples:
-#   sudo ./setup_smb_mount.sh -p Movies nas.local media /mnt/nas/movies
-#   sudo ./setup_smb_mount.sh nas.local plexmedia /mnt/nas/plexmedia
+#   sudo ./nas_setup_mount.sh -p Movies nas.local media /mnt/nas/movies
+#   sudo ./nas_setup_mount.sh nas.local plexmedia /mnt/nas/plexmedia
 #
 # Options:
 #   -p PATH     Subpath within the share to mount, appended to the UNC path

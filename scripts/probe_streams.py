@@ -18,7 +18,7 @@ SUB_LANGS is a comma-separated list of 3-letter codes; is_target is 1 when the t
 language is in it, an untagged ("und") track counting as "eng". LANG_TABLE_TSV is the path
 of lang_table.tsv, which supplies the display labels.
 
-scan mode (called by scan_subtitle_types.sh) prints one tab-separated line per subtitle
+scan mode (called by subtitle_scan_types.sh) prints one tab-separated line per subtitle
 stream: FILE, INDEX, CODEC, LANG, CLASS. CLASS is TEXT_RISK (subrip, mov_text: can carry a
 literal ASS override tag), ASS_NATIVE, BITMAP or OTHER. A failed probe prints one line with
 ERROR in the INDEX, CODEC and LANG columns and PROBE_FAILED:<message> or
@@ -247,7 +247,7 @@ def main(argv=None):
     enc.add_argument('file')
     enc.add_argument('sub_langs', help="comma-separated 3-letter codes of the wanted subtitle languages")
     enc.add_argument('lang_table_tsv', help="path of lang_table.tsv")
-    scan = sub.add_parser('scan', help="subtitle class lines for scan_subtitle_types.sh")
+    scan = sub.add_parser('scan', help="subtitle class lines for subtitle_scan_types.sh")
     scan.add_argument('file')
     a = p.parse_args(argv)
     if a.mode == 'encode':

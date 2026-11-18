@@ -1,4 +1,4 @@
-"""Helpers shared by get_plex_labels.py, sync_plex_folders.py and apply_plex_labels.py.
+"""Helpers shared by plex_get_labels.py, plex_sync_folders.py and plex_apply_labels.py.
 
 HTTP with throttling and retries (fetch_json), folder-name parsing, atomic file
 writes, a self-cleaning single-run lock, and logging to the logs directory beside the
