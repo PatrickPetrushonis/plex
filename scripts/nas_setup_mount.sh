@@ -64,6 +64,15 @@
 #   * A target user that resolves to root is refused: the project's batch
 #     tools refuse to run as root, and a mount owned by uid 0 is not writable
 #     by anyone else.
+#   * <server> is resolved with getent before anything is written. A name that
+#     does not resolve (for example a .local name on a machine without mDNS
+#     name lookup) stops the run; pass the server's IP address instead.
+#   * Run again after a failed mount: an existing fstab entry identical to the
+#     line this run would write is not rewritten, and the run goes on to the
+#     mount. An entry that differs is left in place, no mount is attempted, and
+#     the run exits 1.
+#   * Exit codes: 0 mounted (or a dry run completed); 1 any error, a failed
+#     mount, or no mount because an existing entry differs.
 #   * Out of scope, deliberately: this is a single, short-lived
 #     provisioning run, not a recurring batch job, so it doesn't take a
 #     concurrency lock or register a state-restoring EXIT trap the way the
@@ -158,6 +167,7 @@ fi
 # -- Dependency check -----------------------------------------------------------
 require() { command -v "$1" &>/dev/null || { echo "ERROR: '$1' not found on PATH" >&2; exit 1; }; }
 require id
+require getent
 require grep
 require sed
 require awk
@@ -192,6 +202,33 @@ fstab_has_entry() {
     local fstab_file="$1" mountpoint_escaped="$2"
     [[ -f "$fstab_file" ]] || return 1
     awk -v mp="$mountpoint_escaped" '$1 !~ /^#/ && $2 == mp { found=1 } END { exit !found }' "$fstab_file"
+}
+
+# Tests whether FSTAB_FILE has a non-comment entry for MOUNTPOINT_ESCAPED whose
+# fields, joined by single spaces, equal WANT_LINE's. Returns 0 (identical) or
+# 1 (absent or different); a plain boolean, safe in a bare `if`.
+fstab_entry_matches() {
+    local fstab_file="$1" mountpoint_escaped="$2" want_line="$3"
+    [[ -f "$fstab_file" ]] || return 1
+    awk -v mp="$mountpoint_escaped" -v want="$want_line" '
+        BEGIN { n = split(want, w, " "); joined = w[1]; for (i = 2; i <= n; i++) joined = joined " " w[i] }
+        $1 !~ /^#/ && $2 == mp {
+            line = $1; for (i = 2; i <= NF; i++) line = line " " $i
+            if (line == joined) found = 1
+        }
+        END { exit !found }' "$fstab_file"
+}
+
+# Reloads systemd so it re-reads the fstab just written; mount prints a hint
+# when it is missing. Does nothing when systemctl is absent. A failed reload is
+# reported, not fatal: the mount step reports its own result.
+reload_systemd() {
+    command -v systemctl &>/dev/null || return 0
+    if systemctl daemon-reload; then
+        echo "  Reloaded systemd."
+    else
+        echo "  WARNING: systemctl daemon-reload failed; run it before mounting." >&2
+    fi
 }
 
 # Replaces an existing entry for MOUNTPOINT_ESCAPED in FSTAB_FILE with
@@ -229,6 +266,18 @@ if (( TARGET_UID == 0 )); then
     exit 1
 fi
 echo "  User: $TARGET_USER (uid=$TARGET_UID, gid=$TARGET_GID)"
+
+echo ""
+echo "== Check: server name =="
+if getent hosts "$SERVER" >/dev/null; then
+    echo "  Resolves: $SERVER"
+elif (( DRY_RUN )); then
+    echo "  [DRY RUN] WARNING: $SERVER does not resolve; a real run stops here."
+else
+    echo "ERROR: $SERVER does not resolve, so mount.cifs would fail with 'could not resolve address'." >&2
+    echo "  Pass the server's IP address, or fix name lookup (a .local name needs mDNS)." >&2
+    exit 1
+fi
 
 echo ""
 echo "== Step 1/6: cifs-utils =="
@@ -298,9 +347,12 @@ if fstab_has_entry "$FSTAB_PATH" "$MOUNTPOINT_ESCAPED"; then
             replace_fstab_entry "$FSTAB_PATH" "$MOUNTPOINT_ESCAPED" "$FSTAB_LINE"
             echo "  Backed up to: $FSTAB_BACKUP"
             echo "  Replaced existing entry for $MOUNTPOINT."
+            reload_systemd
         fi
+    elif fstab_entry_matches "$FSTAB_PATH" "$MOUNTPOINT_ESCAPED" "$FSTAB_LINE"; then
+        echo "  An identical entry for $MOUNTPOINT already exists; no write needed."
     else
-        echo "  An entry for $MOUNTPOINT already exists, leaving it in place (use -f to overwrite)."
+        echo "  An entry for $MOUNTPOINT already exists and differs from this run's line (use -f to overwrite)."
         echo "  Not touching $FSTAB_PATH; skipping mount below to avoid mounting against a stale definition."
         SKIP_MOUNT=1
     fi
@@ -314,6 +366,7 @@ else
         printf '%s\n' "$FSTAB_LINE" >> "$FSTAB_PATH"
         echo "  Backed up to: $FSTAB_BACKUP"
         echo "  Appended entry for $MOUNTPOINT."
+        reload_systemd
     fi
 fi
 
@@ -323,8 +376,14 @@ if (( SKIP_MOUNT )); then
     echo "  Skipped (see above) - run manually once you've reconciled the existing fstab entry: mount \"$MOUNTPOINT\""
 elif (( DRY_RUN )); then
     echo "  [DRY RUN] Would run: mount \"$MOUNTPOINT\""
+elif mountpoint -q -- "$MOUNTPOINT"; then
+    echo "  Already mounted."
 else
-    mount "$MOUNTPOINT"
+    if ! mount "$MOUNTPOINT"; then
+        echo "  ERROR: mount failed. The credentials file and fstab entry are in place." >&2
+        echo "  Fix the cause shown above, then run this script again or: mount \"$MOUNTPOINT\"" >&2
+        exit 1
+    fi
     echo "  Mounted."
 fi
 
@@ -345,6 +404,12 @@ else
     }
     echo ""
     ls -la "$MOUNTPOINT"
+fi
+
+if (( SKIP_MOUNT )); then
+    echo ""
+    echo "Not mounted: reconcile the existing fstab entry for $MOUNTPOINT (or rerun with -f), then run this script again." >&2
+    exit 1
 fi
 
 echo ""
