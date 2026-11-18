@@ -12,10 +12,11 @@ plex/
 ├── logs/                           Label pipeline logs (created on first run; not committed)
 └── scripts/
     ├── config.sh                   Paths, encoder settings and the ingest settle window, sourced by media.sh
-    ├── media.sh                    Run a stage: `media.sh encode|rename|ingest|release [-n]`; -n previews it (nothing is written, renamed or moved); prints [DRY RUN] or [LIVE] first
+    ├── media.sh                    Run a stage: `media.sh encode|rename|ingest|release|archive [-n]`; -n previews it (nothing is written, renamed or moved); prints [DRY RUN] or [LIVE] first
     ├── ingest.sh                   Unattended stage from the completed-downloads directory to the holding directory: settle check, rename preview, real rename only when the preview is clean, then move (called by media.sh; can also be run standalone)
     ├── release.sh                  Moves held entries from the holding directory to the encoder's input directory (called by media.sh; can also be run standalone)
-    ├── install_units.sh            Writes the systemd user timer that runs `media.sh ingest`
+    ├── archive.sh                  Moves encoded files from the local archive directory to the NAS archive directory, category by category, with copy verification (called by media.sh; can also be run standalone)
+    ├── install_units.sh            Writes the systemd user timer that runs `media.sh ingest` or `media.sh archive`
     ├── encode.sh                   Core batch encoder: copy/transcode decisions, HDR-to-SDR conversion, output verification (called by media.sh; can also be run standalone)
     ├── encode_args.sh              Shared: encode.sh's ffmpeg argument builders for video, audio and embedded subtitle tracks
     ├── rename.sh                   Plex-convention renamer for movies + TV episodes + subtitles (called by media.sh; can also be run standalone)
@@ -43,12 +44,18 @@ plex/
 
 ### Mount the NAS share
 
-`setup_smb_mount.sh` mounts a CIFS/SMB share (for example a NAS) at a stable local path, owned by a normal user, so the encoder, renamer, ingest and release scripts, which refuse to run as root, can read and write it. It is the one script in this repo that must run as root: installing `cifs-utils`, writing `/etc/fstab` and mounting all need it.
+`setup_smb_mount.sh` mounts a CIFS/SMB share (for example a NAS) at a stable local path, owned by a normal user, so the pipeline scripts, which refuse to run as root, can read and write it. `archive.sh` is the stage that writes to it by default. It is the one script in this repo that must run as root: installing `cifs-utils`, writing `/etc/fstab` and mounting all need it.
 
 ```bash
 cd scripts
 ./setup_smb_mount.sh -n -p Movies nas.local media /mnt/nas/movies    # preview; needs no root
 sudo ./setup_smb_mount.sh -p Movies nas.local media /mnt/nas/movies  # do it
+```
+
+For the archive stage, mount the whole share (no `-p`) and let `NAS_ARCHIVE_DIR` add the `#archive` folder, since `setup_smb_mount.sh` refuses a `#` in a subpath:
+
+```bash
+sudo ./setup_smb_mount.sh nas.local plexmedia /mnt/nas/plexmedia
 ```
 
 | Option | Meaning |
@@ -57,10 +64,11 @@ sudo ./setup_smb_mount.sh -p Movies nas.local media /mnt/nas/movies  # do it
 | `-u USER` | Local user who owns the mounted files (default: the user who ran `sudo`) |
 | `-c FILE` | SMB credentials file (default: `/etc/samba/credentials/<share>`; root-owned, mode 600) |
 | `-v VERS` | SMB protocol version (default: 3.0) |
+| `-o OPTS` | Extra mount options, comma-separated, appended to the fstab line (default: none) |
 | `-f` | Overwrite an existing `/etc/fstab` entry or credentials file instead of leaving it in place |
 | `-n` | Dry run: print every step, change nothing |
 
-It prompts for the SMB username and password and writes them only to the credentials file. `/etc/fstab` is backed up (timestamped) before any change, and only one line is ever appended or replaced. It needs bash 4.0+ and `apt-get` (Debian/Ubuntu). It takes no lock because it is a short, single provisioning run.
+It prompts for the SMB username and password and writes them only to the credentials file. `/etc/fstab` is backed up (timestamped) before any change, and only one line is ever appended or replaced. It needs bash 4.0+, `apt-get` (Debian/Ubuntu), `mountpoint` and `runuser`. It refuses a target user that resolves to root, and a `#` in the server, share, subpath or mount point. After mounting it confirms that the path is a mount point and writable by the target user. It takes no lock because it is a short, single provisioning run.
 
 The label pipeline does not need this mount: it talks to Plex over its API.
 
@@ -83,8 +91,9 @@ Runs `shellcheck -x` on every `.sh` file under `scripts/` (installing shellcheck
 | Ingest | `media.sh ingest` | `$DOWNLOADS_INPUT_DIR` (`$DOWNLOADS_BASE/Complete`) | Renames in place, then moves entries to `$UNENCODED_DIR` (`$VIDEOS_BASE/unencoded`), the holding directory |
 | Release | `media.sh release` | `$UNENCODED_DIR` | `$INPUT_DIR` (`$VIDEOS_BASE/input`) |
 | Encode | `media.sh encode` | `$INPUT_DIR` | `$OUTPUT_DIR` (`.tmp` files and logs), then `$ARCHIVE_DIR` (`encoded`, from `-M`) and `$BACKUP_DIR` (`backup`, the sources, from `-A`) |
+| Archive | `media.sh archive` | `$ARCHIVE_DIR` | `$NAS_ARCHIVE_DIR` (`$NAS_MOUNT/#archive`), then removes the local copy |
 
-No script moves `$ARCHIVE_DIR` to the NAS or `$BACKUP_DIR` to cold storage.
+No script moves `$BACKUP_DIR` to cold storage.
 
 ### 1. Ingest finished downloads (automatic, or on demand)
 
@@ -152,7 +161,27 @@ CRF=18 PRESET=slow ./media.sh encode
 VIDEOS_BASE=/mnt/scratch/Videos ./media.sh encode -n
 ```
 
-### 4. Scan a library for subtitle risk (optional, read-only)
+### 4. Archive encoded files to the NAS (automatic, or on demand)
+
+```bash
+cd scripts
+./media.sh archive -n   # preview: nothing is copied or deleted
+./media.sh archive      # run it for real
+```
+
+`media.sh archive` moves the files in `$ARCHIVE_DIR` to `$NAS_ARCHIVE_DIR`, category by category, and deletes each local file only after the NAS copy is verified. It ends before any work when `$NAS_MOUNT` is not mounted. A collision, or a top-level entry that is not a category folder on the NAS, leaves the file in place and exits 2. See [`archive.sh`](#archivesh).
+
+To run it on a timer, use the same installer with the archive stage:
+
+```bash
+cd scripts
+./install_units.sh -s archive -n   # preview the two unit files
+./install_units.sh -s archive      # write them to ~/.config/systemd/user
+systemctl --user daemon-reload
+systemctl --user enable --now media_archive.timer
+```
+
+### 5. Scan a library for subtitle risk (optional, read-only)
 
 ```bash
 cd scripts
@@ -161,7 +190,7 @@ cd scripts
 
 Inventories every embedded subtitle stream under a directory, classified by whether its codec can carry a leftover ASS override tag as literal on-screen text (`subrip`/`mov_text`) or not (`ass`/`ssa`, bitmap). It takes its target directory as a plain argument and writes nothing beyond an optional `-o` report file.
 
-### 5. Label the Plex library with Age and Target
+### 6. Label the Plex library with Age and Target
 
 Run this after Plex has scanned the files: labels are applied to items Plex already has, matched by folder name on disk.
 
@@ -180,14 +209,14 @@ See [Plex labels](#plex-labels-age-and-target) for the rules, the inputs and eac
 
 ## `config.sh`
 
-Defines two independent variable groups, one for the video-library pipeline (from `VIDEOS_BASE`) and one for the completed-downloads directory the rename and ingest stages read (from `DOWNLOADS_BASE`):
+Defines three independent variable groups: the video-library pipeline (from `VIDEOS_BASE`), the completed-downloads directory the rename and ingest stages read (from `DOWNLOADS_BASE`) and the NAS share the archive stage writes to (from `NAS_MOUNT`):
 
 | Variable | Default | Passed to |
 |---|---|---|
 | `VIDEOS_BASE` | `$HOME/Videos` | Base for the five video-library directory variables below |
 | `INPUT_DIR` | `$VIDEOS_BASE/input` | `encode.sh` positional arg |
 | `OUTPUT_DIR` | `$VIDEOS_BASE/output` | `encode.sh` `-o` (via `ENCODER_ARGS`) |
-| `ARCHIVE_DIR` | `$VIDEOS_BASE/encoded` | `encode.sh` `-M` (via `ENCODER_ARGS`) |
+| `ARCHIVE_DIR` | `$VIDEOS_BASE/encoded` | `encode.sh` `-M` (via `ENCODER_ARGS`); `archive.sh` source directory (positional arg) |
 | `BACKUP_DIR` | `$VIDEOS_BASE/backup` | `encode.sh` `-A` (via `ENCODER_ARGS`) |
 | `UNENCODED_DIR` | `$VIDEOS_BASE/unencoded` | `ingest.sh` holding directory (positional arg); `release.sh` `-S` |
 | `CRF` | `22` | `encode.sh` `-c` (via `ENCODER_ARGS`) |
@@ -195,8 +224,11 @@ Defines two independent variable groups, one for the video-library pipeline (fro
 | `INGEST_SETTLE_SECONDS` | `60` | `ingest.sh` `-w` |
 | `DOWNLOADS_BASE` | `$HOME/Downloads` | `rename.sh` and `ingest.sh` `-O` (lock/log location only, not the target) |
 | `DOWNLOADS_INPUT_DIR` | `$DOWNLOADS_BASE/Complete` | `rename.sh` and `ingest.sh` positional arg (the actual target) |
+| `NAS_MOUNT` | `/mnt/nas/plexmedia` | `archive.sh` `-m` (the share's mount point) |
+| `NAS_ARCHIVE_DIR` | `$NAS_MOUNT/#archive` | `archive.sh` positional arg (the destination) |
+| `ARCHIVE_SETTLE_SECONDS` | `60` | `archive.sh` `-w` |
 
-No paths or usernames are hardcoded — everything derives from `$HOME` unless overridden. `ENCODER_ARGS` is a prebuilt array (`-r -s -c "$CRF" -p "$PRESET" -o "$OUTPUT_DIR" -M "$ARCHIVE_DIR" -A "$BACKUP_DIR"`) that `media.sh encode` splices in ahead of `$INPUT_DIR`; there is no equivalent prebuilt array for rename, ingest or release, since each needs only the raw directory values passed directly. `media.sh release` passes `-O "$OUTPUT_DIR"`, so release logs sit beside the encoder's. `CRF`, `PRESET` and `INGEST_SETTLE_SECONDS` take overrides at call time; `INGEST_SETTLE_SECONDS=0 ./media.sh ingest -n` skips the settle wait.
+No paths or usernames are hardcoded — everything derives from `$HOME` unless overridden. `ENCODER_ARGS` is a prebuilt array (`-r -s -c "$CRF" -p "$PRESET" -o "$OUTPUT_DIR" -M "$ARCHIVE_DIR" -A "$BACKUP_DIR"`) that `media.sh encode` splices in ahead of `$INPUT_DIR`; there is no equivalent prebuilt array for rename, ingest or release, since each needs only the raw directory values passed directly. `media.sh release` and `media.sh archive` pass `-O "$OUTPUT_DIR"`, so their logs sit beside the encoder's. `NAS_MOUNT`, `CRF`, `PRESET`, `INGEST_SETTLE_SECONDS` and `ARCHIVE_SETTLE_SECONDS` take overrides at call time; `INGEST_SETTLE_SECONDS=0 ./media.sh ingest -n` skips the settle wait.
 
 `config.sh` does not set the maximum output height. The encoder's `-H` flag does (default 1080), so `media.sh` always uses 1080; call `encode.sh` directly to change it.
 
@@ -204,14 +236,15 @@ The label scripts do not source `config.sh`. They locate their own inputs and ou
 
 ## Concurrency lock
 
-`encode.sh`, `rename.sh`, `ingest.sh` and `release.sh` each take their own exclusive, non-blocking `flock`, once the directory they work from is ready: `encode.sh` creates `OUTPUT_DIR` first, and the others resolve the target's canonical path. A dry run of `rename.sh`, `ingest.sh` or `release.sh` takes no lock and writes no log. A second run against the same directory, from any invocation path (`media.sh`, or a script called directly), exits immediately with an error instead of racing. The lock releases automatically when the process exits, including on Ctrl-C.
+`encode.sh`, `rename.sh`, `ingest.sh`, `release.sh` and `archive.sh` each take their own exclusive, non-blocking `flock`, once the directory they work from is ready: `encode.sh` creates `OUTPUT_DIR` first, and the others resolve the target's canonical path. A dry run of `rename.sh`, `ingest.sh`, `release.sh` or `archive.sh` takes no lock and writes no log. A second run against the same directory, from any invocation path (`media.sh`, or a script called directly), exits immediately with an error instead of racing. The lock releases automatically when the process exits, including on Ctrl-C.
 
 No script's lock (or logs) live inside the directory being processed — each routes through an operational directory instead:
 - `encode.sh` locks `OUTPUT_DIR/.media.lock` and logs to `OUTPUT_DIR/Logs`, since `OUTPUT_DIR` is a working/encoding area, not a curated library.
 - `rename.sh` takes an `-O DIR` flag (operational directory) for the same purpose: `media.sh rename` passes `-O "$DOWNLOADS_BASE"`, so its lock (`DOWNLOADS_BASE/.locks/<hash-of-target>.lock`) and logs (`DOWNLOADS_BASE/Logs`) stay out of the actual rename target. Since `rename.sh` can also run standalone against any target, `-O` defaults to the script's own directory when omitted.
 - `ingest.sh` and `release.sh` take the same `-O DIR` flag with the same default. `media.sh ingest` passes `-O "$DOWNLOADS_BASE"` and `media.sh release` passes `-O "$OUTPUT_DIR"`. `ingest.sh` locks `DOWNLOADS_BASE/.locks/ingest_<hash-of-source>.lock`, named apart from `rename.sh`'s `<hash>.lock` for the same directory because it runs `rename.sh` as a child. `release.sh` locks `OUTPUT_DIR/.locks/release_<hash-of-input>.lock`. Neither takes `encode.sh`'s lock, since `encode.sh` lists its input files once at the start.
+- `archive.sh` takes `-O DIR` with the same meaning; `media.sh archive` passes `-O "$OUTPUT_DIR"`. It locks `OUTPUT_DIR/.locks/archive_<hash-of-source>.lock`. It does not take `encode.sh`'s lock: `encode.sh -M` copies into the directory `archive.sh` reads, and the settle window keeps `archive.sh` off a file still being written.
 
-`config.sh` and `media.sh` contain no locking logic — they're path/flag plumbing only. `encode.sh`, `rename.sh`, `ingest.sh` and `release.sh` can be run standalone, without going through `media.sh`, and are still protected.
+`config.sh` and `media.sh` contain no locking logic — they're path/flag plumbing only. `encode.sh`, `rename.sh`, `ingest.sh`, `release.sh` and `archive.sh` can be run standalone, without going through `media.sh`, and are still protected.
 
 The label scripts keep their lock files in `scripts/` instead, and remove them when a run ends:
 - `plex_labels.sh` takes `.plex_labels.lock` when it runs all three stages, so only one pipeline runs at a time.
@@ -295,7 +328,7 @@ Renames movie and TV-episode video and subtitle files into Plex convention. The 
   - **Release-folder subtitles:** a subtitle named only `<track> <language>` (`2 English.srt`, `3_English.srt`) under a show folder takes its episode from the nearest folder above it with an `SxxEyy` token and becomes `Series - SxxEyy.en.srt`.
   - **Subtitles below their video:** a subtitle in a folder with no video of its own (`Subs`, `Subtitles`), named only by a language (`English.srt`, `2_English.srt`, `English.forced.srt`) or carrying a language tag, with no episode in its name or folders, is renamed after the single video in the nearest folder above it that holds videos and moved beside it (`Movie Name (2010).en.srt`). If that folder holds several videos, or the video was not renamed, the subtitle is left and reported as no match. With `-F` they stay in their folder and follow the ordinary rules.
   - **Two tracks of one language:** the one with more lines containing `[` or `]` (sound descriptions) becomes `.en.cc.srt` and the other `.en.srt`. With equal counts the first in byte-order sort of the names is the plain one. The track number is ignored. A third or later track is skipped.
-- **Title casing:** Title Case small words (`a an and but by for in nor of on or the to at`) inside movie, series and episode titles and extra names are lowercased in file and folder names (`Alice In Wonderland` becomes `Alice in Wonderland`). The first and last word, a word after a colon or dash, and all-caps words are left alone, and nothing is capitalized.
+- **Title casing:** Title Case small words (`a an and but by for in nor of on or the to at`) inside movie, series and episode titles and extra names are lowercased in file and folder names (`Title In Name` becomes `Title in Name`). The first and last word, a word after a colon or dash, and all-caps words are left alone, and nothing is capitalized.
 
 Skipped and logged rather than guessed: an unrecognized subtitle language or modifier, ranged or multi-episode numbering (`S01E01-E02`, `S01E01E02`), a movie name with no year, and a rename target that already exists (unless `-f`, which asks for a typed `yes` before overwriting). The script refuses to run as root, so the folders and logs it creates belong to the library's owner. The script's header comment has the full name-parsing rules and known limitations; `-h` has usage.
 
@@ -321,7 +354,7 @@ Exit codes: `0` nothing to do, not settled yet, or every entry moved; `1` a fail
 
 ### Timer units
 
-`install_units.sh` writes `media_ingest.service` and `media_ingest.timer` under `~/.config/systemd/user`. The service runs `<scripts directory>/media.sh ingest` once (`Type=oneshot`). The timer starts it 2 minutes after the user manager starts (`OnStartupSec`) and `-i` minutes (default 5) after each run ends (`OnUnitInactiveSec`), so runs never overlap. An existing unit file is left in place unless `-f` is given. It prints the `systemctl` commands that enable the timer and does not run them. It refuses a scripts path containing whitespace, `%`, `$`, a quote or a backslash, since systemd would misread it in `ExecStart`.
+`install_units.sh` writes `media_<stage>.service` and `media_<stage>.timer` under `~/.config/systemd/user`, where `-s` picks the stage (`ingest` by default, or `archive`). The service runs `<scripts directory>/media.sh <stage>` once (`Type=oneshot`). The timer starts it 2 minutes after the user manager starts (`OnStartupSec`) and `-i` minutes (default 5) after each run ends (`OnUnitInactiveSec`), so runs never overlap. An existing unit file is left in place unless `-f` is given. It prints the `systemctl` commands that enable the timer and does not run them. It refuses a scripts path containing whitespace, `%`, `$`, a quote or a backslash, since systemd would misread it in `ExecStart`.
 
 ## `release.sh`
 
@@ -334,6 +367,22 @@ Moves entries from the holding directory to the encoder's input directory. It ta
 - `-n` previews the moves without a lock or a log. A real run logs to `OPDIR/Logs/Release_<date>_<time>.txt`.
 
 Exit codes: `1` when a move fails or the lock is held; skipped and unmatched items do not change the status. It is safe while an encode runs, because `encode.sh` lists its input files once at the start, so a released entry waits for the next encode. It refuses to run as root.
+
+## `archive.sh`
+
+Moves encoded files from the local archive directory to the NAS archive directory. It takes `-m <mount_point> <source_dir> <nas_archive_dir>`; `media.sh archive` passes `$NAS_MOUNT`, `$ARCHIVE_DIR` and `$NAS_ARCHIVE_DIR`. Options: `-n` (dry run), `-w SECONDS` (settle window, default 60, `0` skips the check), `-s` (verify by size only) and `-O DIR` (operational directory).
+
+- **Categories.** Each top-level directory of the source is a category and must already exist on the NAS; the script never creates one. Files under it keep their relative path and merge into the show and movie folders already there, at file level. A top-level entry that is not a category folder on the NAS (a loose file, or a title folder not yet placed in a category) stays in the source and is reported. `encode.sh -r` mirrors the `$INPUT_DIR` layout into `$ARCHIVE_DIR`, and `release.sh` moves entries to the root of `$INPUT_DIR`, so an entry reaches `$ARCHIVE_DIR` under a category only when it was placed in one before the encode.
+- **Mount check.** `-m` must be a mount point and the NAS directory must lie under it, or the run ends with exit 1 before any work, so an unmounted share is never mistaken for an empty one.
+- **Settle.** A file modified within the last `-w` seconds is skipped and listed as waiting; the next run retries it. `encode.sh -M` writes straight to the final name in `$ARCHIVE_DIR`, so a copy in progress has a recent modification time.
+- **Move.** Per file: copy to a hidden `.<name>.tmp` beside the destination, compare size and contents (`cmp`; size only with `-s`), confirm the source's size and modification time did not change during the copy, rename into place with `mv -n`, then delete the source. A failed step removes the partial copy and keeps the source. Folders emptied by the moves are removed, innermost first; the category folders stay.
+- **Collisions.** A destination that already exists is never overwritten. The source stays and is reported as a collision, with the size comparison in the message.
+
+A real run writes `OPDIR/Logs/Archive_<date>_<time>.txt`. Exit codes: `0` nothing to do, files still waiting, or every file moved; `1` a failed copy, verification or delete, a held lock, an unmounted share or bad usage; `2` a collision, or a top-level entry that is not a category folder on the NAS. It refuses to run as root and needs bash 4.0+, `flock`, `mountpoint`, `sha256sum`, `realpath` and `cmp`.
+
+Known limitation: a writer that stalls for longer than the settle window leaves a partial file that looks finished. The size and modification-time recheck catches a file that grows during the copy, not one that has stopped growing short of its full size.
+
+Known limitation: a file whose name the share rejects fails the copy, stays in the source, and is reported again by every run. The mount options decide which names are rejected (`mapposix` and `mapchars` in `mount.cifs(8)`, passed with `setup_smb_mount.sh -o`); the default translates none of the reserved characters.
 
 ## Subtitle tag stripping (`strip_subtitle_tags.py`)
 
@@ -435,11 +484,11 @@ Without `PLEX_LIBRARY` or `--library` every show and movie library on the server
 
 ### Logs and exit codes
 
-Logs go to `plex/logs/` (the `logs` directory beside `scripts/`): `get_plex_labels.log`, `apply_plex_labels.log`. Exit codes for stages 1 and 2: `0` complete, `1` aborted (outage, bad credentials, repeated failures, bad input), `2` complete but some lookups failed or rows went unmatched. A re-run retries only the failed lookups. `encode.sh` and `rename.sh` exit `0` when no file failed and `1` when any did; skipped and unmatched files do not change the status, except with `rename.sh -x`, which then exits `2`. `ingest.sh` and `release.sh` exit as described in their sections.
+Logs go to `plex/logs/` (the `logs` directory beside `scripts/`): `get_plex_labels.log`, `apply_plex_labels.log`. Exit codes for stages 1 and 2: `0` complete, `1` aborted (outage, bad credentials, repeated failures, bad input), `2` complete but some lookups failed or rows went unmatched. A re-run retries only the failed lookups. `encode.sh` and `rename.sh` exit `0` when no file failed and `1` when any did, and `encode.sh` also exits `1` with "No video files found." when its input holds none; skipped and unmatched files do not change the status, except with `rename.sh -x`, which then exits `2`. `ingest.sh`, `release.sh` and `archive.sh` exit as described in their sections.
 
 ### Flag conventions
 
-`-n` (or `--dry-run` on the Python tools and `plex_labels.sh`) is a dry run everywhere, and `-f` (or `--force`) is a force flag, except in `encode.sh`, where `-f` selects the output container and `-F` selects flat output; in `rename.sh` and `setup_smb_mount.sh` `-f` forces and `-F` (renamer) restricts the run to files. `encode.sh -o DIR` is the output directory and `rename.sh -O DIR` the operational directory; `ingest.sh` and `release.sh` take `-O DIR` with the same meaning. `rename.sh -x` is the attention exit. `ingest.sh -w` is the settle window. `release.sh -S` and `-D` name the holding and input directories and `-a` releases everything. `install_units.sh -i` is the interval in minutes and `-f` overwrites existing unit files.
+`-n` (or `--dry-run` on the Python tools and `plex_labels.sh`) is a dry run everywhere, and `-f` (or `--force`) is a force flag, except in `encode.sh`, where `-f` selects the output container and `-F` selects flat output; in `rename.sh` and `setup_smb_mount.sh` `-f` forces and `-F` (renamer) restricts the run to files. `encode.sh -o DIR` is the output directory and `rename.sh -O DIR` the operational directory; `ingest.sh` and `release.sh` take `-O DIR` with the same meaning. `rename.sh -x` is the attention exit. `ingest.sh -w` is the settle window. `release.sh -S` and `-D` name the holding and input directories and `-a` releases everything. `setup_smb_mount.sh -o` is extra mount options, as in `mount -o`. `archive.sh -m` is the NAS mount point it requires, `-w` its settle window and `-s` size-only verification. `install_units.sh -s` is the stage (`ingest` or `archive`), `-i` the interval in minutes and `-f` overwrites existing unit files.
 
 ### Known limitations
 

@@ -2,7 +2,8 @@
 # setup_smb_mount.sh: Mounts a CIFS/SMB share (e.g. a NAS) as a
 # stable local mountpoint, owned by a real (non-root) user, via
 # /etc/fstab - so batch tools in this project that refuse to run as root
-# (encode.sh, rename.sh) can read/write it directly.
+# (archive.sh by default; the others when pointed at the share) can
+# read/write it directly.
 #
 # This is a one-time system-setup script and is the one place in this
 # project that's SUPPOSED to run as root: installing a package, writing
@@ -14,8 +15,9 @@
 #
 # Usage:  sudo ./setup_smb_mount.sh [OPTIONS] <server> <share> <mountpoint>
 #
-# Example:
+# Examples:
 #   sudo ./setup_smb_mount.sh -p Movies nas.local media /mnt/nas/movies
+#   sudo ./setup_smb_mount.sh nas.local plexmedia /mnt/nas/plexmedia
 #
 # Options:
 #   -p PATH     Subpath within the share to mount, appended to the UNC path
@@ -27,6 +29,9 @@
 #   -c FILE     Path for the SMB credentials file. Default:
 #               /etc/samba/credentials/<share>.
 #   -v VERS     SMB protocol version. Default: 3.0.
+#   -o OPTS     Extra mount options, comma-separated, appended to the fstab
+#               line after the fixed ones (e.g. "iocharset=utf8,mapposix").
+#               No whitespace. Default: none.
 #   -f          Force: overwrite an existing /etc/fstab entry for this
 #               mountpoint, or an existing credentials file, instead of
 #               leaving it in place (default: leave it in place, skip).
@@ -38,8 +43,8 @@
 #   -h          Show this help.
 #
 # Notes:
-#   * Requires bash 4.0+ and apt-get (Debian/Ubuntu); installs cifs-utils
-#     if it isn't already present.
+#   * Requires bash 4.0+, mountpoint and runuser, and apt-get (Debian/Ubuntu);
+#     installs cifs-utils if it isn't already present.
 #   * The credentials file is always root-owned, mode 600, regardless of
 #     -u: mount.cifs itself reads it as root during the mount, before any
 #     uid/gid mapping happens for the files inside.
@@ -50,6 +55,15 @@
 #   * A space in <server>/<share>/-p PATH/<mountpoint> is escaped to \040
 #     automatically when building the fstab line, since fstab fields are
 #     whitespace-delimited and an unescaped space silently breaks the line.
+#   * A "#" in <server>, <share>, -p PATH or <mountpoint> is refused: how an
+#     fstab field holding one is parsed is unconfirmed, so no line is written
+#     for it. To use a folder whose name has a "#", mount the share root and
+#     name the folder in the caller's own configuration.
+#   * -o OPTS is appended to the mount options as written, after the fixed
+#     ones (uid, gid, file_mode, dir_mode, vers, _netdev, nofail).
+#   * A target user that resolves to root is refused: the project's batch
+#     tools refuse to run as root, and a mount owned by uid 0 is not writable
+#     by anyone else.
 #   * Out of scope, deliberately: this is a single, short-lived
 #     provisioning run, not a recurring batch job, so it doesn't take a
 #     concurrency lock or register a state-restoring EXIT trap the way the
@@ -70,6 +84,7 @@ SUBPATH=""
 TARGET_USER="${SUDO_USER:-${USER:-}}"
 CRED_FILE=""
 VERS="3.0"
+MOUNT_OPTS=""
 FORCE=0
 DRY_RUN=0
 SKIP_MOUNT=0
@@ -81,12 +96,13 @@ usage() {
 }
 
 # -- Arg parsing -------------------------------------------------------------------
-while getopts ":p:u:c:v:fnh" opt; do
+while getopts ":p:u:c:v:o:fnh" opt; do
     case $opt in
         p) SUBPATH="$OPTARG" ;;
         u) TARGET_USER="$OPTARG" ;;
         c) CRED_FILE="$OPTARG" ;;
         v) VERS="$OPTARG" ;;
+        o) MOUNT_OPTS="$OPTARG" ;;
         f) FORCE=1 ;;
         n) DRY_RUN=1 ;;
         h) usage ;;
@@ -104,6 +120,15 @@ shift $(( OPTIND - 1 ))
 SERVER="$1"
 SHARE="$2"
 MOUNTPOINT="${3%/}"
+
+if [[ "$SERVER$SHARE$SUBPATH$MOUNTPOINT" == *"#"* ]]; then
+    echo "ERROR: '#' in the server, share, subpath or mount point is not supported." >&2
+    exit 1
+fi
+if [[ "$MOUNT_OPTS" == *[[:space:]]* ]]; then
+    echo "ERROR: -o takes comma-separated options with no whitespace." >&2
+    exit 1
+fi
 
 [[ -n "$TARGET_USER" ]] || {
     echo "ERROR: could not determine a target user; pass -u USER explicitly." >&2
@@ -136,6 +161,8 @@ require id
 require grep
 require sed
 require awk
+require mountpoint
+require runuser
 if ! command -v mount.cifs &>/dev/null; then
     require apt-get
 fi
@@ -144,15 +171,16 @@ fi
 # literal space in any of the four path components to \040 - fstab fields
 # are whitespace-delimited, and an unescaped space silently breaks the
 # line rather than erroring, so this is done unconditionally rather than
-# only when a space happens to be spotted.
+# only when a space happens to be spotted. EXTRA_OPTS, when non-empty, is
+# appended to the mount options as written.
 build_fstab_line() {
     local server="$1" share="$2" subpath="$3" mountpoint="$4" \
-          cred_file="$5" uid="$6" gid="$7" vers="$8"
+          cred_file="$5" uid="$6" gid="$7" vers="$8" extra_opts="$9"
     local unc="//${server}/${share}"
     [[ -n "$subpath" ]] && unc="${unc}/${subpath}"
     unc="${unc// /\\040}"
     local mp_escaped="${mountpoint// /\\040}"
-    FSTAB_LINE="${unc} ${mp_escaped} cifs credentials=${cred_file},uid=${uid},gid=${gid},file_mode=0664,dir_mode=0775,vers=${vers},_netdev,nofail 0 0"
+    FSTAB_LINE="${unc} ${mp_escaped} cifs credentials=${cred_file},uid=${uid},gid=${gid},file_mode=0664,dir_mode=0775,vers=${vers},_netdev,nofail${extra_opts:+,${extra_opts}} 0 0"
 }
 
 # Tests whether FSTAB_FILE already has a non-comment entry whose mountpoint
@@ -196,6 +224,10 @@ TARGET_GID="$(id -g "$TARGET_USER" 2>/dev/null)" || {
     echo "ERROR: could not resolve a primary group for: $TARGET_USER" >&2
     exit 1
 }
+if (( TARGET_UID == 0 )); then
+    echo "ERROR: the target user resolves to root; the project's batch tools refuse to run as root and could not write to the mount. Pass -u USER." >&2
+    exit 1
+fi
 echo "  User: $TARGET_USER (uid=$TARGET_UID, gid=$TARGET_GID)"
 
 echo ""
@@ -236,7 +268,9 @@ else
     echo ""
     CRED_DIR="$(dirname "$CRED_FILE")"
     mkdir -p -- "$CRED_DIR"
-    CRED_TMP="$(mktemp)"
+    # Created beside the target, as in replace_fstab_entry: a mv across
+    # filesystems is a copy and delete, not an atomic rename.
+    CRED_TMP="$(mktemp "${CRED_FILE}.XXXXXX")"
     {
         printf 'username=%s\n' "$SMB_USERNAME"
         printf 'password=%s\n' "$SMB_PASSWORD"
@@ -250,7 +284,7 @@ fi
 
 echo ""
 echo "== Step 4/6: /etc/fstab entry =="
-build_fstab_line "$SERVER" "$SHARE" "$SUBPATH" "$MOUNTPOINT" "$CRED_FILE" "$TARGET_UID" "$TARGET_GID" "$VERS"
+build_fstab_line "$SERVER" "$SHARE" "$SUBPATH" "$MOUNTPOINT" "$CRED_FILE" "$TARGET_UID" "$TARGET_GID" "$VERS" "$MOUNT_OPTS"
 MOUNTPOINT_ESCAPED="${MOUNTPOINT// /\\040}"
 
 if fstab_has_entry "$FSTAB_PATH" "$MOUNTPOINT_ESCAPED"; then
@@ -297,12 +331,16 @@ fi
 echo ""
 echo "== Step 6/6: confirm =="
 if (( DRY_RUN )); then
-    echo "  [DRY RUN] Would run: mount | grep -F \"$MOUNTPOINT\"; ls -la \"$MOUNTPOINT\""
+    echo "  [DRY RUN] Would check: mountpoint -q \"$MOUNTPOINT\"; write access for $TARGET_USER; ls -la \"$MOUNTPOINT\""
 elif (( SKIP_MOUNT )); then
     echo "  Skipped (mount step skipped above)."
 else
-    mount | grep -F "$MOUNTPOINT" || {
-        echo "  WARNING: mount succeeded but was not found in the mount table - check manually." >&2
+    mountpoint -q -- "$MOUNTPOINT" || {
+        echo "  WARNING: mount succeeded but $MOUNTPOINT is not a mount point - check manually." >&2
+        exit 1
+    }
+    runuser -u "$TARGET_USER" -- test -w "$MOUNTPOINT" || {
+        echo "  WARNING: $TARGET_USER cannot write to $MOUNTPOINT - check the SMB account's permissions on the share." >&2
         exit 1
     }
     echo ""
@@ -310,4 +348,4 @@ else
 fi
 
 echo ""
-echo "Done. Point this project's scripts at: $MOUNTPOINT"
+echo "Done. Set NAS_MOUNT to $MOUNTPOINT (environment or config.sh) for media.sh archive."

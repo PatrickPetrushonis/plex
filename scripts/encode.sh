@@ -21,7 +21,7 @@
 #                   input is a file or glob; ignored for directory inputs unless set)
 #   -n              Dry run: print decisions, do not encode
 #   -s              Skip if output file already exists (default: overwrite)
-#   -M PATH         After encode: cp output to this path (NAS/SMB mount), verify size, remove original
+#   -M PATH         After encode: cp output to this path (a local staging directory or a NAS/SMB mount), verify size, remove original
 #   -A PATH         After encode: mv source input and its muxed sidecar subtitle files to this
 #                   path, mirroring directory structure (flat by file name for file and glob inputs)
 #   -S MODE         Subtitle delivery (default: @DEFAULT_SUB_MODE@): embed muxes subtitles into
@@ -699,6 +699,7 @@ archive_output() {
     cp -- "$SRC" "$DEST" || {
         echo " WARNING: cp failed: $SRC -> $DEST" >&2
         log "ARCHIVE FAILED (cp): $SRC"
+        rm -f -- "$DEST"
         return 1
     }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # media.sh: Runs a pipeline stage with the settings in config.sh.
 #
-# Usage: ./media.sh <encode|rename|ingest|release> [-n] [release options and items]
+# Usage: ./media.sh <encode|rename|ingest|release|archive> [-n] [release options and items]
 #   encode   Runs encode.sh on $INPUT_DIR.
 #   rename   Runs rename.sh on $DOWNLOADS_INPUT_DIR, renaming the files into Plex naming.
 #   ingest   Runs ingest.sh: waits for $DOWNLOADS_INPUT_DIR to settle, previews the rename,
@@ -11,7 +11,11 @@
 #   release  Runs release.sh: moves held entries from $UNENCODED_DIR to $INPUT_DIR.
 #            Everything after "release" goes to release.sh: -a (all), item names, and --
 #            to end the options. With neither -a nor an item, it lists the held entries.
-#   -n       Dry run: preview only, writes nothing and renames nothing. Run this first.
+#   archive  Runs archive.sh: moves the encoded files in $ARCHIVE_DIR to $NAS_ARCHIVE_DIR,
+#            category by category, merging into the folders already there. Needs the share
+#            mounted at $NAS_MOUNT. Exits 2 when a file collides or a top-level entry is not
+#            a category folder on the NAS.
+#   -n      Dry run: preview only, writes nothing and renames nothing. Run this first.
 #   -h       Show this help
 #
 # Prints [DRY RUN] or [LIVE] first, so a real run is never mistaken for a preview.
@@ -50,15 +54,15 @@ while (( $# )); do
     case "$arg" in
         -n) DRY_ARGS=(-n); MODE="DRY RUN" ;;
         -h|--help) usage ;;
-        encode|rename|ingest|release)
+        encode|rename|ingest|release|archive)
             [[ -z "$COMMAND" ]] || { echo "ERROR: more than one command: $COMMAND, $arg" >&2; exit 1; }
             COMMAND="$arg" ;;
         *) echo "ERROR: unknown argument: $arg" >&2
-           echo "Usage: $0 <encode|rename|ingest|release> [-n]" >&2
+           echo "Usage: $0 <encode|rename|ingest|release|archive> [-n]" >&2
            exit 1 ;;
     esac
 done
-[[ -n "$COMMAND" ]] || { echo "Usage: $0 <encode|rename|ingest|release> [-n]" >&2; exit 1; }
+[[ -n "$COMMAND" ]] || { echo "Usage: $0 <encode|rename|ingest|release|archive> [-n]" >&2; exit 1; }
 
 echo "[$MODE] media.sh $COMMAND"
 
@@ -81,5 +85,10 @@ case "$COMMAND" in
         # -O puts release logs beside encode.sh's in $OUTPUT_DIR/Logs.
         ./release.sh ${DRY_ARGS[@]+"${DRY_ARGS[@]}"} -S "$UNENCODED_DIR" -D "$INPUT_DIR" \
             -O "$OUTPUT_DIR" ${PASS_ARGS[@]+"${PASS_ARGS[@]}"}
+        ;;
+    archive)
+        # -O puts archive logs beside encode.sh's and release.sh's in $OUTPUT_DIR/Logs.
+        ./archive.sh ${DRY_ARGS[@]+"${DRY_ARGS[@]}"} -m "$NAS_MOUNT" -w "$ARCHIVE_SETTLE_SECONDS" \
+            -O "$OUTPUT_DIR" "$ARCHIVE_DIR" "$NAS_ARCHIVE_DIR"
         ;;
 esac
