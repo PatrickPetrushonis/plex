@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# encode_args.sh: The ffmpeg argument builders for encode.sh: video (copy, or x264
+# media_encode_args.sh: The ffmpeg argument builders for media_encode.sh: video (copy, or x264
 # re-encode with HDR-to-SDR tone-mapping), audio (copy, or aac) and the selection of
 # embedded subtitle tracks. Each builder appends to the array named by its first
 # argument and prints its per-stream decision to stdout; none runs ffmpeg or ffprobe,
 # or creates, reads or changes a file.
 #
-# Sourced by encode.sh. The caller provides, before calling into this file:
+# Sourced by media_encode.sh. The caller provides, before calling into this file:
 #   MAX_HEIGHT, MAX_COPY_KBPS, SDR_TONEMAP_CHAIN, CRF, PRESET, TUNE
 #                                                read by build_video_args()
 #   AUDIO_COPY_CODECS, AUDIO_BITRATE             read by build_audio_args()
@@ -22,7 +22,7 @@
 # Not intended to be run standalone.
 #
 # shellcheck disable=SC2034
-# File-wide: SIDECAR_EXTRACT_LINES is appended to here and read by encode.sh;
+# File-wide: SIDECAR_EXTRACT_LINES is appended to here and read by media_encode.sh;
 # the checker cannot see across that boundary when this file is checked
 # standalone.
 

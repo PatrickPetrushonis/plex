@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# rename_parse.sh: Name parsing for rename.sh: turns a raw file or folder name
+# media_rename_parse.sh: Name parsing for media_rename.sh: turns a raw file or folder name
 # into a Plex-convention movie or episode name, and reads language, modifier and
 # edition tags. The functions work on their arguments and report through the
 # globals documented above each one; none reads or writes the filesystem.
 #
-# Sourced by rename.sh. The caller provides, before calling into this file:
+# Sourced by media_rename.sh. The caller provides, before calling into this file:
 #   LANG_ALIASES         assoc array from lang_table.sh, read by normalize_lang()
 #   SUPPORTED_SUB_LANGS  space-separated 2-letter codes, read by is_supported_lang()
 #   TARGET_DIR           the directory being processed, read by season_folder_above()
@@ -13,7 +13,7 @@
 #
 # shellcheck disable=SC2034
 # File-wide: the PARSED_* results and the other globals set here are read by
-# rename.sh; shellcheck cannot see across that boundary standalone.
+# media_rename.sh; shellcheck cannot see across that boundary standalone.
 
 # Include guard: safe to source twice.
 [[ -n "${RENAME_PARSE_LOADED:-}" ]] && return 0
@@ -29,7 +29,7 @@ normalize_lang() {
 # Returns 0 when CODE (a 2-letter language code) is in SUPPORTED_SUB_LANGS.
 is_supported_lang() { [[ " $SUPPORTED_SUB_LANGS " == *" $1 "* ]]; }
 
-# Only cc, sdh, and forced are meaningful to encode.sh's sidecar
+# Only cc, sdh, and forced are meaningful to media_encode.sh's sidecar
 # lookup. Anything else comes back empty and the caller treats it as unknown
 # rather than writing a modifier the encoder will never match.
 normalize_modifier() {
@@ -389,7 +389,7 @@ extract_known_edition() {
 # Core name parser for MOVIES. Sets PARSED_OK, PARSED_TITLE, PARSED_YEAR,
 # PARSED_EDITION from an already-prefix-stripped name with no extension (a
 # file basename with its extension already stripped, or a directory
-# basename). See "Name parsing" in rename.sh's header comment for the heuristic.
+# basename). See "Name parsing" in media_rename.sh's header comment for the heuristic.
 # PARSED_OK=0 means no usable year was found; the other PARSED_* vars are
 # meaningless in that case.
 parse_media_name() {

@@ -21,7 +21,7 @@
 # scanned here):
 #   TEXT_RISK   codec is subrip or mov_text: plain text, can carry a
 #               leftover ASS override tag as literal on-screen text.
-#               encode.sh -S sidecar extracts it as a tag-stripped
+#               media_encode.sh -S sidecar extracts it as a tag-stripped
 #               sidecar; -S embed muxes a tag-stripped copy.
 #   ASS_NATIVE  codec is ass or ssa: override tags here are genuine
 #               positioning/styling, correctly rendered by an ASS-capable
@@ -30,9 +30,9 @@
 #               image-based, no text tags possible.
 #   OTHER       any other codec_name ffprobe reports.
 #
-# Run this before an encode.sh run to see which files have TEXT_RISK
+# Run this before an media_encode.sh run to see which files have TEXT_RISK
 # tracks. A TEXT_RISK track with a sidecar of the same language and type is not
-# muxed: the sidecar replaces it (discover_sidecar_subs() in encode.sh).
+# muxed: the sidecar replaces it (discover_sidecar_subs() in media_encode.sh).
 
 set -euo pipefail
 
@@ -164,7 +164,7 @@ echo "  Files with >=1 TEXT_RISK (subrip/mov_text) embedded track: ${FILES_WITH_
 echo "  Files with no embedded subtitle streams at all:            ${FILES_WITH_NO_SUBS} / ${#ALL_FILES[@]}"
 echo "-------------------------------------------------------------------------"
 echo "  Note: a file's sidecar subtitle of the same language and type replaces"
-echo "  its embedded track in encode.sh."
+echo "  its embedded track in media_encode.sh."
 
 if [[ -n "$REPORT_FILE" ]]; then
     {

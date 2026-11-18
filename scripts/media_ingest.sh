@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# ingest.sh: Rename finished downloads into Plex naming and move them to the
+# media_ingest.sh: Rename finished downloads into Plex naming and move them to the
 #            holding directory, stopping for a person only when something
 #            needs a decision.
 #
-# Usage:  ./ingest.sh [OPTIONS] <source_dir> <holding_dir>
+# Usage:  ./media_ingest.sh [OPTIONS] <source_dir> <holding_dir>
 #
 # Steps, in order, against <source_dir> (the completed-downloads directory):
 #   1. Settle check: the files under <source_dir> must be unchanged across the
 #      settle window (-w). A directory that is still changing ends the run with
 #      exit 0; the next run tries again.
-#   2. Preview: rename.sh -n -x on the whole directory. A skipped, unmatched or
+#   2. Preview: media_rename.sh -n -x on the whole directory. A skipped, unmatched or
 #      to-be-deleted file stops the run with exit 2 before anything changes.
-#   3. Rename: rename.sh -x with no input attached, so a subtitle-deletion
+#   3. Rename: media_rename.sh -x with no input attached, so a subtitle-deletion
 #      prompt is answered "no" instead of blocking an unattended run. Any
 #      non-zero exit stops the run before the move.
 #   4. Move: every top-level entry of <source_dir> that holds a video file moves
@@ -39,16 +39,16 @@
 #
 # Exit codes:
 #   0  Nothing to do, directory not settled yet, or every entry moved
-#   1  rename.sh failed, a move failed, or bad usage
+#   1  media_rename.sh failed, a move failed, or bad usage
 #   2  Something needs a person (see Ingest_review.txt)
 #
 # Notes:
 #   • Refuses to run as root: the folders and logs it creates must belong to
 #     the user who owns the library
 #   • Requires bash 4.4+ (mapfile -d), GNU find (-printf), flock, sha256sum,
-#     realpath, and rename.sh and video_exts.sh alongside this script
+#     realpath, and media_rename.sh and video_exts.sh alongside this script
 #   • One run per <source_dir> at a time; a second run exits 1 immediately. The
-#     lock file is named ingest_<hash>.lock, apart from rename.sh's
+#     lock file is named ingest_<hash>.lock, apart from media_rename.sh's
 #     <hash>.lock for the same directory, so the two never block each other
 #   • A run that finds both directories exactly as the last non-zero run left
 #     them repeats that exit code at once, with no settle wait, rename or log
@@ -135,14 +135,14 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -z "$OPERATIONAL_DIR" ]] && OPERATIONAL_DIR="$SCRIPT_DIR"
 
-RENAME_SH="${SCRIPT_DIR}/rename.sh"
+RENAME_SH="${SCRIPT_DIR}/media_rename.sh"
 [[ -x "$RENAME_SH" ]] || {
-    echo "ERROR: rename.sh not found or not executable next to this script (${SCRIPT_DIR})" >&2
+    echo "ERROR: media_rename.sh not found or not executable next to this script (${SCRIPT_DIR})" >&2
     exit 1
 }
 
 # Video extensions (video_exts.sh, alongside this script): the same list
-# rename.sh and encode.sh read.
+# media_rename.sh and media_encode.sh read.
 [[ -r "${SCRIPT_DIR}/video_exts.sh" ]] || {
     echo "ERROR: video_exts.sh not found next to this script (${SCRIPT_DIR})" >&2
     exit 1
@@ -166,7 +166,7 @@ fi
 LOCK_FILE=""
 WORK_DIR=""
 
-# Concurrency lock, on descriptor 7 (rename.sh uses 8 and 9, and runs as a
+# Concurrency lock, on descriptor 7 (media_rename.sh uses 8 and 9, and runs as a
 # child of this script). A dry run only reads: it takes no lock and creates no
 # directory or file.
 LOG_FILE="/dev/null"
@@ -390,7 +390,7 @@ else
 fi
 
 # 2. PREVIEW
-echo "=== Preview: rename.sh -n -x ==="
+echo "=== Preview: media_rename.sh -n -x ==="
 PREVIEW_RC=0
 if (( DRY_RUN )); then
     "$RENAME_SH" -n -x -O "$OPERATIONAL_DIR" "$SOURCE_DIR" || PREVIEW_RC=$?
@@ -408,7 +408,7 @@ if (( PREVIEW_RC != 0 )); then
     (( DRY_RUN )) && exit "$PREVIEW_RC"
     log "PREVIEW exit $PREVIEW_RC: $SOURCE_DIR"
     stop_for_review "$PREVIEW_RC" \
-        "rename.sh -n -x exited $PREVIEW_RC on $SOURCE_DIR. Resolve the items below, or run rename.sh -n on it to see them again." \
+        "media_rename.sh -n -x exited $PREVIEW_RC on $SOURCE_DIR. Resolve the items below, or run media_rename.sh -n on it to see them again." \
         "$PREVIEW_FILE"
 fi
 if (( DRY_RUN )); then
@@ -417,17 +417,17 @@ if (( DRY_RUN )); then
 fi
 
 # 3. RENAME
-echo "=== Rename: rename.sh -x ==="
+echo "=== Rename: media_rename.sh -x ==="
 log "Rename started: $SOURCE_DIR"
 RENAME_RC=0
 RENAME_FILE="${WORK_DIR}/rename.txt"
 "$RENAME_SH" -x -O "$OPERATIONAL_DIR" "$SOURCE_DIR" < /dev/null > "$RENAME_FILE" 2>&1 || RENAME_RC=$?
 cat -- "$RENAME_FILE"
 if (( RENAME_RC != 0 )); then
-    echo "STOPPED: rename.sh exited $RENAME_RC; nothing was moved." >&2
+    echo "STOPPED: media_rename.sh exited $RENAME_RC; nothing was moved." >&2
     log "RENAME exit $RENAME_RC: $SOURCE_DIR"
     stop_for_review "$RENAME_RC" \
-        "rename.sh -x exited $RENAME_RC on $SOURCE_DIR after a clean preview. Nothing was moved." \
+        "media_rename.sh -x exited $RENAME_RC on $SOURCE_DIR after a clean preview. Nothing was moved." \
         "$RENAME_FILE"
 fi
 

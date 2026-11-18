@@ -30,7 +30,7 @@ UNENCODED_DIR="$VIDEOS_BASE/unencoded"
 
 DOWNLOADS_INPUT_DIR="$DOWNLOADS_BASE/Complete"
 
-# NAS folder that archive.sh fills from $ARCHIVE_DIR.
+# NAS folder that media_archive.sh fills from $ARCHIVE_DIR.
 NAS_ARCHIVE_DIR="$NAS_MOUNT/#archive"
 
 CRF="${CRF:-20}"
@@ -49,7 +49,7 @@ MAX_COPY_KBPS="${MAX_COPY_KBPS:-8000}"
 INGEST_SETTLE_SECONDS="${INGEST_SETTLE_SECONDS:-60}"
 
 # Seconds a file in $ARCHIVE_DIR must have gone unmodified before archive moves it,
-# so a copy encode.sh -M is still writing is not picked up; 0 skips the check.
+# so a copy media_encode.sh -M is still writing is not picked up; 0 skips the check.
 ARCHIVE_SETTLE_SECONDS="${ARCHIVE_SETTLE_SECONDS:-60}"
 
 ENCODER_ARGS=(-r -s -c "$CRF" -p "$PRESET" -K "$MAX_COPY_KBPS" -o "$OUTPUT_DIR" -M "$ARCHIVE_DIR" -A "$BACKUP_DIR")

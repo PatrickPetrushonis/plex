@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# release.sh: Move entries from the holding directory to the encoder's input
+# media_release.sh: Move entries from the holding directory to the encoder's input
 #             directory. This is the one deliberate step between a held
 #             download and an encode.
 #
-# Usage:  ./release.sh -S <holding_dir> -D <input_dir> [OPTIONS] [-a | ITEM...]
+# Usage:  ./media_release.sh -S <holding_dir> -D <input_dir> [OPTIONS] [-a | ITEM...]
 #
 # ITEM is the name of a top-level entry in <holding_dir>, with no path. Options
 # go before the items. With no ITEM and no -a, the held entries are listed and
@@ -26,7 +26,7 @@
 #   • Requires bash 4.0+, GNU find (-printf), flock, sha256sum and realpath
 #   • A target that already exists in <input_dir> is skipped and logged, never
 #     overwritten or merged: mv would nest a directory inside an existing one
-#   • Safe while an encode runs: encode.sh lists its input files once at the
+#   • Safe while an encode runs: media_encode.sh lists its input files once at the
 #     start, so a released entry waits for the next encode
 #   • Only one run may target a given <input_dir> at a time; a second run exits
 #     1 immediately

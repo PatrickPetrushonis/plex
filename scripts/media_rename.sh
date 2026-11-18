@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# rename.sh: Rename movie AND TV episode video/subtitle files (and
+# media_rename.sh: Rename movie AND TV episode video/subtitle files (and
 #                  optionally their containing directories) into Plex naming
 #                  convention. Handles both already-Plex-formatted names and
 #                  raw scene-release names — see "Name parsing" below.
 #
-# Usage:  ./rename.sh [OPTIONS] <target_dir>
+# Usage:  ./media_rename.sh [OPTIONS] <target_dir>
 #
 # Options:
 #   -n              Dry run: print decisions, do not rename; takes no lock and
@@ -137,7 +137,7 @@
 #   The text after SxxEyy is the episode title, with or without a hyphen
 #   between them ("S03E01 - Real Title", "S03E01.Real.Title"), cut at the
 #   first release tag: a resolution, source, codec, audio, HDR or streaming
-#   tag from RELEASE_TAG_PATTERN in rename_parse.sh, plus any upper-case
+#   tag from RELEASE_TAG_PATTERN in media_rename_parse.sh, plus any upper-case
 #   language codes right before it ("Real.Title.ITA.KOR.1080p.x265-GROUP"
 #   gives "Real Title"). A name with a tag straight after SxxEyy has no title
 #   ("S03E01.1080p.WEB-DL.x264-GROUP"). No structural signal separates a title
@@ -370,15 +370,15 @@ source "${SCRIPT_DIR}/lang_table.sh"
 # shellcheck source=./video_exts.sh
 source "${SCRIPT_DIR}/video_exts.sh"
 
-# Name parsing (rename_parse.sh, alongside this script): the functions that turn
+# Name parsing (media_rename_parse.sh, alongside this script): the functions that turn
 # a raw name into a Plex name. It reads LANG_ALIASES, SUPPORTED_SUB_LANGS and
 # TARGET_DIR, all set before any of its functions run.
-[[ -r "${SCRIPT_DIR}/rename_parse.sh" ]] || {
-    echo "ERROR: rename_parse.sh not found next to this script (${SCRIPT_DIR})" >&2
+[[ -r "${SCRIPT_DIR}/media_rename_parse.sh" ]] || {
+    echo "ERROR: media_rename_parse.sh not found next to this script (${SCRIPT_DIR})" >&2
     exit 1
 }
-# shellcheck source=./rename_parse.sh
-source "${SCRIPT_DIR}/rename_parse.sh"
+# shellcheck source=./media_rename_parse.sh
+source "${SCRIPT_DIR}/media_rename_parse.sh"
 
 # Concurrency lock: only one run may target a given TARGET_DIR at a time. The
 # lock file lives under OPERATIONAL_DIR, never inside TARGET_DIR, so a library
@@ -428,7 +428,7 @@ DELETE_STATE=""
 # Log setup. The log is written directly to its final path: a rename pass is
 # idempotent (already-correct names are left alone on a re-run), so an
 # interrupted batch has no partial state worth keeping apart from the log.
-# A dry run writes no log, as in encode.sh: every log() call goes to
+# A dry run writes no log, as in media_encode.sh: every log() call goes to
 # /dev/null.
 if (( DRY_RUN )); then
     LOG_FILE="/dev/null"

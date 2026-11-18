@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# archive.sh: Move encoded files from the local archive directory to the NAS
+# media_archive.sh: Move encoded files from the local archive directory to the NAS
 #             archive directory, merging into the folders already there.
 #
-# Usage:  ./archive.sh -m <mount_point> [OPTIONS] <source_dir> <nas_archive_dir>
+# Usage:  ./media_archive.sh -m <mount_point> [OPTIONS] <source_dir> <nas_archive_dir>
 #
 # Each top-level directory of <source_dir> is a category ("Series", "Movies")
 # and must already exist in <nas_archive_dir>; no category is ever created.
@@ -23,7 +23,7 @@
 #                   unmounted share is never mistaken for an empty one
 #   -w SECONDS      A file is moved only when its modification time is at
 #                   least this old; 0 disables the check (default: 60). A file
-#                   that encode.sh -M is still copying into <source_dir> has a
+#                   that media_encode.sh -M is still copying into <source_dir> has a
 #                   recent modification time
 #   -s              Verify by size only; the default also compares contents
 #                   with cmp before the source is deleted (default: off)
@@ -40,7 +40,7 @@
 #   • Requires bash 4.0+, flock, mountpoint, sha256sum, realpath and cmp
 #   • Only one run may target a given <source_dir> at a time; a second run
 #     exits 1 immediately
-#   • Safe while an encode runs: encode.sh -M copies into <source_dir>, and a
+#   • Safe while an encode runs: media_encode.sh -M copies into <source_dir>, and a
 #     file still being written is skipped by the -w window. Neither script
 #     takes the other's lock
 #   • A source file whose delete failed after a verified copy is reported as a
@@ -327,7 +327,7 @@ while IFS= read -r -d '' ENTRY; do
     done < <(find "$ENTRY" -type f ! -name '.*' -print0 | sort -z)
 
     # Folders emptied by the moves are removed innermost first. The category
-    # folder itself stays, as in encode.sh's own cleanup.
+    # folder itself stays, as in media_encode.sh's own cleanup.
     if (( ! DRY_RUN )); then
         find "$ENTRY" -mindepth 1 -type d -empty -delete \
             || log "WARNING: could not remove every empty folder under $CATEGORY"

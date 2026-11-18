@@ -4,7 +4,7 @@
 # track matching, output stream-count verification, and ffmpeg arg-building
 # for muxing external subtitle files into a video.
 #
-# Sourced by encode.sh.
+# Sourced by media_encode.sh.
 #
 # The caller provides, before sourcing this file and calling into it:
 #   OUT_FORMAT       "mkv" or "mp4" - read by subtitle_output_codec() and
@@ -269,7 +269,7 @@ verify_subtitle_count() {
 # Builds ffmpeg -map/-c:s/-metadata/-disposition args for one or more
 # external subtitle files already opened as ffmpeg inputs. Shares the
 # _OUT_IDX counter with any other subtitle-arg builder the caller runs
-# first (e.g. encode_args.sh's build_subtitle_args() for embedded
+# first (e.g. media_encode_args.sh's build_subtitle_args() for embedded
 # tracks), so external and embedded tracks are numbered continuously and
 # indistinguishable in the output.
 # Takes: ff_ref idx_ref, then "LANG TYPE INPUT_IDX PATH" lines, where PATH
@@ -306,7 +306,7 @@ build_external_subtitle_args() {
         OUT_SUB_CODEC="$(sidecar_output_codec "$SRC_CODEC")"
 
         # PATH may be a stripped copy or the original, unstripped file: the
-        # caller falls back to the latter if encode.sh's strip_sidecar_sub() failed and
+        # caller falls back to the latter if media_encode.sh's strip_sidecar_sub() failed and
         # prints its own WARNING at that point, so this line makes no claim
         # about stripping.
         echo " Subtitle[external:$(basename "$SIDECAR_PATH") -> out:${_OUT_IDX}]: INCLUDE: $SUB_TITLE ($SRC_CODEC -> $OUT_SUB_CODEC)"

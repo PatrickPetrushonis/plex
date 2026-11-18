@@ -5,7 +5,7 @@ Usage:
     python3 probe_streams.py encode FILE SUB_LANGS LANG_TABLE_TSV
     python3 probe_streams.py scan FILE
 
-encode mode (called by encode.sh) prints one line per stream group:
+encode mode (called by media_encode.sh) prints one line per stream group:
     VIDEO <codec> <height> <fps> <label>
     VIDEOFMT <pix_fmt>                       ("unknown" when the probe reports none)
     VIDEOCOLOR <color_transfer> <has_dovi>   (transfer is "unknown" when untagged; has_dovi is
@@ -243,7 +243,7 @@ def scan_output(path):
 def main(argv=None):
     p = argparse.ArgumentParser(description="Print a media file's streams as lines for a shell caller.")
     sub = p.add_subparsers(dest='mode', required=True)
-    enc = sub.add_parser('encode', help="video, audio and subtitle lines for encode.sh")
+    enc = sub.add_parser('encode', help="video, audio and subtitle lines for media_encode.sh")
     enc.add_argument('file')
     enc.add_argument('sub_langs', help="comma-separated 3-letter codes of the wanted subtitle languages")
     enc.add_argument('lang_table_tsv', help="path of lang_table.tsv")

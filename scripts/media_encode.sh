@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# encode.sh: Batch video encoder with stream-aware copy/transcode decisions
+# media_encode.sh: Batch video encoder with stream-aware copy/transcode decisions
 #
-# Usage:  ./encode.sh [OPTIONS] <input_file|dir|glob> [<input2> ...]
+# Usage:  ./media_encode.sh [OPTIONS] <input_file|dir|glob> [<input2> ...]
 #
 # Options:
 #   -o DIR          Output directory (default: <script directory>/encoded)
@@ -294,10 +294,10 @@ declare -F canon_lang >/dev/null || {
 source "$(dirname "${BASH_SOURCE[0]}")/subtitle_mux.sh"
 
 # is_hdr_transfer, build_video_args, build_audio_args and build_subtitle_args come
-# from encode_args.sh (same directory). They read the settings defined below when
+# from media_encode_args.sh (same directory). They read the settings defined below when
 # they run.
-# shellcheck source=./encode_args.sh
-source "$(dirname "${BASH_SOURCE[0]}")/encode_args.sh"
+# shellcheck source=./media_encode_args.sh
+source "$(dirname "${BASH_SOURCE[0]}")/media_encode_args.sh"
 
 # zscale (libzimg) and tonemap convert HDR sources to SDR; checked here so a
 # batch fails before any work instead of on the first HDR file. The filter
@@ -367,7 +367,7 @@ if [[ -f "$LOG_FILE_TEMP" ]]; then
 fi
 
 {
-    echo "encode.sh Batch Processing Log: $(date)"
+    echo "media_encode.sh Batch Processing Log: $(date)"
     echo "Output:  $OUTPUT_DIR"
     echo "Logs:    $LOG_DIR"
     [[ -n "$ARCHIVE_DIR" ]] && echo "Archive: $ARCHIVE_DIR"
@@ -437,7 +437,7 @@ declare -a SIDECAR_EXTRACT_LINES=()
 cleanup() {
     local SIG="$1"
     echo "" >&2
-    echo "encode.sh: caught $SIG, aborting." >&2
+    echo "media_encode.sh: caught $SIG, aborting." >&2
     if [[ -n "$CURRENT_FFMPEG_PID" ]]; then
         kill "$CURRENT_FFMPEG_PID" 2>/dev/null
         wait "$CURRENT_FFMPEG_PID" 2>/dev/null

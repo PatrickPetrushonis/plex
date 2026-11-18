@@ -13,21 +13,21 @@ plex/
 └── scripts/
     ├── config.sh                   Paths, encoder settings and the ingest settle window, sourced by media.sh
     ├── media.sh                    Run a stage: `media.sh encode|rename|ingest|release|archive [-n]`; -n previews it (nothing is written, renamed or moved); prints [DRY RUN] or [LIVE] first
-    ├── ingest.sh                   Unattended stage from the completed-downloads directory to the holding directory: settle check, rename preview, real rename only when the preview is clean, then move (called by media.sh; can also be run standalone)
-    ├── release.sh                  Moves held entries from the holding directory to the encoder's input directory (called by media.sh; can also be run standalone)
-    ├── archive.sh                  Moves encoded files from the local archive directory to the NAS archive directory, category by category, with copy verification (called by media.sh; can also be run standalone)
+    ├── media_ingest.sh             Unattended stage from the completed-downloads directory to the holding directory: settle check, rename preview, real rename only when the preview is clean, then move (called by media.sh; can also be run standalone)
+    ├── media_release.sh            Moves held entries from the holding directory to the encoder's input directory (called by media.sh; can also be run standalone)
+    ├── media_archive.sh            Moves encoded files from the local archive directory to the NAS archive directory, category by category, with copy verification (called by media.sh; can also be run standalone)
     ├── systemd_install_units.sh    Writes the systemd user timer that runs `media.sh ingest` or `media.sh archive`
-    ├── encode.sh                   Core batch encoder: copy/transcode decisions, HDR-to-SDR conversion, output verification (called by media.sh; can also be run standalone)
-    ├── encode_args.sh              Shared: encode.sh's ffmpeg argument builders for video, audio and embedded subtitle tracks
-    ├── rename.sh                   Plex-convention renamer for movies + TV episodes + subtitles (called by media.sh; can also be run standalone)
-    ├── rename_parse.sh             Shared: rename.sh's name parsing (raw name to Plex name; edition, episode and subtitle-tag rules), no filesystem access
+    ├── media_encode.sh             Core batch encoder: copy/transcode decisions, HDR-to-SDR conversion, output verification (called by media.sh; can also be run standalone)
+    ├── media_encode_args.sh        Shared: media_encode.sh's ffmpeg argument builders for video, audio and embedded subtitle tracks
+    ├── media_rename.sh             Plex-convention renamer for movies + TV episodes + subtitles (called by media.sh; can also be run standalone)
+    ├── media_rename_parse.sh       Shared: media_rename.sh's name parsing (raw name to Plex name; edition, episode and subtitle-tag rules), no filesystem access
     ├── subtitle_mux.sh             Shared: container-aware subtitle codec choice, sidecar discovery, external-subtitle ffmpeg arg building
-    ├── subtitle_strip_tags.py      Strips leftover ASS override tags (e.g. {\an8}) from a plain-text subtitle file; called by encode.sh
+    ├── subtitle_strip_tags.py      Strips leftover ASS override tags (e.g. {\an8}) from a plain-text subtitle file; called by media_encode.sh
     ├── subtitle_scan_types.sh      Standalone, read-only inventory of embedded subtitle codecs across a directory - no wrapper, no config.sh dependency
     ├── lang_table.sh               Shared language-code loader (bash side)
     ├── lang_table.tsv              Canonical language data (single source of truth)
     ├── video_exts.sh               Shared: the video file extensions the encoder, renamer and scanner scan for
-    ├── probe_streams.py            Shared: ffprobe stream reader for encode.sh (video, audio, subtitle lines) and subtitle_scan_types.sh (subtitle classes)
+    ├── probe_streams.py            Shared: ffprobe stream reader for media_encode.sh (video, audio, subtitle lines) and subtitle_scan_types.sh (subtitle classes)
     ├── plex_labels.sh              Label pipeline entry point: all three stages in order, or one stage (sync, get, apply)
     ├── plex_sync_folders.py        Label stage 1: create/update data/plex_folders.csv from the Plex library
     ├── plex_get_labels.py          Label stage 2: Age/Target from MyAnimeList, then TMDB (through Plex's IDs)
@@ -44,7 +44,7 @@ plex/
 
 ### Mount the NAS share
 
-`nas_setup_mount.sh` mounts a CIFS/SMB share (for example a NAS) at a stable local path, owned by a normal user, so the pipeline scripts, which refuse to run as root, can read and write it. `archive.sh` is the stage that writes to it by default. It is the one script in this repo that must run as root: installing `cifs-utils`, writing `/etc/fstab` and mounting all need it.
+`nas_setup_mount.sh` mounts a CIFS/SMB share (for example a NAS) at a stable local path, owned by a normal user, so the pipeline scripts, which refuse to run as root, can read and write it. `media_archive.sh` is the stage that writes to it by default. It is the one script in this repo that must run as root: installing `cifs-utils`, writing `/etc/fstab` and mounting all need it.
 
 ```bash
 cd scripts
@@ -106,11 +106,11 @@ cd scripts
 `media.sh ingest` works on `$DOWNLOADS_INPUT_DIR` and moves the result to `$UNENCODED_DIR`. In order:
 
 1. **Settle check.** The files must be unchanged across `$INGEST_SETTLE_SECONDS`; otherwise the run ends and the next one retries.
-2. **Preview.** `rename.sh -n -x` on the whole directory. A skipped, unmatched or to-be-deleted file stops the run with exit 2 before anything changes.
-3. **Rename.** `rename.sh -x` with no input attached, so a subtitle-deletion prompt is answered "no" instead of blocking the run.
+2. **Preview.** `media_rename.sh -n -x` on the whole directory. A skipped, unmatched or to-be-deleted file stops the run with exit 2 before anything changes.
+3. **Rename.** `media_rename.sh -x` with no input attached, so a subtitle-deletion prompt is answered "no" instead of blocking the run.
 4. **Move.** Each top-level entry that holds a video moves to `$UNENCODED_DIR`. An entry with no video, or whose name already exists there, stays and is listed for review.
 
-When a step needs a decision, `$DOWNLOADS_BASE/Logs/Ingest_review.txt` says what. Fix it (rename the file, delete the leftover, clear the name in the holding directory) and the next run starts over. See [`ingest.sh`](#ingestsh) for the details.
+When a step needs a decision, `$DOWNLOADS_BASE/Logs/Ingest_review.txt` says what. Fix it (rename the file, delete the leftover, clear the name in the holding directory) and the next run starts over. See [`media_ingest.sh`](#media_ingestsh) for the details.
 
 To run it on a timer:
 
@@ -124,7 +124,7 @@ systemctl --user enable --now media_ingest.timer
 
 The service runs `media.sh ingest` 2 minutes after the user manager starts and `-i` minutes (default 5) after each run ends. A run that exits 2 shows as a failed unit in `systemctl --user --failed`. User timers stop when the last session ends unless lingering is enabled (`sudo loginctl enable-linger "$USER"`).
 
-To rename a directory without moving anything, run `./media.sh rename -n` and `./media.sh rename`, which target `$DOWNLOADS_INPUT_DIR` and pass `-O "$DOWNLOADS_BASE"` (where the lock and logs go, see [Concurrency lock](#concurrency-lock)). To rename any other directory, call `rename.sh` directly with an explicit target.
+To rename a directory without moving anything, run `./media.sh rename -n` and `./media.sh rename`, which target `$DOWNLOADS_INPUT_DIR` and pass `-O "$DOWNLOADS_BASE"` (where the lock and logs go, see [Concurrency lock](#concurrency-lock)). To rename any other directory, call `media_rename.sh` directly with an explicit target.
 
 ### 2. Release held entries
 
@@ -138,7 +138,7 @@ cd scripts
 ./media.sh release -a                # move everything
 ```
 
-Item names go after the options, and `--` ends the options. `release` never overwrites or merges a name that already exists in `$INPUT_DIR`, and it is safe while an encode runs. See [`release.sh`](#releasesh).
+Item names go after the options, and `--` ends the options. `release` never overwrites or merges a name that already exists in `$INPUT_DIR`, and it is safe while an encode runs. See [`media_release.sh`](#media_releasesh).
 
 Ingest and release must finish before the encode: filenames must already be correct by the time the encoder builds sidecar-subtitle paths from them.
 
@@ -150,7 +150,7 @@ cd scripts
 ./media.sh encode       # run it for real
 ```
 
-`media.sh encode` takes `-n` and prints `[DRY RUN]` or `[LIVE]` first. It sources `config.sh` for paths/flags and calls the real work out to `encode.sh`, targeting `$INPUT_DIR`. A run lists its input files once, at the start, so entries released into `$INPUT_DIR` while it runs wait for the next encode. Never run `media.sh encode -n` and `media.sh encode` at the same time against the same output directory — see [Concurrency lock](#concurrency-lock).
+`media.sh encode` takes `-n` and prints `[DRY RUN]` or `[LIVE]` first. It sources `config.sh` for paths/flags and calls the real work out to `media_encode.sh`, targeting `$INPUT_DIR`. A run lists its input files once, at the start, so entries released into `$INPUT_DIR` while it runs wait for the next encode. Never run `media.sh encode -n` and `media.sh encode` at the same time against the same output directory — see [Concurrency lock](#concurrency-lock).
 
 The dry run prints each file's decision, including whether an HDR source is tone-mapped to SDR (see [HEVC and HDR sources](#hevc-and-hdr-sources)), the ffmpeg command in a form that can be pasted into a shell, and each planned `-M` archive and `-A` backup move, with a warning for any destination that already exists.
 
@@ -169,7 +169,7 @@ cd scripts
 ./media.sh archive      # run it for real
 ```
 
-`media.sh archive` moves the files in `$ARCHIVE_DIR` to `$NAS_ARCHIVE_DIR`, category by category, and deletes each local file only after the NAS copy is verified. It ends before any work when `$NAS_MOUNT` is not mounted. A collision, or a top-level entry that is not a category folder on the NAS, leaves the file in place and exits 2. See [`archive.sh`](#archivesh).
+`media.sh archive` moves the files in `$ARCHIVE_DIR` to `$NAS_ARCHIVE_DIR`, category by category, and deletes each local file only after the NAS copy is verified. It ends before any work when `$NAS_MOUNT` is not mounted. A collision, or a top-level entry that is not a category folder on the NAS, leaves the file in place and exits 2. See [`media_archive.sh`](#media_archivesh).
 
 To run it on a timer, use the same installer with the archive stage:
 
@@ -214,39 +214,39 @@ Defines three independent variable groups: the video-library pipeline (from `VID
 | Variable | Default | Passed to |
 |---|---|---|
 | `VIDEOS_BASE` | `$HOME/Videos` | Base for the five video-library directory variables below |
-| `INPUT_DIR` | `$VIDEOS_BASE/input` | `encode.sh` positional arg |
-| `OUTPUT_DIR` | `$VIDEOS_BASE/output` | `encode.sh` `-o` (via `ENCODER_ARGS`) |
-| `ARCHIVE_DIR` | `$VIDEOS_BASE/encoded` | `encode.sh` `-M` (via `ENCODER_ARGS`); `archive.sh` source directory (positional arg) |
-| `BACKUP_DIR` | `$VIDEOS_BASE/backup` | `encode.sh` `-A` (via `ENCODER_ARGS`) |
-| `UNENCODED_DIR` | `$VIDEOS_BASE/unencoded` | `ingest.sh` holding directory (positional arg); `release.sh` `-S` |
-| `CRF` | `20` | `encode.sh` `-c` (via `ENCODER_ARGS`) |
-| `PRESET` | `slow` | `encode.sh` `-p` (via `ENCODER_ARGS`) |
-| `TUNE` | empty | `encode.sh` `-T` (via `ENCODER_ARGS`, only when set) |
-| `MAX_COPY_KBPS` | `8000` | `encode.sh` `-K` (via `ENCODER_ARGS`) |
-| `INGEST_SETTLE_SECONDS` | `60` | `ingest.sh` `-w` |
-| `DOWNLOADS_BASE` | `$HOME/Downloads` | `rename.sh` and `ingest.sh` `-O` (lock/log location only, not the target) |
-| `DOWNLOADS_INPUT_DIR` | `$DOWNLOADS_BASE/Complete` | `rename.sh` and `ingest.sh` positional arg (the actual target) |
-| `NAS_MOUNT` | `/mnt/nas/plexmedia` | `archive.sh` `-m` (the share's mount point) |
-| `NAS_ARCHIVE_DIR` | `$NAS_MOUNT/#archive` | `archive.sh` positional arg (the destination) |
-| `ARCHIVE_SETTLE_SECONDS` | `60` | `archive.sh` `-w` |
+| `INPUT_DIR` | `$VIDEOS_BASE/input` | `media_encode.sh` positional arg |
+| `OUTPUT_DIR` | `$VIDEOS_BASE/output` | `media_encode.sh` `-o` (via `ENCODER_ARGS`) |
+| `ARCHIVE_DIR` | `$VIDEOS_BASE/encoded` | `media_encode.sh` `-M` (via `ENCODER_ARGS`); `media_archive.sh` source directory (positional arg) |
+| `BACKUP_DIR` | `$VIDEOS_BASE/backup` | `media_encode.sh` `-A` (via `ENCODER_ARGS`) |
+| `UNENCODED_DIR` | `$VIDEOS_BASE/unencoded` | `media_ingest.sh` holding directory (positional arg); `media_release.sh` `-S` |
+| `CRF` | `20` | `media_encode.sh` `-c` (via `ENCODER_ARGS`) |
+| `PRESET` | `slow` | `media_encode.sh` `-p` (via `ENCODER_ARGS`) |
+| `TUNE` | empty | `media_encode.sh` `-T` (via `ENCODER_ARGS`, only when set) |
+| `MAX_COPY_KBPS` | `8000` | `media_encode.sh` `-K` (via `ENCODER_ARGS`) |
+| `INGEST_SETTLE_SECONDS` | `60` | `media_ingest.sh` `-w` |
+| `DOWNLOADS_BASE` | `$HOME/Downloads` | `media_rename.sh` and `media_ingest.sh` `-O` (lock/log location only, not the target) |
+| `DOWNLOADS_INPUT_DIR` | `$DOWNLOADS_BASE/Complete` | `media_rename.sh` and `media_ingest.sh` positional arg (the actual target) |
+| `NAS_MOUNT` | `/mnt/nas/plexmedia` | `media_archive.sh` `-m` (the share's mount point) |
+| `NAS_ARCHIVE_DIR` | `$NAS_MOUNT/#archive` | `media_archive.sh` positional arg (the destination) |
+| `ARCHIVE_SETTLE_SECONDS` | `60` | `media_archive.sh` `-w` |
 
 No paths or usernames are hardcoded — everything derives from `$HOME` unless overridden. `ENCODER_ARGS` is a prebuilt array (`-r -s -c "$CRF" -p "$PRESET" -K "$MAX_COPY_KBPS" -o "$OUTPUT_DIR" -M "$ARCHIVE_DIR" -A "$BACKUP_DIR"`, plus `-T "$TUNE"` when `TUNE` is set) that `media.sh encode` splices in ahead of `$INPUT_DIR`; there is no equivalent prebuilt array for rename, ingest or release, since each needs only the raw directory values passed directly. `media.sh release` and `media.sh archive` pass `-O "$OUTPUT_DIR"`, so their logs sit beside the encoder's. `NAS_MOUNT`, `CRF`, `PRESET`, `TUNE`, `MAX_COPY_KBPS`, `INGEST_SETTLE_SECONDS` and `ARCHIVE_SETTLE_SECONDS` take overrides at call time; `INGEST_SETTLE_SECONDS=0 ./media.sh ingest -n` skips the settle wait.
 
-`config.sh` does not set the maximum output height. The encoder's `-H` flag does (default 1080), so `media.sh` always uses 1080; call `encode.sh` directly to change it.
+`config.sh` does not set the maximum output height. The encoder's `-H` flag does (default 1080), so `media.sh` always uses 1080; call `media_encode.sh` directly to change it.
 
 The label scripts do not source `config.sh`. They locate their own inputs and outputs relative to themselves (`../data`, `../logs`) and take credentials from the environment (see [Plex labels](#plex-labels-age-and-target)).
 
 ## Concurrency lock
 
-`encode.sh`, `rename.sh`, `ingest.sh`, `release.sh` and `archive.sh` each take their own exclusive, non-blocking `flock`, once the directory they work from is ready: `encode.sh` creates `OUTPUT_DIR` first, and the others resolve the target's canonical path. A dry run of `rename.sh`, `ingest.sh`, `release.sh` or `archive.sh` takes no lock and writes no log. A second run against the same directory, from any invocation path (`media.sh`, or a script called directly), exits immediately with an error instead of racing. The lock releases automatically when the process exits, including on Ctrl-C.
+`media_encode.sh`, `media_rename.sh`, `media_ingest.sh`, `media_release.sh` and `media_archive.sh` each take their own exclusive, non-blocking `flock`, once the directory they work from is ready: `media_encode.sh` creates `OUTPUT_DIR` first, and the others resolve the target's canonical path. A dry run of `media_rename.sh`, `media_ingest.sh`, `media_release.sh` or `media_archive.sh` takes no lock and writes no log. A second run against the same directory, from any invocation path (`media.sh`, or a script called directly), exits immediately with an error instead of racing. The lock releases automatically when the process exits, including on Ctrl-C.
 
 No script's lock (or logs) live inside the directory being processed — each routes through an operational directory instead:
-- `encode.sh` locks `OUTPUT_DIR/.media.lock` and logs to `OUTPUT_DIR/Logs`, since `OUTPUT_DIR` is a working/encoding area, not a curated library.
-- `rename.sh` takes an `-O DIR` flag (operational directory) for the same purpose: `media.sh rename` passes `-O "$DOWNLOADS_BASE"`, so its lock (`DOWNLOADS_BASE/.locks/<hash-of-target>.lock`) and logs (`DOWNLOADS_BASE/Logs`) stay out of the actual rename target. Since `rename.sh` can also run standalone against any target, `-O` defaults to the script's own directory when omitted.
-- `ingest.sh` and `release.sh` take the same `-O DIR` flag with the same default. `media.sh ingest` passes `-O "$DOWNLOADS_BASE"` and `media.sh release` passes `-O "$OUTPUT_DIR"`. `ingest.sh` locks `DOWNLOADS_BASE/.locks/ingest_<hash-of-source>.lock`, named apart from `rename.sh`'s `<hash>.lock` for the same directory because it runs `rename.sh` as a child. `release.sh` locks `OUTPUT_DIR/.locks/release_<hash-of-input>.lock`. Neither takes `encode.sh`'s lock, since `encode.sh` lists its input files once at the start.
-- `archive.sh` takes `-O DIR` with the same meaning; `media.sh archive` passes `-O "$OUTPUT_DIR"`. It locks `OUTPUT_DIR/.locks/archive_<hash-of-source>.lock`. It does not take `encode.sh`'s lock: `encode.sh -M` copies into the directory `archive.sh` reads, and the settle window keeps `archive.sh` off a file still being written.
+- `media_encode.sh` locks `OUTPUT_DIR/.media.lock` and logs to `OUTPUT_DIR/Logs`, since `OUTPUT_DIR` is a working/encoding area, not a curated library.
+- `media_rename.sh` takes an `-O DIR` flag (operational directory) for the same purpose: `media.sh rename` passes `-O "$DOWNLOADS_BASE"`, so its lock (`DOWNLOADS_BASE/.locks/<hash-of-target>.lock`) and logs (`DOWNLOADS_BASE/Logs`) stay out of the actual rename target. Since `media_rename.sh` can also run standalone against any target, `-O` defaults to the script's own directory when omitted.
+- `media_ingest.sh` and `media_release.sh` take the same `-O DIR` flag with the same default. `media.sh ingest` passes `-O "$DOWNLOADS_BASE"` and `media.sh release` passes `-O "$OUTPUT_DIR"`. `media_ingest.sh` locks `DOWNLOADS_BASE/.locks/ingest_<hash-of-source>.lock`, named apart from `media_rename.sh`'s `<hash>.lock` for the same directory because it runs `media_rename.sh` as a child. `media_release.sh` locks `OUTPUT_DIR/.locks/release_<hash-of-input>.lock`. Neither takes `media_encode.sh`'s lock, since `media_encode.sh` lists its input files once at the start.
+- `media_archive.sh` takes `-O DIR` with the same meaning; `media.sh archive` passes `-O "$OUTPUT_DIR"`. It locks `OUTPUT_DIR/.locks/archive_<hash-of-source>.lock`. It does not take `media_encode.sh`'s lock: `media_encode.sh -M` copies into the directory `media_archive.sh` reads, and the settle window keeps `media_archive.sh` off a file still being written.
 
-`config.sh` and `media.sh` contain no locking logic — they're path/flag plumbing only. `encode.sh`, `rename.sh`, `ingest.sh`, `release.sh` and `archive.sh` can be run standalone, without going through `media.sh`, and are still protected.
+`config.sh` and `media.sh` contain no locking logic — they're path/flag plumbing only. `media_encode.sh`, `media_rename.sh`, `media_ingest.sh`, `media_release.sh` and `media_archive.sh` can be run standalone, without going through `media.sh`, and are still protected.
 
 The label scripts keep their lock files in `scripts/` instead, and remove them when a run ends:
 - `plex_labels.sh` takes `.plex_labels.lock` when it runs all three stages, so only one pipeline runs at a time.
@@ -257,16 +257,16 @@ The label scripts keep their lock files in `scripts/` instead, and remove them w
 
 `lang_table.tsv` is the single source of truth for every language code, alias, and display label used across the project — add a language once here and it's picked up everywhere. Each row has a primary 3-letter code (`code3`, ISO 639-2), a 2-letter code (`code2`, ISO 639-1, used in sidecar filenames), a display label, and a comma-separated alias list (e.g. `fra`'s alias is the bibliographic `fre`). **Pass the primary `code3` to `-l`.** Sidecar discovery looks each `-l` value up in `LANG_3TO2` and silently skips a value with no entry, and the encoder's own check only warns when a value is not 2–3 letters. Aliases are for matching a file's own language tag and for display; the lowercase label also resolves as a language name in subtitle file names; English is the supported one.
 
-- `encode.sh` sources `lang_table.sh` for its bash-side sidecar matching (`LANG_TABLE`, `LANG_3TO2`, `LANG_LABEL_BASH`), and `probe_streams.py`, which it calls to read each file's streams, reads `lang_table.tsv` directly for embedded-track display labels (which resolve aliases).
-- `rename.sh` sources `lang_table.sh` for the `LANG_ALIASES` lookup in `rename_parse.sh`, used to normalize subtitle filename language tags (e.g. `.eng.srt` → `.en.srt`, `.fre.srt` → `.fr.srt`) to the 2-letter form `encode.sh`'s sidecar matching expects.
-- `video_exts.sh` defines `VIDEO_EXTS`, the one video extension list `encode.sh`, `rename.sh` and `subtitle_scan_types.sh` all read.
+- `media_encode.sh` sources `lang_table.sh` for its bash-side sidecar matching (`LANG_TABLE`, `LANG_3TO2`, `LANG_LABEL_BASH`), and `probe_streams.py`, which it calls to read each file's streams, reads `lang_table.tsv` directly for embedded-track display labels (which resolve aliases).
+- `media_rename.sh` sources `lang_table.sh` for the `LANG_ALIASES` lookup in `media_rename_parse.sh`, used to normalize subtitle filename language tags (e.g. `.eng.srt` → `.en.srt`, `.fre.srt` → `.fr.srt`) to the 2-letter form `media_encode.sh`'s sidecar matching expects.
+- `video_exts.sh` defines `VIDEO_EXTS`, the one video extension list `media_encode.sh`, `media_rename.sh` and `subtitle_scan_types.sh` all read.
 - `subtitle_mux.sh` does not source `lang_table.sh`: it depends on `LANG_3TO2`/`LANG_LABEL_BASH` already being loaded by whichever script sourced it.
 
 Both `lang_table.sh` and `lang_table.tsv` resolve their own file locations relative to themselves, not the caller's working directory, so this works regardless of where a script is invoked from. `lang_table.sh` is also safe to source more than once in the same process (an include guard makes the second call a no-op).
 
-## `encode.sh`
+## `media_encode.sh`
 
-The core encoder is documented in full detail — every flag, the audio/subtitle decision logic, sidecar handling, and logging format — in its own header comment (`-h`). The ffmpeg argument builders for video, audio and embedded subtitle tracks are in `encode_args.sh`; the file handling, sidecars, verification, archiving and locking are in `encode.sh`. It can be run directly (bypassing `config.sh`; it still takes its own lock) for one-off jobs outside the standard `VIDEOS_BASE` layout. Run directly, its defaults are CRF 18, preset `slow` and output to `encoded` beside the script; `media.sh` overrides them through `config.sh` (22 and `fast`). It requires an ffmpeg build with the `zscale` and `tonemap` filters and exits before any work if either is missing.
+The core encoder is documented in full detail — every flag, the audio/subtitle decision logic, sidecar handling, and logging format — in its own header comment (`-h`). The ffmpeg argument builders for video, audio and embedded subtitle tracks are in `media_encode_args.sh`; the file handling, sidecars, verification, archiving and locking are in `media_encode.sh`. It can be run directly (bypassing `config.sh`; it still takes its own lock) for one-off jobs outside the standard `VIDEOS_BASE` layout. Run directly, its defaults are CRF 18, preset `slow` and output to `encoded` beside the script; `media.sh` sets CRF 20 and preset `slow` through `config.sh`. It requires an ffmpeg build with the `zscale` and `tonemap` filters and exits before any work if either is missing.
 
 ### Video decisions
 
@@ -313,9 +313,9 @@ The conversion filter chain lives in one constant, `SDR_TONEMAP_CHAIN`, near the
 
 Sidecar discovery, the container-aware subtitle codec choice and external-subtitle ffmpeg arg building live in the shared `subtitle_mux.sh`. Sidecars are tag-stripped before muxing (see [Subtitle tag stripping](#subtitle-tag-stripping-subtitle_strip_tagspy)).
 
-## `rename.sh`
+## `media_rename.sh`
 
-Renames movie and TV-episode video and subtitle files into Plex convention. The name parsing (everything that turns a raw name into a Plex name, with no filesystem access) is in `rename_parse.sh`; the file and folder operations, collision handling, logging and locking are in `rename.sh`:
+Renames movie and TV-episode video and subtitle files into Plex convention. The name parsing (everything that turns a raw name into a Plex name, with no filesystem access) is in `media_rename_parse.sh`; the file and folder operations, collision handling, logging and locking are in `media_rename.sh`:
 
 - **Movies:** `Franchise/Movie Name (YYYY) {edition-A B}/Movie Name (YYYY) {edition-A B}.ext`. Several editions in one name are joined alphabetically with Remastered last.
 - **Episodes:** `Series Name (YYYY)/Season XX/Series Name - SxxEyy[ - Title].ext`. The episode title is the text after `SxxEyy`, with or without a hyphen between them, cut at the first release tag (resolution, source, codec, audio, HDR or streaming-service tag, plus upper-case language codes right before it): `Series.S01E01.Real.Title.ITA.1080p.WEB-DL.x264-GRP` gives `Series - S01E01 - Real Title`. A release group with no tag before it (`Series.S01E01.Real.Title-GRP`) stays in the title.
@@ -327,7 +327,7 @@ Renames movie and TV-episode video and subtitle files into Plex convention. The 
   - A release folder that names the series in its own `(...)` group (`Native Title (Series Title) (Season 02)`) is emptied into the series folder beside it, so every season merges into one show folder.
   - A name without an `SxxEyy` token (`Episode 12`, `- 12`, `- 12 - Title`, `Show.12`) is read as an episode only when at least two videos in the same folder share the title before the number; the title after `Episode 12` is kept, and the title after `- 12 -` is dropped. A separated version suffix (`- 12 v2`) is dropped.
   - A `.5` after the number is kept as a special (`Show - 02.5` becomes `S01E02.5`).
-- **Subtitles:** language tags and modifiers (`cc`/`sdh`/`forced`) are normalized against `lang_table.tsv` (loaded by `lang_table.sh`), so files renamed here match what `encode.sh`'s sidecar discovery looks for. A subtitle named only by a language word resolves through the table's label column, matched in lowercase; English (`English`, `2_English`) is the supported language.
+- **Subtitles:** language tags and modifiers (`cc`/`sdh`/`forced`) are normalized against `lang_table.tsv` (loaded by `lang_table.sh`), so files renamed here match what `media_encode.sh`'s sidecar discovery looks for. A subtitle named only by a language word resolves through the table's label column, matched in lowercase; English (`English`, `2_English`) is the supported language.
   - **Release-folder subtitles:** a subtitle named only `<track> <language>` (`2 English.srt`, `3_English.srt`) under a show folder takes its episode from the nearest folder above it with an `SxxEyy` token and becomes `Series - SxxEyy.en.srt`.
   - **Subtitles below their video:** a subtitle in a folder with no video of its own (`Subs`, `Subtitles`), named only by a language (`English.srt`, `2_English.srt`, `English.forced.srt`) or carrying a language tag, with no episode in its name or folders, is renamed after the single video in the nearest folder above it that holds videos and moved beside it (`Movie Name (2010).en.srt`). If that folder holds several videos, or the video was not renamed, the subtitle is left and reported as no match. With `-F` they stay in their folder and follow the ordinary rules.
   - **Two tracks of one language:** the one with more lines containing `[` or `]` (sound descriptions) becomes `.en.cc.srt` and the other `.en.srt`. With equal counts the first in byte-order sort of the names is the plain one. The track number is ignored. A third or later track is skipped.
@@ -335,15 +335,15 @@ Renames movie and TV-episode video and subtitle files into Plex convention. The 
 
 Skipped and logged rather than guessed: an unrecognized subtitle language or modifier, ranged or multi-episode numbering (`S01E01-E02`, `S01E01E02`), a movie name with no year, and a rename target that already exists (unless `-f`, which asks for a typed `yes` before overwriting). The script refuses to run as root, so the folders and logs it creates belong to the library's owner. The script's header comment has the full name-parsing rules and known limitations; `-h` has usage.
 
-`rename.sh -x` is the attention exit: it exits 2 when nothing failed but at least one file was skipped, left unmatched or (dry run) would be deleted, so a caller can tell a clean run from one that needs a person. Without `-x` those files do not change the exit status.
+`media_rename.sh -x` is the attention exit: it exits 2 when nothing failed but at least one file was skipped, left unmatched or (dry run) would be deleted, so a caller can tell a clean run from one that needs a person. Without `-x` those files do not change the exit status.
 
-## `ingest.sh`
+## `media_ingest.sh`
 
 Moves finished downloads from the completed-downloads directory into Plex naming and then to the holding directory, and stops for a person only when something needs a decision. It takes `<source_dir> <holding_dir>`; `media.sh ingest` passes `$DOWNLOADS_INPUT_DIR` and `$UNENCODED_DIR`. Options: `-n` (dry run), `-w SECONDS` (settle window, default 60, `0` skips the check) and `-O DIR` (operational directory).
 
 - **Settle check.** `tree_signature` hashes the size and modification time of every file under the source. It is taken, the script waits the settle window, and it is taken again; a difference ends the run with exit 0 and the next run retries. The hash ignores names, so it is also compared after the rename: a different value means something arrived or changed during the rename, and the move waits for the next run.
-- **Preview.** `rename.sh -n -x` runs on the whole directory. Exit 2 (a skipped, unmatched or to-be-deleted file) or 1 stops the run before any change; the preview output is saved as the review file.
-- **Rename.** `rename.sh -x` runs with no input attached. A subtitle-deletion prompt reads nothing, which `rename.sh` treats as "no", so the file stays and the run reports it. Any non-zero exit stops the run before the move.
+- **Preview.** `media_rename.sh -n -x` runs on the whole directory. Exit 2 (a skipped, unmatched or to-be-deleted file) or 1 stops the run before any change; the preview output is saved as the review file.
+- **Rename.** `media_rename.sh -x` runs with no input attached. A subtitle-deletion prompt reads nothing, which `media_rename.sh` treats as "no", so the file stays and the run reports it. Any non-zero exit stops the run before the move.
 - **Move.** Each top-level entry that holds a video (by `video_exts.sh`) moves whole to the holding directory with `mv -nT`. An entry with no video stays and is reported as held. An entry whose name already exists in the holding directory stays and is reported as a collision; a directory is never merged, since `mv` would nest it. An entry that vanishes between the listing and the move is a failure.
 
 A real run writes three files under `OPDIR/Logs`: `Ingest.log` (one line per move, hold, collision and failure), `Ingest_review.txt` (what needs a person, rewritten only when its content changes and removed when nothing needs review) and `Ingest_state` (the exit code and a hash of the source and holding directories after a non-zero run). A run that finds both directories exactly as the last non-zero run left them repeats that exit code at once, with no wait, rename or log line; renaming a file, or adding or removing a name in either directory, starts the run over.
@@ -359,7 +359,7 @@ Exit codes: `0` nothing to do, not settled yet, or every entry moved; `1` a fail
 
 `systemd_install_units.sh` writes `media_<stage>.service` and `media_<stage>.timer` under `~/.config/systemd/user`, where `-s` picks the stage (`ingest` by default, or `archive`). The service runs `<scripts directory>/media.sh <stage>` once (`Type=oneshot`). The timer starts it 2 minutes after the user manager starts (`OnStartupSec`) and `-i` minutes (default 5) after each run ends (`OnUnitInactiveSec`), so runs never overlap. An existing unit file is left in place unless `-f` is given. It prints the `systemctl` commands that enable the timer and does not run them. It refuses a scripts path containing whitespace, `%`, `$`, a quote or a backslash, since systemd would misread it in `ExecStart`.
 
-## `release.sh`
+## `media_release.sh`
 
 Moves entries from the holding directory to the encoder's input directory. It takes `-S <holding_dir> -D <input_dir>`, then options, then item names; `media.sh release` supplies the directories and passes everything after `release` through.
 
@@ -369,15 +369,15 @@ Moves entries from the holding directory to the encoder's input directory. It ta
 - A name that already exists in the input directory is skipped and logged, never overwritten or merged.
 - `-n` previews the moves without a lock or a log. A real run logs to `OPDIR/Logs/Release_<date>_<time>.txt`.
 
-Exit codes: `1` when a move fails or the lock is held; skipped and unmatched items do not change the status. It is safe while an encode runs, because `encode.sh` lists its input files once at the start, so a released entry waits for the next encode. It refuses to run as root.
+Exit codes: `1` when a move fails or the lock is held; skipped and unmatched items do not change the status. It is safe while an encode runs, because `media_encode.sh` lists its input files once at the start, so a released entry waits for the next encode. It refuses to run as root.
 
-## `archive.sh`
+## `media_archive.sh`
 
 Moves encoded files from the local archive directory to the NAS archive directory. It takes `-m <mount_point> <source_dir> <nas_archive_dir>`; `media.sh archive` passes `$NAS_MOUNT`, `$ARCHIVE_DIR` and `$NAS_ARCHIVE_DIR`. Options: `-n` (dry run), `-w SECONDS` (settle window, default 60, `0` skips the check), `-s` (verify by size only) and `-O DIR` (operational directory).
 
-- **Categories.** Each top-level directory of the source is a category and must already exist on the NAS; the script never creates one. Files under it keep their relative path and merge into the show and movie folders already there, at file level. A top-level entry that is not a category folder on the NAS (a loose file, or a title folder not yet placed in a category) stays in the source and is reported. `encode.sh -r` mirrors the `$INPUT_DIR` layout into `$ARCHIVE_DIR`, and `release.sh` moves entries to the root of `$INPUT_DIR`, so an entry reaches `$ARCHIVE_DIR` under a category only when it was placed in one before the encode.
+- **Categories.** Each top-level directory of the source is a category and must already exist on the NAS; the script never creates one. Files under it keep their relative path and merge into the show and movie folders already there, at file level. A top-level entry that is not a category folder on the NAS (a loose file, or a title folder not yet placed in a category) stays in the source and is reported. `media_encode.sh -r` mirrors the `$INPUT_DIR` layout into `$ARCHIVE_DIR`, and `media_release.sh` moves entries to the root of `$INPUT_DIR`, so an entry reaches `$ARCHIVE_DIR` under a category only when it was placed in one before the encode.
 - **Mount check.** `-m` must be a mount point and the NAS directory must lie under it, or the run ends with exit 1 before any work, so an unmounted share is never mistaken for an empty one.
-- **Settle.** A file modified within the last `-w` seconds is skipped and listed as waiting; the next run retries it. `encode.sh -M` writes straight to the final name in `$ARCHIVE_DIR`, so a copy in progress has a recent modification time.
+- **Settle.** A file modified within the last `-w` seconds is skipped and listed as waiting; the next run retries it. `media_encode.sh -M` writes straight to the final name in `$ARCHIVE_DIR`, so a copy in progress has a recent modification time.
 - **Move.** Per file: copy to a hidden `.<name>.tmp` beside the destination, compare size and contents (`cmp`; size only with `-s`), confirm the source's size and modification time did not change during the copy, rename into place with `mv -n`, then delete the source. A failed step removes the partial copy and keeps the source. Folders emptied by the moves are removed, innermost first; the category folders stay.
 - **Collisions.** A destination that already exists is never overwritten. The source stays and is reported as a collision, with the size comparison in the message.
 
@@ -389,7 +389,7 @@ Known limitation: a file whose name the share rejects fails the copy, stays in t
 
 ## Subtitle tag stripping (`subtitle_strip_tags.py`)
 
-Some subtitle files carry leftover ASS/SSA override tags (for example `{\an8}`, a positioning tag) as literal text, from an ASS→SRT conversion that kept the tags. Most players, including Plex on TV clients, don't parse the tag and instead display it as on-screen text. `subtitle_strip_tags.py strip SRC DEST` strips any `{\...}` bracketed override sequence (structural match on a single line, not a tag-name keyword list) from a plain-text subtitle file, writing the result to a scratch copy — the original file is never modified. `encode.sh` calls it through `strip_sidecar_sub()` and owns the scratch directory, which is removed on exit. `subtitle_strip_tags.py has SRC` exits 0 when the file contains a tag, which is how `encode.sh` checks an extracted embedded track before deciding to strip it.
+Some subtitle files carry leftover ASS/SSA override tags (for example `{\an8}`, a positioning tag) as literal text, from an ASS→SRT conversion that kept the tags. Most players, including Plex on TV clients, don't parse the tag and instead display it as on-screen text. `subtitle_strip_tags.py strip SRC DEST` strips any `{\...}` bracketed override sequence (structural match on a single line, not a tag-name keyword list) from a plain-text subtitle file, writing the result to a scratch copy — the original file is never modified. `media_encode.sh` calls it through `strip_sidecar_sub()` and owns the scratch directory, which is removed on exit. `subtitle_strip_tags.py has SRC` exits 0 when the file contains a tag, which is how `media_encode.sh` checks an extracted embedded track before deciding to strip it.
 
 This is sidecar-file logic specifically (a real file already on disk); an *embedded* subtitle stream can't be edited in place the same way, and no script here repairs one.
 
@@ -487,11 +487,11 @@ Without `PLEX_LIBRARY` or `--library` every show and movie library on the server
 
 ### Logs and exit codes
 
-Logs go to `plex/logs/` (the `logs` directory beside `scripts/`): `plex_get_labels.log`, `plex_apply_labels.log`. Exit codes for stages 1 and 2: `0` complete, `1` aborted (outage, bad credentials, repeated failures, bad input), `2` complete but some lookups failed or rows went unmatched. A re-run retries only the failed lookups. `encode.sh` and `rename.sh` exit `0` when no file failed and `1` when any did, and `encode.sh` also exits `1` with "No video files found." when its input holds none; skipped and unmatched files do not change the status, except with `rename.sh -x`, which then exits `2`. `ingest.sh`, `release.sh` and `archive.sh` exit as described in their sections.
+Logs go to `plex/logs/` (the `logs` directory beside `scripts/`): `plex_get_labels.log`, `plex_apply_labels.log`. Exit codes for stages 1 and 2: `0` complete, `1` aborted (outage, bad credentials, repeated failures, bad input), `2` complete but some lookups failed or rows went unmatched. A re-run retries only the failed lookups. `media_encode.sh` and `media_rename.sh` exit `0` when no file failed and `1` when any did, and `media_encode.sh` also exits `1` with "No video files found." when its input holds none; skipped and unmatched files do not change the status, except with `media_rename.sh -x`, which then exits `2`. `media_ingest.sh`, `media_release.sh` and `media_archive.sh` exit as described in their sections.
 
 ### Flag conventions
 
-`-n` (or `--dry-run` on the Python tools and `plex_labels.sh`) is a dry run everywhere, and `-f` (or `--force`) is a force flag, except in `encode.sh`, where `-f` selects the output container and `-F` selects flat output; in `rename.sh` and `nas_setup_mount.sh` `-f` forces and `-F` (renamer) restricts the run to files. `encode.sh -o DIR` is the output directory and `rename.sh -O DIR` the operational directory; `ingest.sh` and `release.sh` take `-O DIR` with the same meaning. `rename.sh -x` is the attention exit. `ingest.sh -w` is the settle window. `release.sh -S` and `-D` name the holding and input directories and `-a` releases everything. `nas_setup_mount.sh -o` is extra mount options, as in `mount -o`. `archive.sh -m` is the NAS mount point it requires, `-w` its settle window and `-s` size-only verification. `systemd_install_units.sh -s` is the stage (`ingest` or `archive`), `-i` the interval in minutes and `-f` overwrites existing unit files.
+`-n` (or `--dry-run` on the Python tools and `plex_labels.sh`) is a dry run everywhere, and `-f` (or `--force`) is a force flag, except in `media_encode.sh`, where `-f` selects the output container and `-F` selects flat output; in `media_rename.sh` and `nas_setup_mount.sh` `-f` forces and `-F` (renamer) restricts the run to files. `media_encode.sh -o DIR` is the output directory and `media_rename.sh -O DIR` the operational directory; `media_ingest.sh` and `media_release.sh` take `-O DIR` with the same meaning. `media_rename.sh -x` is the attention exit. `media_ingest.sh -w` is the settle window. `media_release.sh -S` and `-D` name the holding and input directories and `-a` releases everything. `nas_setup_mount.sh -o` is extra mount options, as in `mount -o`. `media_archive.sh -m` is the NAS mount point it requires, `-w` its settle window and `-s` size-only verification. `systemd_install_units.sh -s` is the stage (`ingest` or `archive`), `-i` the interval in minutes and `-f` overwrites existing unit files.
 
 ### Known limitations
 

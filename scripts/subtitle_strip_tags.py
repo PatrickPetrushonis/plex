@@ -10,15 +10,15 @@ are not part of the SRT spec. When a subtitle service converts ASS to SRT and ke
 tags, they end up as literal text: a player that does not parse them renders "{\\an8}" on
 screen instead of positioning the line.
 
-has mode (called by encode.sh): exits 0 when SRC contains at least one tag, 1 when it
+has mode (called by media_encode.sh): exits 0 when SRC contains at least one tag, 1 when it
 contains none, 2 when SRC cannot be read. Prints nothing on 0 and 1.
 
-strip mode (called by encode.sh): writes a copy of SRC to DEST with every tag removed.
+strip mode (called by media_encode.sh): writes a copy of SRC to DEST with every tag removed.
 SRC is never modified, and an existing DEST is overwritten. Exits 0 on success, 1 on a
 read or write failure (message on stderr).
 
 Scope: sidecar files whose probed codec is subrip, and embedded SubRip or mov_text tracks
-that encode.sh has extracted to a temporary .srt. The caller gates on the codec. ASS/SSA,
+that media_encode.sh has extracted to a temporary .srt. The caller gates on the codec. ASS/SSA,
 WebVTT and MicroDVD sidecars never reach this script, and a real embedded ASS/SSA track
 must never be run through it: \\an8 there is genuine positioning, rendered correctly by an
 ASS-capable player, not a conversion artifact.
