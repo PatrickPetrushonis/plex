@@ -47,6 +47,9 @@
 #     mismatch rejects the output, so -M and -A never act on it
 #   * Audio streams are copied if their codec is in the copy list; otherwise -> aac
 #   * Subtitles: only target languages included; Signs & Songs tracks excluded
+#   * Embedded subtitles: one track per language and type (standard, CC, forced); the
+#     best codec wins (subrip, mov_text and webvtt, then ass and ssa, then bitmap) and
+#     a tie goes to the first listed track
 #   * Subtitle codec is container-aware: srt/ass in MKV; mov_text in MP4 (subtitle_mux.sh)
 #   * Sidecar subtitle files (<name>.<lang2>[.cc|.sdh|.forced].<ext>, ext in
 #     srt vtt ass ssa sub, claimed by probed codec subrip/webvtt/ass/microdvd;
@@ -667,8 +670,8 @@ cleanup_empty_dirs() {
 # verifies the copy by byte size, then removes SRC. ROOT is accepted for call
 # symmetry with backup_input() and is unused: the relative path is taken from
 # OUTPUT_DIR. A destination that already exists is never overwritten. Returns
-# 0 on success; returns 1 with SRC kept in place on any failure. In a dry run
-# it prints the plan and returns 0 without touching disk.
+# 0 on success; returns 1 with SRC kept in place on any failure, including an
+# existing destination. In a dry run it prints the plan without touching disk.
 archive_output() {
     local SRC="$1"
     local ROOT="$2"
@@ -679,14 +682,14 @@ archive_output() {
     local DEST_DIR
     DEST_DIR="$(dirname "$DEST")"
 
-    if (( DRY_RUN )); then
-        echo " [DRY RUN] Would archive: $SRC -> $DEST"
-        return 0
-    fi
     if [[ -e "$DEST" ]]; then
         echo " WARNING: archive destination already exists, not overwriting: $DEST" >&2
         log "ARCHIVE FAILED (destination exists): $SRC"
         return 1
+    fi
+    if (( DRY_RUN )); then
+        echo " [DRY RUN] Would archive: $SRC -> $DEST"
+        return 0
     fi
 
     echo " Archive -> $DEST"
@@ -781,7 +784,7 @@ backup_input() {
     local DEST_BASE="$3"
 
     move_into_backup "$SRC" "$ROOT" "$DEST_BASE" "" || return 1
-    cleanup_empty_dirs "$SRC" "$ROOT"
+    (( DRY_RUN )) || cleanup_empty_dirs "$SRC" "$ROOT"
 }
 
 # Moves each sidecar subtitle file that was muxed into the output to BACKUP_DIR,
@@ -819,9 +822,10 @@ backup_sidecar_subs() {
 # SUB_LINES and is muxed from the source. Args: input video, the name of the
 # SUB_LINES array, the name of the output array. Appends to the output array one
 # "LANG3 TYPE PATH" line per replaced track, LANG3 being the primary code. A
-# second standard (non-CC, non-forced) track of one language is dropped here by
-# the rule build_subtitle_args() applies, so a dropped duplicate is never
-# extracted and removing a replaced track cannot promote a duplicate behind it.
+# track that loses its language-and-type group in select_subtitle_winners(), the
+# choice build_subtitle_args() also makes, is dropped here, so a dropped
+# duplicate is never extracted and removing a replaced track cannot promote a
+# duplicate behind it.
 EMBED_STRIP_SEQ=0
 strip_embedded_text_tracks() {
     local INPUT="$1"
@@ -829,8 +833,10 @@ strip_embedded_text_tracks() {
     local -n _SL="$2"
     local -n _REPL="$3"
     local -a kept=()
-    local -A seen=()
+    local -A winner=()
     local line
+
+    select_subtitle_winners winner "${_SL[@]+"${_SL[@]}"}"
 
     for line in "${_SL[@]+"${_SL[@]}"}"; do
         local _ idx codec lang is_target is_forced is_signs is_cc rest
@@ -844,13 +850,10 @@ strip_embedded_text_tracks() {
 
         local type key
         type="$(subtitle_track_type "$is_forced" "$is_cc")"
-        if [[ "$type" == "target" ]]; then
-            key="$(canon_lang "$lang")"
-            if [[ -n "${seen[$key]+_}" ]]; then
-                echo " Subtitle[src:$idx]: DROP ($lang, duplicate standard track: no distinguishing title)"
-                continue
-            fi
-            seen["$key"]=1
+        key="$(subtitle_track_key "$lang" "$type")"
+        if [[ "${winner[$key]}" != "$idx" ]]; then
+            echo " Subtitle[src:$idx]: DROP ($lang, duplicate ${type/target/standard} track: src:${winner[$key]} kept)"
+            continue
         fi
 
         if [[ "$codec" != "subrip" && "$codec" != "mov_text" ]]; then
@@ -1054,9 +1057,51 @@ discard_encode_artifacts() {
     return 0
 }
 
+# -- finish_outputs ------------------------------------------------------------------
+# Runs -M and then -A for one encoded file. With -M set, archives each sidecar
+# output and then the video to ARCHIVE_DIR, the video only if every sidecar was
+# archived. With -A set and no archive failure, moves the muxed sidecar
+# subtitles and then the source video into BACKUP_DIR. Args: input video,
+# output video, scan root (empty for a file or glob input), then the names of
+# the sidecar job array ("STRIP<TAB>TMP<TAB>FINAL" lines) and the sidecar
+# "LANG TYPE PATH" line array. In a dry run it prints the planned moves and
+# touches nothing. Returns 0 when every requested step succeeded, 1 otherwise;
+# every failure is logged.
+finish_outputs() {
+    local INPUT="$1" OUTPUT="$2" ROOT="$3"
+    # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
+    local -n _FO_JOBS="$4"
+    # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
+    local -n _FO_EXTSUB="$5"
+    local POST_RC=0 _job _j_strip _j_tmp _j_final
+
+    if [[ -n "$ARCHIVE_DIR" ]]; then
+        # Sidecars first, video last, and the video only if every sidecar
+        # was archived.
+        for _job in "${_FO_JOBS[@]+"${_FO_JOBS[@]}"}"; do
+            IFS=$'\t' read -r _j_strip _j_tmp _j_final <<< "$_job"
+            archive_output "$_j_final" "$ROOT" "$ARCHIVE_DIR" || POST_RC=1
+        done
+        (( POST_RC )) || archive_output "$OUTPUT" "$ROOT" "$ARCHIVE_DIR" || POST_RC=1
+    fi
+    if (( POST_RC )); then
+        echo " WARNING: archive failed; source and sidecars left in place, output kept at $OUTPUT" >&2
+        log "BACKUP SKIPPED (archive failed): $(basename "$INPUT")"
+    elif [[ -n "$BACKUP_DIR" ]]; then
+        if backup_sidecar_subs "${_FO_EXTSUB[@]+"${_FO_EXTSUB[@]}"}" "$ROOT" "$BACKUP_DIR"; then
+            backup_input "$INPUT" "$ROOT" "$BACKUP_DIR" || true
+        else
+            echo " WARNING: a sidecar move failed; source video left in place with its remaining sidecars" >&2
+            log "BACKUP SKIPPED (sidecar move failed): $(basename "$INPUT")"
+        fi
+    fi
+    return "$POST_RC"
+}
+
 # -- execute_encode ------------------------------------------------------------------
 # Runs ffmpeg into OUTPUT_TMP, verifies the result (non-empty, SDR transfer,
-# subtitle stream count), promotes it to OUTPUT, then runs -M and -A. Args 7-9
+# subtitle stream count), promotes it to OUTPUT, then runs finish_outputs() for
+# -M and -A. Args 7-9
 # are the names of the ffmpeg arg array, the container-flag array, and the
 # sidecar "LANG TYPE PATH" line array; arg 10 is the number of subtitle streams
 # the build step emitted; args 11 and 12 are the names of the sidecar ffmpeg
@@ -1068,7 +1113,7 @@ execute_encode() {
     # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
     local -n _FF="$7"
     local -n _CF="$8"
-    local -n _EXTSUB="$9"
+    local EXTSUB_NAME="$9"
     local EXPECTED_SUBS="${10}"
     # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
     local -n _SFF="${11}"
@@ -1246,26 +1291,7 @@ execute_encode() {
         # The source and its sidecars move only after the output is safely in
         # place: a failed archive leaves them where they are.
         local POST_RC=0
-        if [[ -n "$ARCHIVE_DIR" ]]; then
-            # Sidecars first, video last, and the video only if every sidecar
-            # was archived.
-            for _job in "${_JOBS[@]+"${_JOBS[@]}"}"; do
-                IFS=$'\t' read -r _j_strip _j_tmp _j_final <<< "$_job"
-                archive_output "$_j_final" "$ROOT" "$ARCHIVE_DIR" || POST_RC=1
-            done
-            (( POST_RC )) || archive_output "$OUTPUT" "$ROOT" "$ARCHIVE_DIR" || POST_RC=1
-        fi
-        if (( POST_RC )); then
-            echo " WARNING: archive failed; source and sidecars left in place, output kept at $OUTPUT" >&2
-            log "BACKUP SKIPPED (archive failed): $(basename "$INPUT")"
-        elif [[ -n "$BACKUP_DIR" ]]; then
-            if backup_sidecar_subs "${_EXTSUB[@]+"${_EXTSUB[@]}"}" "$ROOT" "$BACKUP_DIR"; then
-                backup_input "$INPUT" "$ROOT" "$BACKUP_DIR" || true
-            else
-                echo " WARNING: a sidecar move failed; source video left in place with its remaining sidecars" >&2
-                log "BACKUP SKIPPED (sidecar move failed): $(basename "$INPUT")"
-            fi
-        fi
+        finish_outputs "$INPUT" "$OUTPUT" "$ROOT" _JOBS "$EXTSUB_NAME" || POST_RC=1
 
         [[ "$STDERR_CAPTURE" != "/dev/null" ]] && rm -f -- "$STDERR_CAPTURE"
         CURRENT_STDERR_CAPTURE=""
@@ -1465,7 +1491,11 @@ process_file() {
 
     echo ""
     if (( DRY_RUN )); then
-        echo " [DRY RUN] ffmpeg ${FF_ARGS[*]} ${CONTAINER_FLAGS[*]:-} \"$OUTPUT_TMP\" ${SIDECAR_FF[*]:-} && mv -> \"$OUTPUT\""
+        local DRY_CMD
+        printf -v DRY_CMD '%q ' ffmpeg "${FF_ARGS[@]}" "${CONTAINER_FLAGS[@]+"${CONTAINER_FLAGS[@]}"}" \
+            "$OUTPUT_TMP" "${SIDECAR_FF[@]+"${SIDECAR_FF[@]}"}"
+        echo " [DRY RUN] ${DRY_CMD}&& mv -- $(printf '%q %q' "$OUTPUT_TMP" "$OUTPUT")"
+        finish_outputs "$INPUT" "$OUTPUT" "$ROOT" SIDECAR_JOBS EXTSUB_LINES || true
         return 3
     fi
 

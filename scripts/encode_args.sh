@@ -12,8 +12,8 @@
 #                                                 build_subtitle_args()
 #   SIDECAR_EXTRACT_LINES                        array build_subtitle_args() appends
 #                                                 to in sidecar mode
-#   subtitle_output_codec, subtitle_track_type, sidecar_output_spec
-#                                                functions from subtitle_mux.sh
+#   subtitle_output_codec, subtitle_track_type, subtitle_track_key,
+#   sidecar_output_spec                          functions from subtitle_mux.sh
 #   canon_lang                                   function from lang_table.sh
 # subtitle_mux.sh and lang_table.sh are sourced by the caller before these
 # functions are called; this module does not source them itself.
@@ -62,7 +62,7 @@ build_video_args() {
     fi
 
     if [[ "$VID_CODEC" == "h264" ]] && (( SRC_HEIGHT <= MAX_HEIGHT )) && (( ! NEEDS_SDR )) && (( ! NEEDS_FMT )); then
-        echo " Video: COPY (already h264, SDR, 8-bit 4:2:0, within ${MAX_HEIGHT}p)"
+        echo " Video: COPY (already h264, transfer not PQ/HLG, 8-bit 4:2:0, within ${MAX_HEIGHT}p)"
         _FF+=(-map 0:v:0 -c:v copy)
         VID_TITLE="H.264 ${SRC_HEIGHT}p"
     else
@@ -155,6 +155,49 @@ build_audio_args() {
     done
 }
 
+# -- subtitle_codec_rank -------------------------------------------------------------
+# Echoes the preference rank of a source subtitle codec, lower is better: 0 for
+# the text formats every Plex app renders without burn-in (subrip, mov_text,
+# webvtt), 1 for ass/ssa and any other codec, 2 for bitmap formats (hdmv_pgs_subtitle,
+# dvd_subtitle, dvbsub), which most Plex apps can show only by burning them into
+# the video. Takes no other input and sets no state.
+subtitle_codec_rank() {
+    case "$1" in
+        subrip|mov_text|webvtt)                    echo 0 ;;
+        hdmv_pgs_subtitle|dvd_subtitle|dvbsub)     echo 2 ;;
+        *)                                         echo 1 ;;
+    esac
+}
+
+# -- select_subtitle_winners ---------------------------------------------------------
+# Chooses one embedded track per language and type. Tracks that are in a target
+# language and not Signs & Songs form a group per "<primary code3>:<type>" key
+# (subtitle_track_key; type is standard, CC or forced); the track with the lowest
+# subtitle_codec_rank wins, and a tie goes to the first listed. Fills the
+# associative array named by the first argument with key -> SRC_IDX of the winner
+# (emptied first), one entry for every group present. Args: array name, then the
+# source track lines in the format build_subtitle_args() documents. Both
+# build_subtitle_args() and strip_embedded_text_tracks() call this, so they
+# always agree on which track survives.
+select_subtitle_winners() {
+    local -n _WIN="$1"
+    shift
+    local -A _BEST_RANK=()
+    local line _ idx codec lang is_target is_forced is_signs is_cc rest key rank
+
+    _WIN=()
+    for line in "$@"; do
+        read -r _ idx codec lang is_target is_forced is_signs is_cc rest <<< "$line"
+        [[ "$is_target" == "1" && "$is_signs" != "1" ]] || continue
+        key="$(subtitle_track_key "$lang" "$(subtitle_track_type "$is_forced" "$is_cc")")"
+        rank="$(subtitle_codec_rank "$codec")"
+        if [[ -z "${_BEST_RANK[$key]+_}" ]] || (( rank < _BEST_RANK[$key] )); then
+            _BEST_RANK["$key"]="$rank"
+            _WIN["$key"]="$idx"
+        fi
+    done
+}
+
 # -- build_subtitle_args -------------------------------------------------------------
 # Selects embedded subtitle tracks. In -S embed mode each kept track becomes an
 # embedded stream in the output. In -S sidecar mode a kept track that has a text
@@ -164,8 +207,8 @@ build_audio_args() {
 # (e.g. {\an8}): -S sidecar strips the extracted srt files, and in -S embed mode
 # strip_embedded_text_tracks() replaces a tagged SubRip or mov_text track with a
 # stripped copy before this function runs.
-# A second standard (non-CC, non-forced) embedded track of the same primary
-# language is dropped; the language is compared after alias resolution.
+# One track is kept per primary language and type (standard, CC, forced), chosen
+# by select_subtitle_winners(); the language is compared after alias resolution.
 # Args: array name, the name of the output subtitle index counter (increased by
 # one per embedded track appended), then one line per source subtitle track
 # "IGNORED SRC_IDX CODEC LANG IS_TARGET IS_FORCED IS_SIGNS IS_CC LABEL", where
@@ -178,7 +221,8 @@ build_subtitle_args() {
     local -a SUB_LINES=("$@")
     local line
 
-    local -A _LANG_COUNT=()
+    local -A _WINNER=()
+    select_subtitle_winners _WINNER "${SUB_LINES[@]+"${SUB_LINES[@]}"}"
 
     for line in "${SUB_LINES[@]+"${SUB_LINES[@]}"}"; do
         local _ SRC_IDX SUB_CODEC SUB_LANG IS_TARGET IS_FORCED IS_SIGNS IS_CC LANG_LABEL
@@ -201,26 +245,25 @@ build_subtitle_args() {
             continue
         fi
 
-        local SUB_TITLE
-        if [[ "$IS_CC" == "1" ]]; then
-            SUB_TITLE="${LANG_LABEL} CC"
-        elif [[ "$IS_FORCED" == "1" ]]; then
-            SUB_TITLE="${LANG_LABEL} Forced"
-        else
-            local _lang_key
-            _lang_key="$(canon_lang "$SUB_LANG")"
-            _LANG_COUNT[$_lang_key]=$(( ${_LANG_COUNT[$_lang_key]:-0} + 1 ))
-            if (( ${_LANG_COUNT[$_lang_key]} > 1 )); then
-                echo " Subtitle[src:$SRC_IDX]: DROP ($SUB_LANG, duplicate standard track: no distinguishing title)"
-                continue
-            fi
-            SUB_TITLE="${LANG_LABEL}"
+        local SUB_TYPE _track_key
+        SUB_TYPE="$(subtitle_track_type "$IS_FORCED" "$IS_CC")"
+        _track_key="$(subtitle_track_key "$SUB_LANG" "$SUB_TYPE")"
+        if [[ "${_WINNER[$_track_key]}" != "$SRC_IDX" ]]; then
+            echo " Subtitle[src:$SRC_IDX]: DROP ($SUB_LANG, duplicate ${SUB_TYPE/target/standard} track: src:${_WINNER[$_track_key]} kept)"
+            continue
         fi
+
+        local SUB_TITLE
+        case "$SUB_TYPE" in
+            cc)     SUB_TITLE="${LANG_LABEL} CC" ;;
+            forced) SUB_TITLE="${LANG_LABEL} Forced" ;;
+            *)      SUB_TITLE="${LANG_LABEL}" ;;
+        esac
 
         # shellcheck disable=SC2153  # SUB_MODE is the caller-provided global named in the header; SUB_CODEC is a separate local
         if [[ "$SUB_MODE" == "sidecar" ]] && sidecar_output_spec "$SUB_CODEC" >/dev/null; then
             echo " Subtitle[src:$SRC_IDX]: SIDECAR: $SUB_TITLE ($SUB_CODEC)"
-            SIDECAR_EXTRACT_LINES+=("${SRC_IDX} ${SUB_CODEC} $(subtitle_track_type "$IS_FORCED" "$IS_CC") ${SUB_LANG}")
+            SIDECAR_EXTRACT_LINES+=("${SRC_IDX} ${SUB_CODEC} ${SUB_TYPE} ${SUB_LANG}")
             continue
         fi
 
@@ -243,5 +286,5 @@ build_subtitle_args() {
 
         _OUT_IDX=$(( _OUT_IDX + 1 ))
     done
-    unset _LANG_COUNT
+    unset _WINNER
 }

@@ -152,7 +152,7 @@ cd scripts
 
 `media.sh encode` takes `-n` and prints `[DRY RUN]` or `[LIVE]` first. It sources `config.sh` for paths/flags and calls the real work out to `encode.sh`, targeting `$INPUT_DIR`. A run lists its input files once, at the start, so entries released into `$INPUT_DIR` while it runs wait for the next encode. Never run `media.sh encode -n` and `media.sh encode` at the same time against the same output directory — see [Concurrency lock](#concurrency-lock).
 
-The dry run prints each file's decision, including whether an HDR source is tone-mapped to SDR (see [HEVC and HDR sources](#hevc-and-hdr-sources)).
+The dry run prints each file's decision, including whether an HDR source is tone-mapped to SDR (see [HEVC and HDR sources](#hevc-and-hdr-sources)), the ffmpeg command in a form that can be pasted into a shell, and each planned `-M` archive and `-A` backup move, with a warning for any destination that already exists.
 
 To change quality, paths, or run against a different tree without editing any file:
 
