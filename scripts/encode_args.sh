@@ -6,7 +6,8 @@
 # or creates, reads or changes a file.
 #
 # Sourced by encode.sh. The caller provides, before calling into this file:
-#   MAX_HEIGHT, SDR_TONEMAP_CHAIN, CRF, PRESET   read by build_video_args()
+#   MAX_HEIGHT, MAX_COPY_KBPS, SDR_TONEMAP_CHAIN, CRF, PRESET, TUNE
+#                                                read by build_video_args()
 #   AUDIO_COPY_CODECS, AUDIO_BITRATE             read by build_audio_args()
 #   SUB_MODE                                     "embed" or "sidecar", read by
 #                                                 build_subtitle_args()
@@ -36,18 +37,21 @@ is_hdr_transfer() {
 # -- build_video_args ---------------------------------------------------------------
 # Appends the video-stream ffmpeg args to the array named by $1.
 # Args: array name, source codec, source height, source fps, source colour
-# transfer, source Dolby Vision flag (0/1), source pixel format.
-# Copy path: h264, within MAX_HEIGHT, not PQ/HLG, and 8-bit 4:2:0 (yuv420p or
-# yuvj420p; an unreported pixel format is treated as eligible).
+# transfer, source Dolby Vision flag (0/1), source pixel format, source overall
+# bitrate in kb/s (empty when unknown).
+# Copy path: h264, within MAX_HEIGHT, not PQ/HLG, 8-bit 4:2:0 (yuv420p or
+# yuvj420p; an unreported pixel format is treated as eligible), and an overall
+# bitrate of at most MAX_COPY_KBPS. A MAX_COPY_KBPS of 0, or an unknown bitrate,
+# never forces a re-encode.
 # Encode path: everything else; PQ/HLG sources are tone-mapped to SDR and
 # tagged bt709, because libx264 writes the source's colour tags into the output
 # header unless they are set explicitly.
 build_video_args() {
     # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
     local -n _FF="$1"
-    local VID_CODEC="$2" SRC_HEIGHT="$3" SRC_FPS="$4" SRC_TRANSFER="$5" SRC_DOVI="$6" SRC_PIXFMT="$7"
+    local VID_CODEC="$2" SRC_HEIGHT="$3" SRC_FPS="$4" SRC_TRANSFER="$5" SRC_DOVI="$6" SRC_PIXFMT="$7" SRC_KBPS="${8:-}"
     local OUT_HEIGHT VID_TITLE ENCODE_DESC
-    local NEEDS_SDR=0 NEEDS_FMT=0
+    local NEEDS_SDR=0 NEEDS_FMT=0 TOO_HIGH=0
     local -a VF=()
 
     if is_hdr_transfer "$SRC_TRANSFER"; then
@@ -57,12 +61,15 @@ build_video_args() {
         yuv420p|yuvj420p|unknown) ;;
         *) NEEDS_FMT=1 ;;
     esac
+    if (( MAX_COPY_KBPS > 0 )) && [[ -n "$SRC_KBPS" ]] && (( SRC_KBPS > MAX_COPY_KBPS )); then
+        TOO_HIGH=1
+    fi
     if (( SRC_DOVI )); then
         echo " WARNING: source carries a Dolby Vision configuration record" >&2
     fi
 
-    if [[ "$VID_CODEC" == "h264" ]] && (( SRC_HEIGHT <= MAX_HEIGHT )) && (( ! NEEDS_SDR )) && (( ! NEEDS_FMT )); then
-        echo " Video: COPY (already h264, transfer not PQ/HLG, 8-bit 4:2:0, within ${MAX_HEIGHT}p)"
+    if [[ "$VID_CODEC" == "h264" ]] && (( SRC_HEIGHT <= MAX_HEIGHT )) && (( ! NEEDS_SDR )) && (( ! NEEDS_FMT )) && (( ! TOO_HIGH )); then
+        echo " Video: COPY (already h264, transfer not PQ/HLG, 8-bit 4:2:0, within ${MAX_HEIGHT}p, ${SRC_KBPS:-unknown} kb/s overall)"
         _FF+=(-map 0:v:0 -c:v copy)
         VID_TITLE="H.264 ${SRC_HEIGHT}p"
     else
@@ -79,6 +86,10 @@ build_video_args() {
             OUT_HEIGHT=$SRC_HEIGHT
             ENCODE_DESC="x264 @ native ${OUT_HEIGHT}p (source codec: $VID_CODEC)"
         fi
+        if (( TOO_HIGH )); then
+            ENCODE_DESC+=", ${SRC_KBPS} kb/s overall exceeds the ${MAX_COPY_KBPS} kb/s copy limit"
+        fi
+        ENCODE_DESC+=", CRF ${CRF}, preset ${PRESET}${TUNE:+, tune ${TUNE}}"
         if (( NEEDS_FMT )); then
             ENCODE_DESC+=", pixel format $SRC_PIXFMT converted to yuv420p"
         fi
@@ -102,6 +113,7 @@ build_video_args() {
             -profile:v high
             -level:v 4.1
         )
+        [[ -z "$TUNE" ]] || _FF+=(-tune "$TUNE")
         # Explicit tags: without them libx264 carries the source's tags over.
         if (( NEEDS_SDR )); then
             _FF+=(-color_primaries bt709 -color_trc bt709 -colorspace bt709)

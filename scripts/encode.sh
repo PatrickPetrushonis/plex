@@ -7,6 +7,9 @@
 #   -o DIR          Output directory (default: <script directory>/encoded)
 #   -c INT          CRF quality, 0-51, lower = better (default: 18)
 #   -p PRESET       x264 preset: ultrafast..veryslow (default: slow)
+#   -T TUNE         x264 tune, passed to ffmpeg as -tune, e.g. animation or film (default: none)
+#   -K KBPS         Copy h264 video only when the file's overall bitrate is at most KBPS kb/s;
+#                   a higher bitrate is re-encoded. 0 always copies (default: 8000)
 #   -b BITRATE      Audio fallback encode bitrate (default: 192k)
 #   -H HEIGHT       Max output height in px; taller sources are scaled down (default: 1080)
 #   -f FORMAT       Output container: mkv or mp4 (default: mkv)
@@ -35,7 +38,9 @@
 #   * Requires bash 4.0+, ffmpeg (built with the zscale and tonemap filters),
 #     ffprobe, python3, flock, find, grep, sed, awk, iconv
 #   * Video is copied if already h264, 8-bit 4:2:0, SDR (colour transfer not PQ or
-#     HLG), and within MAX_HEIGHT; otherwise re-encoded to x264
+#     HLG), within MAX_HEIGHT, and at an overall bitrate of at most -K kb/s (container
+#     size over duration, which includes audio; unreadable means copy); otherwise
+#     re-encoded to x264
 #   * PQ and HLG sources are tone-mapped to SDR BT.709 and tagged bt709, since
 #     libx264 writes the source's colour tags into the output unless they are
 #     set explicitly (see README: HEVC and HDR sources)
@@ -111,6 +116,8 @@ fi
 OUTPUT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/encoded"
 CRF=18
 PRESET="slow"
+TUNE=""
+MAX_COPY_KBPS=8000
 AUDIO_BITRATE="192k"
 MAX_HEIGHT=1080
 OUT_FORMAT="mkv"
@@ -153,11 +160,13 @@ usage() {
 }
 
 # -- Arg parsing -------------------------------------------------------------------
-while getopts ":o:c:p:b:H:f:l:a:e:L:M:A:S:d:P:rFnsh" opt; do
+while getopts ":o:c:p:T:K:b:H:f:l:a:e:L:M:A:S:d:P:rFnsh" opt; do
     case $opt in
         o) OUTPUT_DIR="$OPTARG" ;;
         c) CRF="$OPTARG" ;;
         p) PRESET="$OPTARG" ;;
+        T) TUNE="$OPTARG" ;;
+        K) MAX_COPY_KBPS="$OPTARG" ;;
         b) AUDIO_BITRATE="$OPTARG" ;;
         H) MAX_HEIGHT="$OPTARG" ;;
         f) OUT_FORMAT="$OPTARG" ;;
@@ -220,6 +229,11 @@ validate_params() {
 
     if ! [[ "$MAX_HEIGHT" =~ ^[0-9]+$ ]] || (( MAX_HEIGHT < 1 )); then
         echo "ERROR: MAX_HEIGHT must be a positive integer (got: $MAX_HEIGHT)" >&2
+        (( errors++ )) || true
+    fi
+
+    if ! [[ "$MAX_COPY_KBPS" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: Copy limit (-K) must be a non-negative integer in kb/s (got: $MAX_COPY_KBPS)" >&2
         (( errors++ )) || true
     fi
 
@@ -363,6 +377,8 @@ fi
     echo " Settings"
     echo "  CRF:          $CRF"
     echo "  Preset:       $PRESET"
+    echo "  Tune:         ${TUNE:-none}"
+    echo "  Copy limit:   ${MAX_COPY_KBPS} kb/s"
     echo "  Format:       $OUT_FORMAT"
     echo "  Max height:   ${MAX_HEIGHT}p"
     echo "  Sub langs:    $SUB_LANGS"
@@ -571,6 +587,23 @@ compute_output_path() {
 #   ERROR <message>   (on probe failure)
 probe_file() {
     python3 "$PROBE_PY" encode "$1" "$SUB_LANGS" "$LANG_TABLE_TSV"
+}
+
+# Echoes the overall bitrate of FILE in kb/s as an integer, from the container's
+# size and duration. Audio and subtitle streams are included, so it is an upper
+# bound on the video bitrate; the video stream's own value is not used because
+# ffprobe reports none for many Matroska files. Returns 1 with nothing echoed
+# when ffprobe fails or reports no usable size or duration.
+probe_overall_kbps() {
+    local OUT key val SIZE="" DURATION=""
+    OUT="$(ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 "$1" 2>/dev/null)" || return 1
+    while IFS='=' read -r key val; do
+        case "$key" in
+            duration) DURATION="$val" ;;
+            size)     SIZE="$val" ;;
+        esac
+    done <<< "$OUT"
+    awk -v s="$SIZE" -v d="$DURATION" 'BEGIN { if (s + 0 > 0 && d + 0 > 0) printf "%d\n", s * 8 / 1000 / d; else exit 1 }'
 }
 
 # Scratch directory for subtitle work: the tag-stripped copies of sidecar and
@@ -1542,7 +1575,9 @@ process_file() {
     local -a CONTAINER_FLAGS=()
     [[ "$OUT_FORMAT" == "mp4" ]] && CONTAINER_FLAGS+=(-movflags +faststart)
 
-    build_video_args    FF_ARGS "$VID_CODEC" "$SRC_HEIGHT" "$SRC_FPS" "$SRC_TRANSFER" "$SRC_DOVI" "$SRC_PIXFMT"
+    local SRC_KBPS
+    SRC_KBPS="$(probe_overall_kbps "$INPUT")" || SRC_KBPS=""
+    build_video_args    FF_ARGS "$VID_CODEC" "$SRC_HEIGHT" "$SRC_FPS" "$SRC_TRANSFER" "$SRC_DOVI" "$SRC_PIXFMT" "$SRC_KBPS"
     build_audio_args    FF_ARGS "${AUDIO_LINES[@]+"${AUDIO_LINES[@]}"}"
 
     local SUB_OUT_IDX=0

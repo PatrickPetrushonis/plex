@@ -219,8 +219,10 @@ Defines three independent variable groups: the video-library pipeline (from `VID
 | `ARCHIVE_DIR` | `$VIDEOS_BASE/encoded` | `encode.sh` `-M` (via `ENCODER_ARGS`); `archive.sh` source directory (positional arg) |
 | `BACKUP_DIR` | `$VIDEOS_BASE/backup` | `encode.sh` `-A` (via `ENCODER_ARGS`) |
 | `UNENCODED_DIR` | `$VIDEOS_BASE/unencoded` | `ingest.sh` holding directory (positional arg); `release.sh` `-S` |
-| `CRF` | `22` | `encode.sh` `-c` (via `ENCODER_ARGS`) |
-| `PRESET` | `fast` | `encode.sh` `-p` (via `ENCODER_ARGS`) |
+| `CRF` | `20` | `encode.sh` `-c` (via `ENCODER_ARGS`) |
+| `PRESET` | `slow` | `encode.sh` `-p` (via `ENCODER_ARGS`) |
+| `TUNE` | empty | `encode.sh` `-T` (via `ENCODER_ARGS`, only when set) |
+| `MAX_COPY_KBPS` | `8000` | `encode.sh` `-K` (via `ENCODER_ARGS`) |
 | `INGEST_SETTLE_SECONDS` | `60` | `ingest.sh` `-w` |
 | `DOWNLOADS_BASE` | `$HOME/Downloads` | `rename.sh` and `ingest.sh` `-O` (lock/log location only, not the target) |
 | `DOWNLOADS_INPUT_DIR` | `$DOWNLOADS_BASE/Complete` | `rename.sh` and `ingest.sh` positional arg (the actual target) |
@@ -228,7 +230,7 @@ Defines three independent variable groups: the video-library pipeline (from `VID
 | `NAS_ARCHIVE_DIR` | `$NAS_MOUNT/#archive` | `archive.sh` positional arg (the destination) |
 | `ARCHIVE_SETTLE_SECONDS` | `60` | `archive.sh` `-w` |
 
-No paths or usernames are hardcoded — everything derives from `$HOME` unless overridden. `ENCODER_ARGS` is a prebuilt array (`-r -s -c "$CRF" -p "$PRESET" -o "$OUTPUT_DIR" -M "$ARCHIVE_DIR" -A "$BACKUP_DIR"`) that `media.sh encode` splices in ahead of `$INPUT_DIR`; there is no equivalent prebuilt array for rename, ingest or release, since each needs only the raw directory values passed directly. `media.sh release` and `media.sh archive` pass `-O "$OUTPUT_DIR"`, so their logs sit beside the encoder's. `NAS_MOUNT`, `CRF`, `PRESET`, `INGEST_SETTLE_SECONDS` and `ARCHIVE_SETTLE_SECONDS` take overrides at call time; `INGEST_SETTLE_SECONDS=0 ./media.sh ingest -n` skips the settle wait.
+No paths or usernames are hardcoded — everything derives from `$HOME` unless overridden. `ENCODER_ARGS` is a prebuilt array (`-r -s -c "$CRF" -p "$PRESET" -K "$MAX_COPY_KBPS" -o "$OUTPUT_DIR" -M "$ARCHIVE_DIR" -A "$BACKUP_DIR"`, plus `-T "$TUNE"` when `TUNE` is set) that `media.sh encode` splices in ahead of `$INPUT_DIR`; there is no equivalent prebuilt array for rename, ingest or release, since each needs only the raw directory values passed directly. `media.sh release` and `media.sh archive` pass `-O "$OUTPUT_DIR"`, so their logs sit beside the encoder's. `NAS_MOUNT`, `CRF`, `PRESET`, `TUNE`, `MAX_COPY_KBPS`, `INGEST_SETTLE_SECONDS` and `ARCHIVE_SETTLE_SECONDS` take overrides at call time; `INGEST_SETTLE_SECONDS=0 ./media.sh ingest -n` skips the settle wait.
 
 `config.sh` does not set the maximum output height. The encoder's `-H` flag does (default 1080), so `media.sh` always uses 1080; call `encode.sh` directly to change it.
 
@@ -268,11 +270,12 @@ The core encoder is documented in full detail — every flag, the audio/subtitle
 
 ### Video decisions
 
-`MAX_HEIGHT` is the encoder's `-H` value (default 1080).
+`MAX_HEIGHT` is the encoder's `-H` value (default 1080). `MAX_COPY_KBPS` is its `-K` value (default 8000; 0 always copies): the file's overall bitrate, container size over duration, so it includes audio and overstates the video bitrate. A file whose size or duration cannot be read is copied.
 
 | Source | Result |
 |---|---|
-| h264, SDR, height ≤ `MAX_HEIGHT` | Stream copy (colour tags are unchanged because the stream is not touched) |
+| h264, SDR, height ≤ `MAX_HEIGHT`, overall bitrate ≤ `MAX_COPY_KBPS` | Stream copy (colour tags are unchanged because the stream is not touched) |
+| h264, SDR, height ≤ `MAX_HEIGHT`, overall bitrate > `MAX_COPY_KBPS` | Re-encoded to x264 at native height (a Blu-ray remux takes this row) |
 | h264 with a PQ or HLG transfer, height ≤ `MAX_HEIGHT` | Tone-mapped to SDR, re-encoded to x264, tagged bt709 |
 | h264, height > `MAX_HEIGHT` | Scaled to `MAX_HEIGHT` (width derived from the aspect ratio, even-numbered), re-encoded to x264; if PQ or HLG, scaled and then tone-mapped |
 | Any other codec, SDR | Re-encoded to x264 at native or `MAX_HEIGHT` height |
