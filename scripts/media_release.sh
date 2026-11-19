@@ -6,9 +6,10 @@
 # Usage:  ./media_release.sh -S <holding_dir> -D <input_dir> [OPTIONS] [-a | ITEM...]
 #
 # ITEM is Category/Entry: a category folder in <holding_dir> (the categories are
-# listed in media_categories.sh) and the name of one entry inside it. Options go
-# before the items. With no ITEM and no -a, the held entries are listed and
-# nothing moves.
+# listed in media_categories.sh) and the name of one entry inside it. A bare
+# category name stands for every entry held in that category. Options go before
+# the items. With no ITEM and no -a, the held entries are listed and nothing
+# moves.
 #
 # Options:
 #   -S DIR          Holding directory the entries come from (required)
@@ -276,7 +277,18 @@ if (( RELEASE_ALL )); then
         [[ -z "$NAME" ]] || report_no_match "not in a category folder; move it into one first" "$NAME"
     done < <(list_uncategorized)
 else
-    NAMES=("$@")
+    # An item that is just a category name stands for every entry held in it.
+    for ITEM in "$@"; do
+        if [[ "$ITEM" != */* ]] && is_category "$ITEM"; then
+            COUNT_BEFORE=${#NAMES[@]}
+            while IFS= read -r NAME; do
+                [[ "$NAME" == "${ITEM}/"* ]] && NAMES+=("$NAME")
+            done < <(list_held)
+            (( ${#NAMES[@]} > COUNT_BEFORE )) || report_no_match "nothing held in this category" "$ITEM"
+        else
+            NAMES+=("$ITEM")
+        fi
+    done
 fi
 
 for NAME in ${NAMES[@]+"${NAMES[@]}"}; do

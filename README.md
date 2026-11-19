@@ -132,10 +132,11 @@ cd scripts
 ./media.sh release                   # list what is held
 ./media.sh release -n "Movies/Name (2020)"  # preview moving one entry to $INPUT_DIR
 ./media.sh release "Movies/Name (2020)"     # move it, into $INPUT_DIR/Movies
+./media.sh release -n "Anime - Movies"      # preview moving every entry held in one category
 ./media.sh release -a                       # move everything
 ```
 
-Items are `Category/Entry` and go after the options, and `--` ends the options. The category folder is created in `$INPUT_DIR` when it is missing, which is how an entry reaches the archive under its category. `release` never overwrites or merges a name that already exists in `$INPUT_DIR`, and it is safe while an encode runs. See [`media_release.sh`](#media_releasesh).
+Items are `Category/Entry`, or a bare category name for every entry held in it, and go after the options, and `--` ends the options. The category folder is created in `$INPUT_DIR` when it is missing, which is how an entry reaches the archive under its category. `release` never overwrites or merges a name that already exists in `$INPUT_DIR`, and it is safe while an encode runs. See [`media_release.sh`](#media_releasesh).
 
 Ingest and release must finish before the encode: filenames must already be correct by the time the encoder builds sidecar-subtitle paths from them.
 
@@ -374,7 +375,7 @@ Entries stay in the holding directory until `media_release.sh` runs, so a wrong 
 Moves entries from the holding directory to the encoder's input directory. It takes `-S <holding_dir> -D <input_dir>`, then options, then item names; `media.sh release` supplies the directories and passes everything after `release` through.
 
 - With no item and no `-a`, it lists the held entries and moves nothing.
-- An item is `Category/Entry`: a category folder from `media_categories.sh` and one entry inside it. Anything else, or an item not held, is reported as no match. An entry directly in the holding directory, outside a category folder, is listed but not released; move it into a category folder first.
+- An item is `Category/Entry`: a category folder from `media_categories.sh` and one entry inside it. A bare category name stands for every entry held in that category, and is reported as no match when none is held. Anything else, or an item not held, is reported as no match. An entry directly in the holding directory, outside a category folder, is listed but not released; move it into a category folder first.
 - The entry moves into the same category folder in the input directory, which is created when missing.
 - `-a` releases every entry in every category folder. `-a` with item names is refused.
 - A name that already exists in the input directory is skipped and logged, never overwritten or merged.
