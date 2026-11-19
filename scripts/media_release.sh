@@ -5,14 +5,15 @@
 #
 # Usage:  ./media_release.sh -S <holding_dir> -D <input_dir> [OPTIONS] [-a | ITEM...]
 #
-# ITEM is the name of a top-level entry in <holding_dir>, with no path. Options
-# go before the items. With no ITEM and no -a, the held entries are listed and
+# ITEM is Category/Entry: a category folder in <holding_dir> (the categories are
+# listed in media_categories.sh) and the name of one entry inside it. Options go
+# before the items. With no ITEM and no -a, the held entries are listed and
 # nothing moves.
 #
 # Options:
 #   -S DIR          Holding directory the entries come from (required)
 #   -D DIR          Input directory the entries go to (required)
-#   -a              Release every entry in the holding directory
+#   -a              Release every entry in every category folder
 #   -n              Dry run: print the moves, move nothing, take no lock and
 #                   write no log (default: off)
 #   -O DIR          Operational directory: logs (OPDIR/Logs) and the lock file
@@ -24,6 +25,10 @@
 #   • Refuses to run as root: the folders and logs it creates must belong to
 #     the user who owns the library
 #   • Requires bash 4.0+, GNU find (-printf), flock, sha256sum and realpath
+#   • An entry keeps its category folder, which is created in <input_dir> when
+#     missing, so media_encode.sh -r carries it through to the archive
+#   • An entry sitting directly in <holding_dir>, outside a category folder, is
+#     listed but not released: move it into a category folder first
 #   • A target that already exists in <input_dir> is skipped and logged, never
 #     overwritten or merged: mv would nest a directory inside an existing one
 #   • Safe while an encode runs: media_encode.sh lists its input files once at the
@@ -105,6 +110,15 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -z "$OPERATIONAL_DIR" ]] && OPERATIONAL_DIR="$SCRIPT_DIR"
 
+# Category names (media_categories.sh, alongside this script): the same list
+# media_ingest.sh reads.
+[[ -r "${SCRIPT_DIR}/media_categories.sh" ]] || {
+    echo "ERROR: media_categories.sh not found next to this script (${SCRIPT_DIR})" >&2
+    exit 1
+}
+# shellcheck source=./media_categories.sh
+source "${SCRIPT_DIR}/media_categories.sh"
+
 # Canonical paths, so the identity check below holds for any spelling of them.
 SOURCE_REAL="$(realpath -- "$SOURCE_DIR")"
 DEST_REAL="$(realpath -m -- "$DEST_DIR")"
@@ -116,21 +130,43 @@ if [[ "$DEST_REAL" == "$SOURCE_REAL" || "$DEST_REAL" == "$SOURCE_REAL"/* || "$SO
     exit 1
 fi
 
-# Prints the top-level entries of the holding directory by name, one per line,
-# sorted. Prints nothing for an empty directory.
+# Prints the releasable entries of the holding directory as Category/Entry, one
+# per line, sorted. Only the folders named in media_categories.sh are read.
+# Prints nothing when none is held.
 list_held() {
-    find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort
+    local category name
+    for category in "${CATEGORIES[@]}"; do
+        [[ -d "${SOURCE_DIR}/${category}" ]] || continue
+        while IFS= read -r name; do
+            printf '%s/%s\n' "$category" "$name"
+        done < <(find "${SOURCE_DIR}/${category}" -mindepth 1 -maxdepth 1 -printf '%f\n')
+    done | LC_ALL=C sort
+}
+
+# Prints the top-level names in the holding directory that are not category
+# folders, one per line, sorted. These are not releasable until moved into one.
+list_uncategorized() {
+    local name
+    while IFS= read -r name; do
+        is_category "$name" || printf '%s\n' "$name"
+    done < <(find "$SOURCE_DIR" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
 }
 
 # Listing mode: no item and no -a.
 if (( ! RELEASE_ALL && $# == 0 )); then
     HELD_LIST="$(list_held)"
-    if [[ -z "$HELD_LIST" ]]; then
+    UNCATEGORIZED_LIST="$(list_uncategorized)"
+    if [[ -z "$HELD_LIST" && -z "$UNCATEGORIZED_LIST" ]]; then
         echo "Nothing is held in $SOURCE_DIR."
-    else
+    fi
+    if [[ -n "$HELD_LIST" ]]; then
         echo "Held in $SOURCE_DIR:"
         while IFS= read -r HELD_NAME; do echo "  $HELD_NAME"; done <<< "$HELD_LIST"
-        echo "Name the entries to release, or pass -a for all of them."
+        echo "Name the entries (Category/Entry) to release, or pass -a for all of them."
+    fi
+    if [[ -n "$UNCATEGORIZED_LIST" ]]; then
+        echo "Not in a category folder (move each into one before releasing):"
+        while IFS= read -r HELD_NAME; do echo "  $HELD_NAME"; done <<< "$UNCATEGORIZED_LIST"
     fi
     exit 0
 fi
@@ -189,9 +225,10 @@ report_no_match() {
     NO_MATCH=$(( NO_MATCH + 1 ))
 }
 
-# Moves one entry from the holding directory to the input directory, checking
-# the dry-run flag itself. Counts RELEASED, PREVIEWED, SKIPPED or FAILED. Sets
-# nothing else. Argument: entry name.
+# Moves one entry from its category folder in the holding directory to the same
+# category folder in the input directory, checking the dry-run flag itself.
+# Counts RELEASED, PREVIEWED, SKIPPED or FAILED. Sets nothing else. Argument:
+# item, as Category/Entry.
 release_entry() {
     local name="$1" src dest
     src="${SOURCE_DIR}/${name}"
@@ -211,6 +248,12 @@ release_entry() {
         PREVIEWED=$(( PREVIEWED + 1 ))
         return 0
     fi
+    mkdir -p -- "$(dirname -- "$dest")" || {
+        echo "  [FAILED] mkdir error" >&2
+        log "FAILED (mkdir): $dest"
+        FAILED=$(( FAILED + 1 ))
+        return 0
+    }
     # -T keeps mv from nesting the entry inside a directory that appeared at
     # the target after the check above; -n keeps it from overwriting a file that did.
     if mv -nT -- "$src" "$dest" && [[ ! -e "$src" && -e "$dest" ]]; then
@@ -229,15 +272,25 @@ log "Release started: $SOURCE_DIR -> $DEST_DIR"
 declare -a NAMES=()
 if (( RELEASE_ALL )); then
     mapfile -t NAMES < <(list_held)
+    while IFS= read -r NAME; do
+        [[ -z "$NAME" ]] || report_no_match "not in a category folder; move it into one first" "$NAME"
+    done < <(list_uncategorized)
 else
     NAMES=("$@")
 fi
 
 for NAME in ${NAMES[@]+"${NAMES[@]}"}; do
-    # An item is a bare entry name. A path would reach outside the holding
-    # directory, so it is refused before any filesystem check.
-    if [[ -z "$NAME" || "$NAME" == */* || "$NAME" == "." || "$NAME" == ".." ]]; then
-        report_no_match "not a bare entry name" "$NAME"
+    # An item is Category/Entry: a listed category folder and one entry name.
+    # Any other path would reach outside the holding directory, so it is
+    # refused before any filesystem check.
+    if [[ "$NAME" != */* ]]; then
+        report_no_match "not a Category/Entry item; an entry outside a category folder must be moved into one first" "$NAME"
+        continue
+    fi
+    ITEM_CATEGORY="${NAME%%/*}"
+    ITEM_ENTRY="${NAME#*/}"
+    if ! is_category "$ITEM_CATEGORY" || [[ -z "$ITEM_ENTRY" || "$ITEM_ENTRY" == */* || "$ITEM_ENTRY" == "." || "$ITEM_ENTRY" == ".." ]]; then
+        report_no_match "not a Category/Entry item with a listed category" "$NAME"
         continue
     fi
     if [[ ! -e "${SOURCE_DIR}/${NAME}" && ! -L "${SOURCE_DIR}/${NAME}" ]]; then
@@ -254,7 +307,7 @@ echo " Release complete"
 echo "  Released:   $RELEASED"
 (( DRY_RUN )) && echo "  Previewed:  $PREVIEWED  (dry run: nothing moved; re-run without -n to release)"
 echo "  Skipped:    $SKIPPED  (name already exists in $DEST_DIR - review manually)"
-echo "  No match:   $NO_MATCH  (not held, or not a bare entry name)"
+echo "  No match:   $NO_MATCH  (not held, or not a Category/Entry item)"
 echo "  Failed:     $FAILED"
 echo "------------------------------------------"
 log "Release complete: Released=$RELEASED Previewed=$PREVIEWED Skipped=$SKIPPED NoMatch=$NO_MATCH Failed=$FAILED"

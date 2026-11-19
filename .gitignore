@@ -18,5 +18,6 @@ __pycache__/
 
 # Label pipeline: lookup caches and lock files written next to the scripts
 data/*.csv
+data/*.tsv
 data/cache/
 *.lock

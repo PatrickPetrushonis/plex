@@ -1,0 +1,21 @@
+# plex_env.example: Credentials for the media and Plex label scripts.
+# Copy to ~/.config/plex_env, chmod 600 it, fill in the values. Never commit the
+# filled-in copy. media.sh sources it; for plex_labels.sh add
+# `source ~/.config/plex_env` to ~/.profile.
+#
+# WORK IN PROGRESS: only the names the scripts read today are listed.
+
+# TMDB v3 API key. Needed by media_ingest.sh (media_classify.py) and by
+# plex_labels.sh get unless it is run with --no-tmdb.
+export TMDB_API_KEY=''
+
+# MyAnimeList client ID. Needed by plex_labels.sh get with --source mal-api.
+export MAL_CLIENT_ID=''
+
+# Plex server address with scheme and port, and an access token. Needed by
+# plex_labels.sh sync and apply.
+export PLEX_URL='http://<nas-ip>:32400'
+export PLEX_TOKEN=''
+
+# Optional: limit the label stages to one Plex library.
+# export PLEX_LIBRARY=''

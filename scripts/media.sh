@@ -1,28 +1,42 @@
 #!/usr/bin/env bash
 # media.sh: Runs a pipeline stage with the settings in config.sh.
 #
-# Usage: ./media.sh <encode|rename|ingest|release|archive> [-n] [release options and items]
+# Usage: ./media.sh <encode|rename|ingest|release|archive|promote> [-n] [release options and items]
 #   encode   Runs media_encode.sh on $INPUT_DIR.
 #   rename   Runs media_rename.sh on $DOWNLOADS_INPUT_DIR, renaming the files into Plex naming.
 #   ingest   Runs media_ingest.sh: waits for $DOWNLOADS_INPUT_DIR to settle, previews the rename,
-#            renames for real only when the preview is clean, then moves each renamed
-#            entry to $UNENCODED_DIR. Exits 2 and writes a review file when the preview
-#            needs a decision.
-#   release  Runs media_release.sh: moves held entries from $UNENCODED_DIR to $INPUT_DIR.
-#            Everything after "release" goes to media_release.sh: -a (all), item names, and --
-#            to end the options. With neither -a nor an item, it lists the held entries.
+#            renames for real only when the preview is clean, then sorts each renamed
+#            entry into a category folder under $UNENCODED_DIR. Exits 2 and writes a review
+#            file when the preview or the sort needs a decision.
+#   release  Runs media_release.sh: moves held entries (Category/Entry) from $UNENCODED_DIR to
+#            $INPUT_DIR, keeping the category folder. Everything after "release" goes to
+#            media_release.sh: -a (all), items, and -- to end the options. With neither -a
+#            nor an item, it lists the held entries.
 #   archive  Runs media_archive.sh: moves the encoded files in $ARCHIVE_DIR to $NAS_ARCHIVE_DIR,
 #            category by category, merging into the folders already there. Needs the share
 #            mounted at $NAS_MOUNT. Exits 2 when a file collides or a top-level entry is not
 #            a category folder on the NAS.
+#   promote  Runs media_promote.sh: moves the finished files in $NAS_ARCHIVE_DIR into the
+#            category folders of $NAS_LIBRARY_DIR with a rename inside the share. Needs the
+#            share mounted at $NAS_MOUNT. Exits 2 when a file collides or a top-level entry
+#            is not a category folder in the library.
 #   -n      Dry run: preview only, writes nothing and renames nothing. Run this first.
 #   -h       Show this help
 #
 # Prints [DRY RUN] or [LIVE] first, so a real run is never mistaken for a preview.
+#
+# Credentials (TMDB_API_KEY and the others) are read from ~/.config/plex_env when
+# that file exists; PLEX_ENV_FILE names another path. Values in the file replace
+# the same names already in the environment.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 # shellcheck source=./config.sh
 source ./config.sh
+PLEX_ENV_FILE="${PLEX_ENV_FILE:-$HOME/.config/plex_env}"
+if [[ -f "$PLEX_ENV_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$PLEX_ENV_FILE"
+fi
 
 usage() {
     grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//' || true
@@ -54,15 +68,15 @@ while (( $# )); do
     case "$arg" in
         -n) DRY_ARGS=(-n); MODE="DRY RUN" ;;
         -h|--help) usage ;;
-        encode|rename|ingest|release|archive)
+        encode|rename|ingest|release|archive|promote)
             [[ -z "$COMMAND" ]] || { echo "ERROR: more than one command: $COMMAND, $arg" >&2; exit 1; }
             COMMAND="$arg" ;;
         *) echo "ERROR: unknown argument: $arg" >&2
-           echo "Usage: $0 <encode|rename|ingest|release|archive> [-n]" >&2
+           echo "Usage: $0 <encode|rename|ingest|release|archive|promote> [-n]" >&2
            exit 1 ;;
     esac
 done
-[[ -n "$COMMAND" ]] || { echo "Usage: $0 <encode|rename|ingest|release|archive> [-n]" >&2; exit 1; }
+[[ -n "$COMMAND" ]] || { echo "Usage: $0 <encode|rename|ingest|release|archive|promote> [-n]" >&2; exit 1; }
 
 echo "[$MODE] media.sh $COMMAND"
 
@@ -90,5 +104,10 @@ case "$COMMAND" in
         # -O puts archive logs beside media_encode.sh's and media_release.sh's in $OUTPUT_DIR/Logs.
         ./media_archive.sh ${DRY_ARGS[@]+"${DRY_ARGS[@]}"} -m "$NAS_MOUNT" -w "$ARCHIVE_SETTLE_SECONDS" \
             -O "$OUTPUT_DIR" "$ARCHIVE_DIR" "$NAS_ARCHIVE_DIR"
+        ;;
+    promote)
+        # -O puts promote logs beside the archive logs in $OUTPUT_DIR/Logs.
+        ./media_promote.sh ${DRY_ARGS[@]+"${DRY_ARGS[@]}"} -m "$NAS_MOUNT" \
+            -O "$OUTPUT_DIR" "$NAS_ARCHIVE_DIR" "$NAS_LIBRARY_DIR"
         ;;
 esac

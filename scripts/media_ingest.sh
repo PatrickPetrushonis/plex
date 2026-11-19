@@ -14,15 +14,26 @@
 #   3. Rename: media_rename.sh -x with no input attached, so a subtitle-deletion
 #      prompt is answered "no" instead of blocking an unattended run. Any
 #      non-zero exit stops the run before the move.
-#   4. Move: every top-level entry of <source_dir> that holds a video file moves
-#      to <holding_dir>, unless the files changed during step 3. An entry
-#      with no video, or whose name already exists in <holding_dir>, stays.
+#   4. Classify: media_classify.py names a category folder for each top-level
+#      entry that holds a video file (the categories are listed in
+#      media_categories.sh). An entry it cannot place stays and is listed for
+#      review; an entry whose lookup could not complete stays and the next run
+#      retries it.
+#   5. Move: each classified entry moves to <holding_dir>/<Category>/, unless
+#      the files changed during step 3. An entry with no video, or whose name
+#      already exists in its category folder, stays.
 #
 # Options:
 #   -n              Dry run: runs the settle check and the preview, then prints
 #                   what a real run does; renames and moves nothing, takes no
 #                   lock and writes no log (default: off)
 #   -w SECONDS      Settle window in seconds; 0 skips the check (default: 60)
+#   -C FILE         Category overrides for the classifier: "Title (YYYY)", a
+#                   tab, a category, one per line. A missing file means no
+#                   overrides (default: ../data/ingest_categories.tsv)
+#   -L FILE         Library folder list for the classifier: the label stage's
+#                   plex_folders.csv, which gives it the shows already in Plex
+#                   (default: ../data/plex_folders.csv)
 #   -O DIR          Operational directory: logs (OPDIR/Logs) and the lock file
 #                   (OPDIR/.locks), never <source_dir> itself; real runs only.
 #                   Default: this script's own directory
@@ -38,7 +49,8 @@
 #                       after a run that exits 0
 #
 # Exit codes:
-#   0  Nothing to do, directory not settled yet, or every entry moved
+#   0  Nothing to do, directory not settled yet, every entry moved, or entries
+#      deferred to the next run because a lookup could not complete
 #   1  media_rename.sh failed, a move failed, or bad usage
 #   2  Something needs a person (see Ingest_review.txt)
 #
@@ -46,7 +58,10 @@
 #   • Refuses to run as root: the folders and logs it creates must belong to
 #     the user who owns the library
 #   • Requires bash 4.4+ (mapfile -d), GNU find (-printf), flock, sha256sum,
-#     realpath, and media_rename.sh and video_exts.sh alongside this script
+#     realpath, python3, ffprobe, and media_rename.sh, media_classify.py,
+#     media_categories.sh and video_exts.sh alongside this script. A real run
+#     needs the TMDB_API_KEY environment variable (the key plex_labels.sh uses),
+#     checked before anything is renamed
 #   • One run per <source_dir> at a time; a second run exits 1 immediately. The
 #     lock file is named ingest_<hash>.lock, apart from media_rename.sh's
 #     <hash>.lock for the same directory, so the two never block each other
@@ -54,6 +69,10 @@
 #     them repeats that exit code at once, with no settle wait, rename or log
 #     line. Renaming a file, or adding or removing a name in either directory,
 #     starts the run over
+#   • The category is chosen from the renamed names, so a dry run does not show
+#     it. A lookup that cannot complete defers the entry. While an entry is
+#     deferred the run records no state, so the next run retries it even when
+#     another entry needs a person
 #   • A top-level entry is moved whole. With a clean preview every video under
 #     it is already renamed, so a folder never leaves half renamed
 #   • A directory is never merged into an existing one: mv would nest it
@@ -78,6 +97,8 @@ require sort
 require cmp
 require mktemp
 require sleep
+require python3
+require ffprobe
 require realpath
 find / -maxdepth 0 -printf '' &>/dev/null || {
     echo "ERROR: find must support -printf (GNU findutils)" >&2
@@ -95,6 +116,8 @@ fi
 DRY_RUN=0
 SETTLE_SECONDS=60
 OPERATIONAL_DIR=""
+OVERRIDES_FILE=""
+FOLDERS_FILE=""
 
 # Usage
 usage() {
@@ -103,9 +126,11 @@ usage() {
 }
 
 # Arg parsing
-while getopts ":w:O:nh" opt; do
+while getopts ":w:C:L:O:nh" opt; do
     case $opt in
         w) SETTLE_SECONDS="$OPTARG" ;;
+        C) OVERRIDES_FILE="$OPTARG" ;;
+        L) FOLDERS_FILE="$OPTARG" ;;
         O) OPERATIONAL_DIR="$OPTARG" ;;
         n) DRY_RUN=1 ;;
         h) usage ;;
@@ -149,6 +174,34 @@ RENAME_SH="${SCRIPT_DIR}/media_rename.sh"
 }
 # shellcheck source=./video_exts.sh
 source "${SCRIPT_DIR}/video_exts.sh"
+
+# The classifier and the category list (media_categories.sh, which
+# media_release.sh also reads), alongside this script.
+CLASSIFY_PY="${SCRIPT_DIR}/media_classify.py"
+[[ -r "$CLASSIFY_PY" ]] || {
+    echo "ERROR: media_classify.py not found next to this script (${SCRIPT_DIR})" >&2
+    exit 1
+}
+[[ -r "${SCRIPT_DIR}/media_categories.sh" ]] || {
+    echo "ERROR: media_categories.sh not found next to this script (${SCRIPT_DIR})" >&2
+    exit 1
+}
+# shellcheck source=./media_categories.sh
+source "${SCRIPT_DIR}/media_categories.sh"
+[[ -n "$OVERRIDES_FILE" ]] || OVERRIDES_FILE="${SCRIPT_DIR}/../data/ingest_categories.tsv"
+[[ -n "$FOLDERS_FILE" ]] || FOLDERS_FILE="${SCRIPT_DIR}/../data/plex_folders.csv"
+# The classifier looks up every entry on TMDB. Checked here, before the rename,
+# so a missing key never leaves renamed entries that cannot be sorted.
+if (( ! DRY_RUN )) && [[ -z "${TMDB_API_KEY:-}" ]]; then
+    echo "ERROR: TMDB_API_KEY is not set; put it in ~/.config/plex_env (template: plex_env.example), a TMDB v3 API key that media_classify.py needs" >&2
+    exit 1
+fi
+# Without the library list the classifier cannot tell a series movie from a
+# movie, so say so once here instead of once per entry.
+if [[ ! -f "$FOLDERS_FILE" ]]; then
+    echo "WARNING: library list not found: $FOLDERS_FILE; series movies are not detected" >&2
+    FOLDERS_FILE=""
+fi
 
 # Canonical paths, so the nesting check below holds for any spelling of them.
 SOURCE_REAL="$(realpath -- "$SOURCE_DIR")"
@@ -203,9 +256,13 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
 # Counters
 PROMOTED=0
 HELD=0
+UNCLASSIFIED=0
+DEFERRED_LOOKUP=0
 COLLIDED=0
 FAILED=0
 REVIEW_TEXT=""
+CLASS_CATEGORY=""
+CLASS_REASON=""
 
 # Appends one line to REVIEW_TEXT, the text a person must read. Argument: line.
 add_review() { REVIEW_TEXT+="$1"$'\n'; }
@@ -220,13 +277,33 @@ report_held() {
 }
 
 # Reports an entry left in the source directory because its name already exists
-# in the holding directory. A directory is never merged: mv would nest it.
-# Prints, logs and counts it, and adds it to the review text. Argument: name.
+# in its category folder in the holding directory. A directory is never merged:
+# mv would nest it. Prints, logs and counts it, and adds it to the review text.
+# Arguments: name, category folder.
 report_collision() {
-    echo "COLLISION (name already exists in $HOLD_DIR; merge manually): $1"
-    log "COLLISION: $1"
-    add_review "COLLISION (name already exists in $HOLD_DIR; merge manually): $1"
+    echo "COLLISION (name already exists in $2; merge manually): $1"
+    log "COLLISION: $2/$1"
+    add_review "COLLISION (name already exists in $2; merge manually): $1"
     COLLIDED=$(( COLLIDED + 1 ))
+}
+
+# Reports an entry left in the source directory because the classifier needs a
+# person to place it: prints, logs and counts it, and adds it to the review
+# text. Arguments: name, reason.
+report_unclassified() {
+    echo "NEEDS A DECISION ($2; left in place): $1"
+    log "UNCLASSIFIED ($2): $1"
+    add_review "NEEDS A DECISION ($2; left in $SOURCE_DIR): $1. Name its category in $OVERRIDES_FILE, or move it into a category folder under $HOLD_DIR by hand."
+    UNCLASSIFIED=$(( UNCLASSIFIED + 1 ))
+}
+
+# Reports an entry left in the source directory because a lookup could not
+# complete: prints, logs and counts it. It is not added to the review text; the
+# next run retries it. Arguments: name, reason.
+report_deferred() {
+    echo "DEFERRED ($2; the next run retries): $1"
+    log "DEFERRED ($2): $1"
+    DEFERRED_LOOKUP=$(( DEFERRED_LOOKUP + 1 ))
 }
 
 # Reports a move that did not complete: prints, logs and counts it. Argument:
@@ -263,21 +340,26 @@ tree_signature() {
 
 # Prints one hash of every path under the source directory with its type, size
 # and modification time, plus the top-level names in the holding directory.
-# Unlike tree_signature it changes when a file is renamed or a held name appears
-# or disappears, so a person's fix makes the next run start over.
+# Unlike tree_signature it changes when a file is renamed, a held name appears or
+# disappears (in a category folder too), or the overrides file changes, so a
+# person's fix makes the next run start over.
 state_signature() {
     {
         find "$SOURCE_DIR" -mindepth 1 -printf '%P\t%y\t%s\t%T@\n'
-        find "$HOLD_DIR" -mindepth 1 -maxdepth 1 -printf 'held\t%f\n'
+        find "$HOLD_DIR" -mindepth 1 -maxdepth 2 -printf 'held\t%P\n'
+        if [[ -f "$OVERRIDES_FILE" ]]; then
+            printf 'overrides\t%s\n' "$(sha256sum < "$OVERRIDES_FILE")"
+        fi
     } | LC_ALL=C sort | sha256sum | cut -d' ' -f1
 }
 
 # Records RC and the current state_signature in STATE_FILE, so the next run that
 # finds nothing changed repeats RC without redoing the work, or removes
-# STATE_FILE when RC is 0. Real runs only. Argument: exit code.
+# STATE_FILE when RC is 0 or an entry was deferred, so a deferred lookup is
+# retried by the next run. Real runs only. Argument: exit code.
 record_state() {
     (( DRY_RUN )) && return 0
-    if (( $1 == 0 )); then
+    if (( $1 == 0 || DEFERRED_LOOKUP > 0 )); then
         rm -f -- "$STATE_FILE"
     else
         printf '%s %s\n' "$1" "$(state_signature)" > "$STATE_FILE"
@@ -317,15 +399,45 @@ entry_has_video() {
     [[ -n "$found" ]]
 }
 
-# Moves one top-level entry to the holding directory, or reports why it stays:
-# gone since the listing (a failure), no video inside (held), or its name
-# already in the holding directory (a collision). Checks the dry-run flag
-# itself. Counts PROMOTED, HELD, COLLIDED or FAILED. Sets nothing else.
-# Argument: entry path.
+# Asks media_classify.py for the category of one entry. Sets CLASS_CATEGORY and
+# CLASS_REASON. The classifier prints "<first field><TAB><reason>" and exits 0
+# for a chosen category, 2 when it needs a person (HOLD), 3 when a lookup could
+# not complete (DEFER) and 1 on an error (ERROR). Returns 0 for a chosen
+# category that is listed in media_categories.sh, 2 or 3 as the classifier did,
+# and 1 for any other exit or an unlisted category. Argument: entry path.
+classify_entry() {
+    local entry="$1" out="" rc=0
+    local -a args=(-E "$VIDEO_EXTS" -C "$OVERRIDES_FILE")
+    CLASS_CATEGORY=""
+    CLASS_REASON=""
+    [[ -z "$FOLDERS_FILE" ]] || args+=(-L "$FOLDERS_FILE")
+    out="$(python3 "$CLASSIFY_PY" "${args[@]}" -- "$entry")" || rc=$?
+    IFS=$'\t' read -r CLASS_CATEGORY CLASS_REASON <<< "$out"
+    case "$rc" in
+        0)
+            if is_category "$CLASS_CATEGORY"; then
+                return 0
+            fi
+            CLASS_REASON="unlisted category '${CLASS_CATEGORY}'"
+            return 1
+            ;;
+        2|3) return "$rc" ;;
+        *)
+            CLASS_REASON="${CLASS_REASON:-exit $rc}"
+            return 1
+            ;;
+    esac
+}
+
+# Moves one top-level entry to its category folder in the holding directory, or
+# reports why it stays: gone since the listing (a failure), no video inside
+# (held), no category chosen (a decision, or deferred to the next run), or its
+# name already in the category folder (a collision). Checks the dry-run flag
+# itself. Counts PROMOTED, HELD, UNCLASSIFIED, DEFERRED_LOOKUP, COLLIDED or
+# FAILED. Sets nothing else. Argument: entry path.
 ingest_entry() {
-    local entry="$1" name dest
+    local entry="$1" name dest class_rc=0
     name="$(basename -- "$entry")"
-    dest="${HOLD_DIR}/${name}"
     if [[ ! -e "$entry" && ! -L "$entry" ]]; then
         report_failure "$name (gone since the listing)"
         return 0
@@ -334,19 +446,31 @@ ingest_entry() {
         report_held "$name"
         return 0
     fi
+    classify_entry "$entry" || class_rc=$?
+    case "$class_rc" in
+        0) ;;
+        2) report_unclassified "$name" "$CLASS_REASON"; return 0 ;;
+        3) report_deferred "$name" "$CLASS_REASON"; return 0 ;;
+        *) report_failure "$name (classifier: $CLASS_REASON)"; return 0 ;;
+    esac
+    dest="${HOLD_DIR}/${CLASS_CATEGORY}/${name}"
     if [[ -e "$dest" || -L "$dest" ]]; then
-        report_collision "$name"
+        report_collision "$name" "${HOLD_DIR}/${CLASS_CATEGORY}"
         return 0
     fi
     if (( DRY_RUN )); then
-        echo "  [DRY RUN] Would move: $name -> $dest"
+        echo "  [DRY RUN] Would move: $name -> $dest ($CLASS_REASON)"
         return 0
     fi
+    mkdir -p -- "${HOLD_DIR}/${CLASS_CATEGORY}" || {
+        report_failure "$name (mkdir ${CLASS_CATEGORY})"
+        return 0
+    }
     # -T keeps mv from nesting the entry inside a directory that appeared at
     # DEST after the check above; -n keeps it from overwriting a file that did.
     if mv -nT -- "$entry" "$dest" && [[ ! -e "$entry" && -e "$dest" ]]; then
-        echo "MOVED: $name"
-        log "MOVED: $entry -> $dest"
+        echo "MOVED: $name -> $CLASS_CATEGORY ($CLASS_REASON)"
+        log "MOVED: $entry -> $dest ($CLASS_REASON)"
         PROMOTED=$(( PROMOTED + 1 ))
     else
         report_failure "$name (mv error)"
@@ -412,7 +536,7 @@ if (( PREVIEW_RC != 0 )); then
         "$PREVIEW_FILE"
 fi
 if (( DRY_RUN )); then
-    echo "[DRY RUN] The preview is clean. A real run renames, then moves every entry of $SOURCE_DIR that holds a video to $HOLD_DIR."
+    echo "[DRY RUN] The preview is clean. A real run renames, then sorts every entry of $SOURCE_DIR that holds a video into a category folder under $HOLD_DIR. Categories are chosen from the renamed names, so they are not previewed."
     exit 0
 fi
 
@@ -439,8 +563,8 @@ if [[ "$(tree_signature "$SOURCE_DIR")" != "$SIG_SETTLED" ]]; then
     exit 0
 fi
 
-# 4. MOVE
-echo "=== Move to $HOLD_DIR ==="
+# 4. CLASSIFY AND MOVE
+echo "=== Classify and move to $HOLD_DIR ==="
 mapfile -d '' ENTRIES < <(list_entries)
 for ENTRY in ${ENTRIES[@]+"${ENTRIES[@]}"}; do
     ingest_entry "$ENTRY"
@@ -452,10 +576,12 @@ echo "------------------------------------------"
 echo " Ingest complete"
 echo "  Moved:      $PROMOTED"
 echo "  Held:       $HELD  (no video file inside; left in $SOURCE_DIR)"
-echo "  Collisions: $COLLIDED  (name already exists in $HOLD_DIR; merge manually)"
+echo "  Unplaced:   $UNCLASSIFIED  (no category chosen; left in $SOURCE_DIR, see the review file)"
+echo "  Deferred:   $DEFERRED_LOOKUP  (a lookup could not complete; the next run retries)"
+echo "  Collisions: $COLLIDED  (name already exists in its category folder; merge manually)"
 echo "  Failed:     $FAILED"
 echo "------------------------------------------"
-log "Ingest complete: Moved=$PROMOTED Held=$HELD Collisions=$COLLIDED Failed=$FAILED"
+log "Ingest complete: Moved=$PROMOTED Held=$HELD Unplaced=$UNCLASSIFIED Deferred=$DEFERRED_LOOKUP Collisions=$COLLIDED Failed=$FAILED"
 echo "Log saved to: $LOG_FILE"
 FINAL_RC=0
 if (( FAILED > 0 )); then
