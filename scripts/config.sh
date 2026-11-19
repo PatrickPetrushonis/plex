@@ -12,8 +12,8 @@
 #
 # shellcheck disable=SC2034
 # File-wide: INPUT_DIR, UNENCODED_DIR, DOWNLOADS_INPUT_DIR, NAS_ARCHIVE_DIR,
-# INGEST_SETTLE_SECONDS, ARCHIVE_SETTLE_SECONDS and ENCODER_ARGS are written here and
-# read by media.sh; shellcheck cannot see across that boundary standalone.
+# NAS_LIBRARY_DIR, INGEST_SETTLE_SECONDS, ARCHIVE_SETTLE_SECONDS and ENCODER_ARGS are
+# written here and read by media.sh; shellcheck cannot see across that boundary standalone.
 
 : "${VIDEOS_BASE:=$HOME/Videos}"
 : "${DOWNLOADS_BASE:=$HOME/Downloads}"
@@ -32,6 +32,9 @@ DOWNLOADS_INPUT_DIR="$DOWNLOADS_BASE/Complete"
 
 # NAS folder that media_archive.sh fills from $ARCHIVE_DIR.
 NAS_ARCHIVE_DIR="$NAS_MOUNT/#archive"
+
+# NAS folder whose category folders media_promote.sh moves finished files into.
+NAS_LIBRARY_DIR="$NAS_MOUNT"
 
 CRF="${CRF:-20}"
 PRESET="${PRESET:-slow}"
