@@ -29,6 +29,7 @@ plex/
     ├── media_rename_parse.sh       Shared: media_rename.sh's name parsing (raw name to Plex name; edition, episode and subtitle-tag rules), no filesystem access
     ├── subtitle_mux.sh             Shared: container-aware subtitle codec choice, sidecar discovery, external-subtitle ffmpeg arg building
     ├── subtitle_strip_tags.py      Strips leftover ASS override tags (e.g. {\an8}) from a plain-text subtitle file; called by media_encode.sh
+    ├── subtitle_join.py            Joins SubRip files, shifting each by an offset, for the subtitles of a multi-part movie; called by media_encode.sh
     ├── subtitle_scan_types.sh      Standalone, read-only inventory of embedded subtitle codecs across a directory - no wrapper, no config.sh dependency
     ├── lang_table.sh               Shared language-code loader (bash side)
     ├── lang_table.tsv              Canonical language data (single source of truth)
@@ -151,7 +152,7 @@ cd scripts
 
 `media.sh encode` takes `-n` and prints `[DRY RUN]` or `[LIVE]` first. It sources `config.sh` for paths/flags and calls the real work out to `media_encode.sh`, targeting `$INPUT_DIR`. A run lists its input files once, at the start, so entries released into `$INPUT_DIR` while it runs wait for the next encode. Never run `media.sh encode -n` and `media.sh encode` at the same time against the same output directory — see [Concurrency lock](#concurrency-lock).
 
-The dry run prints each file's decision, including whether an HDR source is tone-mapped to SDR (see [HEVC and HDR sources](#hevc-and-hdr-sources)), the ffmpeg command in a form that can be pasted into a shell, and each planned `-M` archive and `-A` backup move, with a warning for any destination that already exists.
+The dry run prints each job's decision (a movie split into `CD1` and `CD2` files is one job and lists every part, see [Multi-part movies](#multi-part-movies-cd1cd2)), including whether an HDR source is tone-mapped to SDR (see [HEVC and HDR sources](#hevc-and-hdr-sources)), the ffmpeg command in a form that can be pasted into a shell, and each planned `-M` archive and `-A` backup move, with a warning for any destination that already exists.
 
 To change quality, paths, or run against a different tree without editing any file:
 
@@ -325,9 +326,21 @@ The conversion filter chain lives in one constant, `SDR_TONEMAP_CHAIN`, near the
 - **Mislabelled SDR.** A source with SDR pixels wrongly tagged PQ is tone-mapped like an HDR source, because the tag is the only machine-readable signal.
 - **Existing HDR-sourced outputs.** An output encoded without tone-mapping from an HDR source holds PQ-coded pixels. Re-encode it from the source; a tag rewrite makes it play but leaves the picture misdescribed.
 
+### Multi-part movies (CD1/CD2)
+
+A movie split across files in one folder is encoded as one output. Names that match once a part token is removed (`cd`, `disc`, `disk`, `dvd`, `part` or `pt`, then a number, with an optional `of N`: `Title CD1 (YYYY).avi`, `Title - part2.mkv`) and whose numbers run 1..N with no gap or repeat form a set. `Title CD1 (YYYY).avi` and `Title CD2 (YYYY).avi` become `Title (YYYY).mkv`, the Plex name of a single-file movie. Episode names (`S01E02`, `1x02`) are never merged.
+
+- **One encode.** ffmpeg's concat demuxer reads the parts as one input, so the video is encoded once, and the copy-or-transcode, audio and subtitle decisions are taken from part 1 and apply to the whole movie.
+- **Same layout.** A set is merged only when every part has a readable duration and the same stream layout (codec, size, pixel format, frame rate, sample rate, channels). An incomplete set (`CD1` and `CD3`) or a mismatched one is encoded as separate files, with a warning and a `MERGE SKIPPED` log line. `-J` turns merging off.
+- **Subtitles.** The sidecar files of one language and type (`Title CD1 (YYYY).en.srt`, `Title CD2 (YYYY).en.srt`) are converted to SubRip, shifted by the summed durations of the parts before them (`subtitle_join.py`) and muxed as one track, or written as one `Title (YYYY).en.srt` with `-S sidecar`. ASS styling in a joined sidecar is dropped. A language that exists for only some parts is joined from those parts, with a warning. Embedded tracks are joined with the video and are not checked for override tags.
+- **Check.** The merged output's duration must be within the larger of 1% and 3 seconds of the parts' total, or the output is rejected before it is promoted and the sources stay untouched. A failed subtitle join fails the job the same way.
+- **`-M` and `-A`.** `-M` archives the single output. `-A` moves every part with every part's sidecars, and moves nothing when the backup destination of any part already exists.
+
+Known limitation: two separate movies whose names differ only by a part number (`Title Part 1 (YYYY)` and `Title Part 2 (YYYY)` in one folder) look like one set and are merged; `-J` encodes them separately.
+
 ### Subtitles
 
-Sidecar discovery, the container-aware subtitle codec choice and external-subtitle ffmpeg arg building live in the shared `subtitle_mux.sh`. Sidecars are tag-stripped before muxing (see [Subtitle tag stripping](#subtitle-tag-stripping-subtitle_strip_tagspy)).
+Sidecar discovery, the container-aware subtitle codec choice and external-subtitle ffmpeg arg building live in the shared `subtitle_mux.sh`. Sidecars are tag-stripped before muxing (see [Subtitle tag stripping](#subtitle-tag-stripping-subtitle_strip_tagspy)). A `.sub` file is claimed only when ffprobe identifies it as MicroDVD; with ffprobe 6.1.1 that needs a first line `{1}{1}<fps>` (for example `{1}{1}25.000`), and a file of bare `{start}{end}text` lines is reported as unclaimed.
 
 ## `media_rename.sh`
 

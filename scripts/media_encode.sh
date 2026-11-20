@@ -22,6 +22,8 @@
 #   -r              Recurse into subdirectories, mirroring folder structure in output
 #   -F              Flat output: do not mirror directory structure (default when
 #                   input is a file or glob; ignored for directory inputs unless set)
+#   -J              Do not merge multi-part sets: encode each CD1/CD2 file on its own
+#                   (default: a complete, compatible set in one folder is one output)
 #   -n              Dry run: print decisions, do not encode
 #   -s              Skip if output file already exists (default: overwrite)
 #   -M PATH         After encode: cp output to this path (a local staging directory or a NAS/SMB mount), verify size, remove original
@@ -37,7 +39,7 @@
 # Notes:
 #   * Requires bash 4.0+, ffmpeg (built with the zscale and tonemap filters),
 #     ffprobe, python3, flock, find, grep, sed, awk, iconv, and media_progress.sh
-#     alongside this script
+#     and subtitle_join.py alongside this script
 #   * The spinner and elapsed time show on a terminal only; a run without one
 #     (a callback, cron) prints none of it
 #   * Video is copied if already h264, 8-bit 4:2:0, SDR (colour transfer not PQ or
@@ -87,6 +89,23 @@
 #     (e.g. {\an8}) is extracted to a scratch file, tag-stripped, and muxed from the
 #     stripped copy; a track without tags is muxed from the source as is. A dry run
 #     does not inspect embedded tracks
+#   * Multi-part movies: video files in one folder whose names match once a part token
+#     is removed (cd, disc, disk, dvd, part or pt, then a number: "Title CD1 (YYYY).avi",
+#     "Title - part2.mkv") and whose numbers run 1..N without a gap are encoded as one
+#     output named without the token. ffmpeg's concat demuxer joins the parts inside the
+#     single encode, so the video is encoded once. A set is merged only when every part
+#     has the same stream layout (codec, size, frame rate, sample rate, channels); an
+#     incomplete or mismatched set is encoded as separate files with a warning, and -J
+#     turns merging off. Episode names (SxxEyy, NxNN) are never merged. Known limitation:
+#     two separate movies named "Title Part 1 (YYYY)" and "Title Part 2 (YYYY)" in one
+#     folder look like one set and are merged; use -J to encode them separately
+#   * Merged sets and subtitles: the sidecar files of one language and type are converted
+#     to SubRip, shifted by the summed durations of the parts before them
+#     (subtitle_join.py) and muxed as one track; ASS styling in a joined sidecar is
+#     dropped. Embedded tracks are joined with the video and are not checked for ASS
+#     override tags. An output whose duration differs from the parts' total by more than
+#     the larger of 1% and 3 s is rejected. -A moves every part and its sidecars, and
+#     moves none when the backup destination of any part already exists
 #   * Output is written atomically (.tmp -> rename) so interrupted runs are retry-safe
 #   * On SIGINT/SIGTERM: partial .tmp file is removed, summary written to log
 #   * -M uses cp + size verify + rm (safe for cross-device/NAS destinations); a
@@ -139,6 +158,11 @@ BACKUP_DIR=""       # -A: mv source input here after encode
 SUB_MODE_CHOICES=(embed sidecar)   # valid -S values
 DEFAULT_SUB_MODE="embed"           # subtitle delivery when -S is not given: one of SUB_MODE_CHOICES
 SUB_MODE="$DEFAULT_SUB_MODE"       # -S: set from the option, validated in validate_params
+MERGE_PARTS=1       # -J sets 0: do not merge multi-part sets
+# A merged output's duration must be within the larger of MERGE_TOLERANCE_PCT percent and
+# MERGE_TOLERANCE_MIN_SECONDS seconds of the parts' summed durations.
+MERGE_TOLERANCE_PCT=1
+MERGE_TOLERANCE_MIN_SECONDS=3
 
 # Filter chain applied to PQ and HLG sources: linearize, convert primaries to
 # BT.709, tone-map, then convert to the BT.709 transfer and matrix at 8-bit
@@ -163,7 +187,7 @@ usage() {
 }
 
 # -- Arg parsing -------------------------------------------------------------------
-while getopts ":o:c:p:T:K:b:H:f:l:a:e:L:M:A:S:d:P:rFnsh" opt; do
+while getopts ":o:c:p:T:K:b:H:f:l:a:e:L:M:A:S:d:P:rFJnsh" opt; do
     case $opt in
         o) OUTPUT_DIR="$OPTARG" ;;
         c) CRF="$OPTARG" ;;
@@ -184,6 +208,7 @@ while getopts ":o:c:p:T:K:b:H:f:l:a:e:L:M:A:S:d:P:rFnsh" opt; do
         S) SUB_MODE="$OPTARG" ;;
         r) RECURSE=1 ;;
         F) FLAT_OUTPUT=1 ;;
+        J) MERGE_PARTS=0 ;;
         n) DRY_RUN=1 ;;
         s) SKIP_EXISTING=1 ;;
         h) usage ;;
@@ -279,6 +304,8 @@ PROBE_PY="$(dirname "${BASH_SOURCE[0]}")/probe_streams.py"
 [[ -r "$PROBE_PY" ]] || { echo "ERROR: probe_streams.py not found next to this script ($PROBE_PY)" >&2; exit 1; }
 STRIP_PY="$(dirname "${BASH_SOURCE[0]}")/subtitle_strip_tags.py"
 [[ -r "$STRIP_PY" ]] || { echo "ERROR: subtitle_strip_tags.py not found next to this script ($STRIP_PY)" >&2; exit 1; }
+JOIN_PY="$(dirname "${BASH_SOURCE[0]}")/subtitle_join.py"
+[[ -r "$JOIN_PY" ]] || { echo "ERROR: subtitle_join.py not found next to this script ($JOIN_PY)" >&2; exit 1; }
 # shellcheck source=./video_exts.sh
 source "$(dirname "${BASH_SOURCE[0]}")/video_exts.sh"
 PROGRESS_SH="$(dirname "${BASH_SOURCE[0]}")/media_progress.sh"
@@ -436,6 +463,13 @@ declare -a CURRENT_SIDECAR_TMPS=()
 # Set by build_subtitle_args() in -S sidecar mode: one "SRC_IDX CODEC TYPE LANG3"
 # line per embedded text track to extract. process_file() resets it per file.
 declare -a SIDECAR_EXTRACT_LINES=()
+# The video files of the job in progress: the input alone, or every part of a merged
+# multi-part set in part order. Set by process_file(), read by execute_encode() and
+# finish_outputs().
+declare -a CURRENT_PARTS=()
+# The parts' summed durations in seconds for a merged set; empty for a single file. Set
+# by process_file(), read by execute_encode().
+CURRENT_EXPECTED_SECONDS=""
 
 # SIGINT/SIGTERM handler. Stops the running ffmpeg, removes the partial .tmp
 # output and the stderr capture, prints the summary labelled ABORTED, and exits
@@ -523,6 +557,165 @@ collect_files() {
     fi
 }
 
+# -- Multi-part sets -------------------------------------------------------------------
+# A movie split across files ("Title CD1 (YYYY).avi", "Title CD2 (YYYY).avi") is one
+# job: ffmpeg joins the parts with the concat demuxer inside the single encode. These
+# functions find the sets in ALL_FILES before the batch starts.
+
+# Parses NAME (a file name without directory or extension) for a part token: cd, disc,
+# disk, dvd, part or pt, an optional gap of spaces, dots, underscores or hyphens, a one
+# or two digit number and an optional "of N", with a non-alphanumeric character or the
+# edge of the name on both sides. A name with an episode marker (SxxEyy or NxNN) never
+# matches. Sets MP_OK (1 when matched), MP_NUM (the part number) and MP_STEM (NAME with
+# the token and the separators around it removed, the rest joined by one space:
+# "Title CD1 (YYYY)" gives "Title (YYYY)"). MP_NUM is 0 and MP_STEM empty when MP_OK is 0.
+multipart_parse() {
+    local NAME="$1" PRE="" POST="" NC=0
+    local EPISODE_RE='(^|[^[:alnum:]])(s[0-9]{1,2}e[0-9]{1,3}|[0-9]{1,2}x[0-9]{2,3})([^[:alnum:]]|$)'
+    local TOKEN_RE='^(.*[^[:alnum:]])?(cd|disc|disk|dvd|part|pt)[[:space:]._-]*([0-9]{1,2})([[:space:]._-]+of[[:space:]._-]+[0-9]{1,2})?([^[:alnum:]].*)?$'
+    MP_OK=0; MP_NUM=0; MP_STEM=""
+
+    shopt -q nocasematch && NC=1
+    shopt -s nocasematch
+    if [[ ! "$NAME" =~ $EPISODE_RE ]] && [[ "$NAME" =~ $TOKEN_RE ]]; then
+        PRE="${BASH_REMATCH[1]}"
+        MP_NUM=$(( 10#${BASH_REMATCH[3]} ))
+        POST="${BASH_REMATCH[5]}"
+        MP_OK=1
+    fi
+    (( NC )) || shopt -u nocasematch
+    (( MP_OK )) || return 0
+
+    # A token wrapped in its own brackets, "Title (CD1)", leaves the pair empty.
+    if [[ "$PRE" == *"(" && "$POST" == ")"* ]] || [[ "$PRE" == *"[" && "$POST" == "]"* ]]; then
+        PRE="${PRE%?}"
+        POST="${POST#?}"
+    fi
+    PRE="${PRE%"${PRE##*[![:space:]._-]}"}"
+    POST="${POST#"${POST%%[![:space:]._-]*}"}"
+    if [[ -n "$PRE" && -n "$POST" ]]; then
+        MP_STEM="$PRE $POST"
+    else
+        MP_STEM="${PRE}${POST}"
+    fi
+    if [[ -z "$MP_STEM" ]]; then
+        MP_OK=0
+        MP_NUM=0
+    fi
+}
+
+# Echoes one line per stream of FILE with the properties the concat demuxer needs
+# identical across parts: type, codec, size, pixel format, frame rate, sample rate and
+# channels. Returns 1 when ffprobe fails.
+stream_signature() {
+    ffprobe -v error \
+        -show_entries stream=codec_type,codec_name,width,height,pix_fmt,r_frame_rate,sample_rate,channels \
+        -of csv=p=0 "$1" 2>/dev/null
+}
+
+# Echoes the container duration of FILE in seconds. Returns 1 with nothing echoed when
+# ffprobe fails or reports no positive duration.
+probe_duration() {
+    local OUT
+    OUT="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null)" || return 1
+    awk -v d="$OUT" 'BEGIN { if (d + 0 > 0) { print d; exit 0 } exit 1 }'
+}
+
+# Echoes the sum of the decimal second counts in the arguments, to three decimals.
+sum_seconds() {
+    printf '%s\n' "$@" | awk '{ s += $1 } END { printf "%.3f\n", s }'
+}
+
+# Returns 0 when the files given (the parts of one set) can be joined: ffprobe reads
+# each, each has a duration, and each has the stream layout of the first. Otherwise
+# returns 1 with MERGE_REASON naming the first part that fails and why.
+check_part_set() {
+    local FIRST_SIG="" SIG p
+    MERGE_REASON=""
+    for p in "$@"; do
+        if ! SIG="$(stream_signature "$p")" || [[ -z "$SIG" ]]; then
+            MERGE_REASON="cannot read the streams of $(basename -- "$p")"
+            return 1
+        fi
+        if ! probe_duration "$p" >/dev/null; then
+            MERGE_REASON="cannot read the duration of $(basename -- "$p")"
+            return 1
+        fi
+        if [[ -z "$FIRST_SIG" ]]; then
+            FIRST_SIG="$SIG"
+        elif [[ "$SIG" != "$FIRST_SIG" ]]; then
+            MERGE_REASON="$(basename -- "$p") has a different stream layout than $(basename -- "$1") (codec, size, frame rate, sample rate or channels)"
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Maps the path of part 1 of each merged set to the paths of all its parts in part
+# order, one per line. Filled by group_multipart_files().
+declare -A GROUP_PARTS=()
+
+# Collapses each complete, compatible multi-part set in ALL_FILES into one job: the
+# entry for part 1 stays and the other parts leave ALL_FILES and ALL_ROOTS, and
+# GROUP_PARTS records the set. A set is the files that share a folder, a scan root and
+# a stem (multipart_parse) and numbered 1..N with no gap or repeat; every part must
+# pass check_part_set. A set that fails either test stays as separate files, with a
+# warning. A path that contains a newline is never part of a set. Does nothing under -J.
+group_multipart_files() {
+    (( MERGE_PARTS )) || return 0
+    local -A MEMBERS=() DROP=()
+    local -a KEYS=() ROWS=() PARTS=() PARTS_IDX=() NEW_FILES=() NEW_ROOTS=()
+    local i f key row num idx k ok SET_STEM NUMS
+    for (( i=0; i<${#ALL_FILES[@]}; i++ )); do
+        f="${ALL_FILES[$i]}"
+        [[ "$f" == *$'\n'* ]] && continue
+        multipart_parse "$(basename -- "${f%.*}")"
+        (( MP_OK )) || continue
+        key="${ALL_ROOTS[$i]}"$'\x1f'"$(dirname -- "$f")"$'\x1f'"$MP_STEM"
+        [[ -n "${MEMBERS[$key]+_}" ]] || KEYS+=("$key")
+        MEMBERS["$key"]+="${MP_NUM} ${i}"$'\n'
+    done
+
+    for key in "${KEYS[@]+"${KEYS[@]}"}"; do
+        SET_STEM="${key##*$'\x1f'}"
+        mapfile -t ROWS < <(printf '%s' "${MEMBERS[$key]}" | sort -n -k1,1)
+        (( ${#ROWS[@]} >= 2 )) || continue
+        PARTS=(); PARTS_IDX=(); k=0; ok=1; NUMS=""
+        for row in "${ROWS[@]}"; do
+            read -r num idx <<< "$row"
+            k=$(( k + 1 ))
+            (( num == k )) || ok=0
+            NUMS+="${NUMS:+,}${num}"
+            PARTS_IDX+=("$idx")
+            PARTS+=("${ALL_FILES[$idx]}")
+        done
+        if (( ! ok )); then
+            echo "WARNING: \"$SET_STEM\" not merged: its part numbers are $NUMS, a set needs 1..${#ROWS[@]} with no gap or repeat" >&2
+            log "MERGE SKIPPED (part numbers $NUMS): $SET_STEM"
+            continue
+        fi
+        if ! check_part_set "${PARTS[@]}"; then
+            echo "WARNING: \"$SET_STEM\" not merged: $MERGE_REASON" >&2
+            log "MERGE SKIPPED ($MERGE_REASON): $SET_STEM"
+            continue
+        fi
+        GROUP_PARTS["${PARTS[0]}"]="$(printf '%s\n' "${PARTS[@]}")"
+        for idx in "${PARTS_IDX[@]:1}"; do
+            DROP["$idx"]=1
+        done
+        echo "Multi-part: \"$SET_STEM\" (${#PARTS[@]} parts) will be encoded as one output"
+        log "MERGE: $SET_STEM (${#PARTS[@]} parts)"
+    done
+
+    for (( i=0; i<${#ALL_FILES[@]}; i++ )); do
+        [[ -n "${DROP[$i]+_}" ]] && continue
+        NEW_FILES+=("${ALL_FILES[$i]}")
+        NEW_ROOTS+=("${ALL_ROOTS[$i]}")
+    done
+    ALL_FILES=("${NEW_FILES[@]+"${NEW_FILES[@]}"}")
+    ALL_ROOTS=("${NEW_ROOTS[@]+"${NEW_ROOTS[@]}"}")
+}
+
 for ARG in "$@"; do
     if [[ -d "$ARG" ]]; then
         collect_files "$ARG" "${ARG%/}"
@@ -535,6 +728,8 @@ if [[ ${#ALL_FILES[@]} -eq 0 ]]; then
     echo "No video files found."
     exit 1
 fi
+
+group_multipart_files
 
 echo "Files to process: ${#ALL_FILES[@]}"
 log "Files to process: ${#ALL_FILES[@]}"
@@ -564,11 +759,14 @@ check_disk_space() {
 }
 
 # -- Compute output path ---------------------------------------------------------------
+# Echoes the output path for INPUT under OUTPUT_DIR: mirrored by its folder below ROOT,
+# or flat when ROOT is empty or -F is set. STEM, when given, replaces INPUT's file name
+# without extension (a merged set's name without the part token).
 compute_output_path() {
     local INPUT="$1"
     local ROOT="$2"
-    local BASENAME
-    BASENAME="$(basename "${INPUT%.*}")"
+    local BASENAME="${3:-}"
+    [[ -n "$BASENAME" ]] || BASENAME="$(basename "${INPUT%.*}")"
 
     if [[ -z "$ROOT" ]] || (( FLAT_OUTPUT )); then
         echo "${OUTPUT_DIR}/${BASENAME}.${OUT_FORMAT}"
@@ -613,10 +811,11 @@ probe_overall_kbps() {
     awk -v s="$SIZE" -v d="$DURATION" 'BEGIN { if (s + 0 > 0 && d + 0 > 0) printf "%d\n", s * 8 / 1000 / d; else exit 1 }'
 }
 
-# Scratch directory for subtitle work: the tag-stripped copies of sidecar and
-# embedded subtitle tracks, and the temporary .srt extracted from each embedded
-# track to check it for override tags. Created once, after the concurrency lock
-# above is held, and only for a real run (see the guard below).
+# Scratch directory: the tag-stripped copies of sidecar and embedded subtitle tracks,
+# the temporary .srt extracted from each embedded track to check it for override tags,
+# and, for a merged multi-part set, the concat list and the joined subtitle files.
+# Created once, after the concurrency lock above is held, and only for a real run (see
+# the guard below).
 SUB_TMP_DIR=""
 
 # Removes SUB_TMP_DIR and everything under it. Safe to call when it was never
@@ -776,20 +975,27 @@ archive_output() {
     log "ARCHIVED: $(basename "$SRC")"
 }
 
+# Echoes where SRC goes under DEST_BASE: its path relative to ROOT, or its file name
+# alone when ROOT is empty.
+backup_dest_path() {
+    local SRC="$1" ROOT="$2" DEST_BASE="$3" REL
+    if [[ -n "$ROOT" ]]; then
+        REL="${SRC#"${ROOT}"/}"
+    else
+        REL="$(basename "$SRC")"
+    fi
+    echo "${DEST_BASE}/${REL}"
+}
+
 # Moves SRC under DEST_BASE, mirroring its path relative to ROOT (flat by file
 # name when ROOT is empty). Refuses to overwrite an existing destination.
 # LABEL ("" or " (sidecar)") is appended to messages. Returns 0 on success, 1
 # on any failure; every failure is logged.
 move_into_backup() {
     local SRC="$1" ROOT="$2" DEST_BASE="$3" LABEL="$4"
-    local REL DEST DEST_DIR
+    local DEST DEST_DIR
 
-    if [[ -n "$ROOT" ]]; then
-        REL="${SRC#"${ROOT}"/}"
-    else
-        REL="$(basename "$SRC")"
-    fi
-    DEST="${DEST_BASE}/${REL}"
+    DEST="$(backup_dest_path "$SRC" "$ROOT" "$DEST_BASE")"
     DEST_DIR="$(dirname "$DEST")"
 
     if [[ -e "$DEST" ]]; then
@@ -1140,6 +1346,20 @@ verify_sdr_output() {
     ! is_hdr_transfer "${TRANSFER:-unknown}"
 }
 
+# -- verify_merged_duration -----------------------------------------------------------
+# Sets MERGED_DURATION_ACTUAL to the duration of FILE in seconds (empty when it cannot
+# be read). Returns 0 when it is within the merge tolerance of EXPECTED seconds, 1
+# otherwise or when it cannot be read. Call on the .tmp output of a merged set.
+MERGED_DURATION_ACTUAL=""
+verify_merged_duration() {
+    local FILE="$1" EXPECTED="$2"
+    MERGED_DURATION_ACTUAL=""
+    MERGED_DURATION_ACTUAL="$(probe_duration "$FILE")" || return 1
+    awk -v a="$MERGED_DURATION_ACTUAL" -v e="$EXPECTED" \
+        -v pct="$MERGE_TOLERANCE_PCT" -v min="$MERGE_TOLERANCE_MIN_SECONDS" \
+        'BEGIN { tol = e * pct / 100; if (tol < min) tol = min; d = a - e; if (d < 0) d = -d; exit (d <= tol) ? 0 : 1 }'
+}
+
 # -- discard_encode_artifacts ---------------------------------------------------------
 # Removes the .tmp output, the sidecar .tmp files, and the stderr capture after
 # a rejected encode and clears the trackers the signal handler reads. Args: tmp
@@ -1161,7 +1381,9 @@ discard_encode_artifacts() {
 # Runs -M and then -A for one encoded file. With -M set, archives each sidecar
 # output and then the video to ARCHIVE_DIR, the video only if every sidecar was
 # archived. With -A set and no archive failure, moves the muxed sidecar
-# subtitles and then the source video into BACKUP_DIR. Args: input video,
+# subtitles and then the source video, or every part of a merged set, into
+# BACKUP_DIR; a merged set moves nothing when the backup destination of any part
+# already exists. Args: input video (part 1 of a merged set),
 # output video, scan root (empty for a file or glob input), then the names of
 # the sidecar job array ("STRIP<TAB>TMP<TAB>FINAL" lines) and the sidecar
 # "LANG TYPE PATH" line array. In a dry run it prints the planned moves and
@@ -1188,8 +1410,19 @@ finish_outputs() {
         echo " WARNING: archive failed; source and sidecars left in place, output kept at $OUTPUT" >&2
         log "BACKUP SKIPPED (archive failed): $(basename "$INPUT")"
     elif [[ -n "$BACKUP_DIR" ]]; then
-        if backup_sidecar_subs "${_FO_EXTSUB[@]+"${_FO_EXTSUB[@]}"}" "$ROOT" "$BACKUP_DIR"; then
-            backup_input "$INPUT" "$ROOT" "$BACKUP_DIR" || true
+        local _part _taken=""
+        if (( ${#CURRENT_PARTS[@]} > 1 )); then
+            for _part in "${CURRENT_PARTS[@]}"; do
+                [[ -e "$(backup_dest_path "$_part" "$ROOT" "$BACKUP_DIR")" ]] && _taken="$_part"
+            done
+        fi
+        if [[ -n "$_taken" ]]; then
+            echo " WARNING: backup destination already exists for $(basename -- "$_taken"); no part or sidecar moved" >&2
+            log "BACKUP SKIPPED (destination exists): $(basename "$_taken")"
+        elif backup_sidecar_subs "${_FO_EXTSUB[@]+"${_FO_EXTSUB[@]}"}" "$ROOT" "$BACKUP_DIR"; then
+            for _part in "${CURRENT_PARTS[@]}"; do
+                backup_input "$_part" "$ROOT" "$BACKUP_DIR" || true
+            done
         else
             echo " WARNING: a sidecar move failed; source video left in place with its remaining sidecars" >&2
             log "BACKUP SKIPPED (sidecar move failed): $(basename "$INPUT")"
@@ -1233,8 +1466,14 @@ execute_encode() {
         return 1
     }
 
+    local JOB_LABEL
+    JOB_LABEL="$(basename "$INPUT")"
+    if (( ${#CURRENT_PARTS[@]} > 1 )); then
+        JOB_LABEL+=" (+$(( ${#CURRENT_PARTS[@]} - 1 )) more parts)"
+    fi
+
     echo " Running ffmpeg..."
-    log "PROCESSING: $(basename "$INPUT")"
+    log "PROCESSING: $JOB_LABEL"
     local FILE_START
     FILE_START=$(date +%s)
 
@@ -1320,6 +1559,13 @@ execute_encode() {
             return 1
         fi
 
+        if [[ -n "$CURRENT_EXPECTED_SECONDS" ]] && ! verify_merged_duration "$OUTPUT_TMP" "$CURRENT_EXPECTED_SECONDS"; then
+            echo " ERROR: merged output runs ${MERGED_DURATION_ACTUAL:-an unreadable number of} s, expected ${CURRENT_EXPECTED_SECONDS} s (the parts' total); not promoted, sources untouched" >&2
+            log "FAILED (merged duration ${MERGED_DURATION_ACTUAL:-unreadable} != ${CURRENT_EXPECTED_SECONDS}): $INPUT"
+            discard_encode_artifacts "$OUTPUT_TMP" "$STDERR_CAPTURE"
+            return 1
+        fi
+
         if ! prepare_sidecars _JOBS; then
             log "FAILED (sidecar output): $INPUT"
             discard_encode_artifacts "$OUTPUT_TMP" "$STDERR_CAPTURE"
@@ -1347,8 +1593,11 @@ execute_encode() {
         FILE_DUR=$(( FILE_END - FILE_START ))
 
         # Capture file sizes for log: use MB for readability
-        local SRC_BYTES OUT_BYTES SRC_MB OUT_MB
-        SRC_BYTES=$(stat -c '%s' "$INPUT"  2>/dev/null || echo 0)
+        local SRC_BYTES=0 OUT_BYTES SRC_MB OUT_MB _part _part_bytes
+        for _part in "${CURRENT_PARTS[@]}"; do
+            _part_bytes=$(stat -c '%s' "$_part" 2>/dev/null || echo 0)
+            SRC_BYTES=$(( SRC_BYTES + _part_bytes ))
+        done
         OUT_BYTES=$(stat -c '%s' "$OUTPUT" 2>/dev/null || echo 0)
         SRC_MB=$(( SRC_BYTES / 1024 / 1024 ))
         OUT_MB=$(( OUT_BYTES / 1024 / 1024 ))
@@ -1371,11 +1620,11 @@ execute_encode() {
         fi
 
         echo " Done -> $OUTPUT ($(( FILE_DUR / 60 ))m $(( FILE_DUR % 60 ))s, ${OUT_MB}MB)"
-        log "COMPLETED: $(basename "$INPUT") [${SRC_CODEC_LABEL}] | $(( FILE_DUR / 60 ))m $(( FILE_DUR % 60 ))s | src: ${SRC_MB}MB -> out: ${OUT_MB}MB (${SIZE_DIFF})"
+        log "COMPLETED: $JOB_LABEL [${SRC_CODEC_LABEL}] | $(( FILE_DUR / 60 ))m $(( FILE_DUR % 60 ))s | src: ${SRC_MB}MB -> out: ${OUT_MB}MB (${SIZE_DIFF})"
         # Ignore growth under 2%: rounding noise, not a real size regression
         if (( GROWTH_PCT >= 2 )); then
             echo " WARNING: output is larger than source (${SIZE_DIFF})" >&2
-            log "SIZE WARNING: $(basename "$INPUT") | output ${OUT_MB}MB exceeds source ${SRC_MB}MB (${SIZE_DIFF})"
+            log "SIZE WARNING: $JOB_LABEL | output ${OUT_MB}MB exceeds source ${SRC_MB}MB (${SIZE_DIFF})"
         fi
 
         # The source and its sidecars move only after the output is safely in
@@ -1399,15 +1648,118 @@ execute_encode() {
     fi
 }
 
-# -- Process one file -----------------------------------------------------------------
+# -- write_concat_list ---------------------------------------------------------------
+# Writes the concat demuxer list LIST for the part files that follow it: one
+# "file '<absolute path>'" line per part, in order. A single quote inside a path is
+# written as '\'' (close the quote, an escaped quote, reopen the quote). Writes nothing
+# in a dry run. Returns 1 when LIST cannot be written.
+write_concat_list() {
+    local LIST="$1" p
+    local QUOTE_ESCAPE="'\\''"
+    shift
+    (( DRY_RUN )) && return 0
+    : > "$LIST" || return 1
+    for p in "$@"; do
+        [[ "$p" == /* ]] || p="$PWD/$p"
+        printf "file '%s'\n" "${p//\'/$QUOTE_ESCAPE}" >> "$LIST" || return 1
+    done
+}
+
+# -- join_part_sidecars --------------------------------------------------------------
+# Joins the sidecar subtitles of each language and type across the parts of a merged
+# set into one SubRip file under SUB_TMP_DIR/join, so the subtitles follow the joined video:
+# ffmpeg converts each part's file to SubRip, and subtitle_join.py shifts it by the
+# summed durations of the parts before it and writes the joined file. Args: the name of
+# the output array, the name of the array of part durations in seconds, then one
+# "PART_INDEX LANG TYPE PATH" line per sidecar (PART_INDEX counts from 0). Appends to
+# the output array one "LANG TYPE PATH" line per language and type, in the order first
+# seen, PATH being the joined file. A language and type missing from some parts is
+# joined from the parts that have it, with a warning. In a dry run it prints the plan,
+# writes nothing and appends the first file of each language and type. Returns 1 on the
+# first file that cannot be converted or joined, with the file named.
+join_part_sidecars() {
+    # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function, not a reassignment of a prior array
+    local -n _JOUT="$1"
+    local -n _JDURS="$2"
+    shift 2
+    local -a ORDER=() OFFSETS=() JOIN_ARGS=()
+    local -A FILES=()
+    local line idx lang type path key d acc=0 first n conv joined lang_type
+
+    if (( ! DRY_RUN )) && ! mkdir -p -- "${SUB_TMP_DIR}/join"; then
+        echo " ERROR: could not create the subtitle join directory under $SUB_TMP_DIR" >&2
+        return 1
+    fi
+    for d in "${_JDURS[@]}"; do
+        OFFSETS+=("$acc")
+        acc="$(awk -v a="$acc" -v b="$d" 'BEGIN { printf "%.3f", a + b }')"
+    done
+    for line in "$@"; do
+        read -r idx lang type path <<< "$line"
+        key="${lang} ${type}"
+        [[ -n "${FILES[$key]+_}" ]] || ORDER+=("$key")
+        FILES["$key"]+="${idx} ${path}"$'\n'
+    done
+
+    for key in "${ORDER[@]+"${ORDER[@]}"}"; do
+        read -r lang type <<< "$key"
+        lang_type="${lang}_${type}"
+        JOIN_ARGS=(); n=0; first=""
+        while IFS=' ' read -r idx path; do
+            [[ -n "$idx" ]] || continue
+            n=$(( n + 1 ))
+            [[ -n "$first" ]] || first="$path"
+            (( DRY_RUN )) && continue
+            conv="${SUB_TMP_DIR}/join/part_${FILE_NUM}_${idx}_${lang_type}.srt"
+            if ! ffmpeg -nostdin -v error -y -i "$path" -c:s srt "$conv" 2>/dev/null || [[ ! -s "$conv" ]]; then
+                echo " ERROR: could not convert subtitle file to SubRip: $path" >&2
+                return 1
+            fi
+            JOIN_ARGS+=("${OFFSETS[$idx]}" "$conv")
+        done <<< "${FILES[$key]}"
+
+        if (( n < ${#_JDURS[@]} )); then
+            echo " WARNING: $lang/$type subtitles exist for $n of ${#_JDURS[@]} parts; the other parts have none" >&2
+            log "SUBTITLE PARTS MISSING: $lang/$type has $n of ${#_JDURS[@]} parts"
+        fi
+        if (( DRY_RUN )); then
+            echo " [DRY RUN] Would join $n $lang/$type subtitle file(s), each shifted by the parts before it"
+            _JOUT+=("${lang} ${type} ${first}")
+            continue
+        fi
+        joined="${SUB_TMP_DIR}/join/joined_${FILE_NUM}_${lang_type}.srt"
+        if ! python3 "$JOIN_PY" join "$joined" "${JOIN_ARGS[@]}"; then
+            echo " ERROR: could not join the $lang/$type subtitle files" >&2
+            return 1
+        fi
+        echo " Subtitles: joined $n $lang/$type file(s), each shifted by the parts before it"
+        _JOUT+=("${lang} ${type} ${joined}")
+    done
+}
+
+# -- Process one job -------------------------------------------------------------------
+# Encodes one job: a single video file, or the parts of a merged multi-part set (INPUT
+# is part 1; GROUP_PARTS holds the rest). Sets CURRENT_PARTS and CURRENT_EXPECTED_SECONDS
+# for execute_encode() and finish_outputs(). Returns 0 on success, 1 on failure, 2 when
+# skipped (-s), 3 for a dry run.
 process_file() {
     local INPUT="$1"
     local ROOT="$2"
     local line
     SIDECAR_EXTRACT_LINES=()
+    CURRENT_PARTS=("$INPUT")
+    CURRENT_EXPECTED_SECONDS=""
+
+    local IS_GROUP=0 OUT_STEM=""
+    if [[ -n "${GROUP_PARTS[$INPUT]+_}" ]]; then
+        IS_GROUP=1
+        mapfile -t CURRENT_PARTS <<< "${GROUP_PARTS[$INPUT]}"
+        multipart_parse "$(basename -- "${INPUT%.*}")"
+        OUT_STEM="$MP_STEM"
+    fi
 
     local OUTPUT
-    OUTPUT="$(compute_output_path "$INPUT" "$ROOT")"
+    OUTPUT="$(compute_output_path "$INPUT" "$ROOT" "$OUT_STEM")"
     local OUTPUT_DIR_FOR_FILE
     OUTPUT_DIR_FOR_FILE="$(dirname "$OUTPUT")"
     local OUTPUT_TMP
@@ -1417,6 +1769,10 @@ process_file() {
     echo ""
     echo "------------------------------------------"
     echo " [${FILE_NUM}/${#ALL_FILES[@]}] INPUT : $INPUT"
+    local _pn
+    for (( _pn=1; _pn<${#CURRENT_PARTS[@]}; _pn++ )); do
+        echo "          + part $(( _pn + 1 )): ${CURRENT_PARTS[$_pn]}"
+    done
     echo " OUTPUT: $OUTPUT"
     echo "------------------------------------------"
 
@@ -1424,6 +1780,21 @@ process_file() {
         echo " SKIP: output already exists (-s)"
         log "SKIPPED: $(basename "$INPUT")"
         return 2
+    fi
+
+    local -a PART_DURS=()
+    if (( IS_GROUP )); then
+        local _p _pd
+        for _p in "${CURRENT_PARTS[@]}"; do
+            if ! _pd="$(probe_duration "$_p")"; then
+                echo " ERROR: could not read the duration of $_p" >&2
+                log "FAILED (part duration): $_p"
+                return 1
+            fi
+            PART_DURS+=("$_pd")
+        done
+        CURRENT_EXPECTED_SECONDS="$(sum_seconds "${PART_DURS[@]}")"
+        echo " Parts: ${#CURRENT_PARTS[@]} joined, $(format_runtime "${CURRENT_EXPECTED_SECONDS%.*}") in total"
     fi
 
     local VID_CODEC="" VID_CODEC_LABEL="" SRC_HEIGHT=0 SRC_FPS="24/1"
@@ -1461,19 +1832,27 @@ process_file() {
     # Raw "LANG TYPE PATH" lines, kept as-is (pointing at the ORIGINAL sidecar
     # files) for backup_sidecar_subs later - stripping happens separately,
     # below, only for the copy that gets fed to ffmpeg.
-    local -a EXTSUB_LINES=()
-    while IFS= read -r line; do
-        [[ -n "$line" ]] && EXTSUB_LINES+=("$line")
-    done < <(discover_sidecar_subs "$INPUT")
+    # PART_SUB_LINES carries the same lines prefixed with the index of the part they
+    # belong to, for join_part_sidecars().
+    local -a EXTSUB_LINES=() PART_SUB_LINES=() _part_lines=()
+    local _unclaimed _pi
+    for (( _pi=0; _pi<${#CURRENT_PARTS[@]}; _pi++ )); do
+        _part_lines=()
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            _part_lines+=("$line")
+            EXTSUB_LINES+=("$line")
+            PART_SUB_LINES+=("${_pi} ${line}")
+        done < <(discover_sidecar_subs "${CURRENT_PARTS[$_pi]}")
 
-    # Files next to the video that discovery does not embed (other formats, a
-    # language outside -l, an unrecognized modifier, a shadowed .sdh.srt).
-    local _unclaimed
-    while IFS= read -r _unclaimed; do
-        [[ -n "$_unclaimed" ]] || continue
-        echo " WARNING: subtitle file not used (format, language, modifier, duplicate, or text not valid UTF-8), stays in the source directory: $(basename "$_unclaimed")" >&2
-        log "SUBTITLE FILE UNCLAIMED: $_unclaimed"
-    done < <(report_unclaimed_sidecars "$INPUT" "${EXTSUB_LINES[@]+"${EXTSUB_LINES[@]}"}")
+        # Files next to the video that discovery does not embed (other formats, a
+        # language outside -l, an unrecognized modifier, a shadowed .sdh.srt).
+        while IFS= read -r _unclaimed; do
+            [[ -n "$_unclaimed" ]] || continue
+            echo " WARNING: subtitle file not used (format, language, modifier, duplicate, or text not valid UTF-8), stays in the source directory: $(basename "$_unclaimed")" >&2
+            log "SUBTITLE FILE UNCLAIMED: $_unclaimed"
+        done < <(report_unclaimed_sidecars "${CURRENT_PARTS[$_pi]}" "${_part_lines[@]+"${_part_lines[@]}"}")
+    done
 
     # Sidecar wins per language and type: an embedded track is dropped only
     # when a sidecar of the same primary language code and the same type
@@ -1511,12 +1890,27 @@ process_file() {
     # tags is replaced by a tag-stripped copy, muxed below as an extra input.
     # Not in EXTSUB_LINES: these copies are scratch files, never backed up.
     local -a EMBED_STRIPPED_LINES=()
-    if [[ "$SUB_MODE" == "embed" ]] && (( ! DRY_RUN )); then
+    if (( IS_GROUP )); then
+        if [[ "$SUB_MODE" == "embed" ]] && (( ${#SUB_LINES[@]} > 0 )); then
+            echo " Subtitles: embedded tracks of a merged set are joined with the video, not checked for ASS override tags"
+        fi
+    elif [[ "$SUB_MODE" == "embed" ]] && (( ! DRY_RUN )); then
         strip_embedded_text_tracks "$INPUT" SUB_LINES EMBED_STRIPPED_LINES
     fi
 
     local TITLE_TAG
     TITLE_TAG="$(basename "${OUTPUT%.*}")"
+
+    # The sidecars ffmpeg opens: each one as found for a single file; one joined file
+    # per language and type for a merged set.
+    local -a MUX_SRC_LINES=("${EXTSUB_LINES[@]+"${EXTSUB_LINES[@]}"}")
+    if (( IS_GROUP && ${#EXTSUB_LINES[@]} > 0 )); then
+        MUX_SRC_LINES=()
+        if ! join_part_sidecars MUX_SRC_LINES PART_DURS "${PART_SUB_LINES[@]}"; then
+            log "FAILED (sidecar join): $INPUT"
+            return 1
+        fi
+    fi
 
     # Build the input list first: main video is input 0, each sidecar
     # gets its own -i and a sequential input index for -map. On a real run,
@@ -1530,9 +1924,19 @@ process_file() {
     # sidecar path with a note, rather than a real disk mutation whose
     # output is then only used to print a message.
     local -a INPUT_ARGS=(-analyzeduration "$PROBE_SIZE" -probesize "$PROBE_SIZE" -i "$INPUT")
+    if (( IS_GROUP )); then
+        local CONCAT_LIST="${SUB_TMP_DIR:-${TMPDIR:-/tmp}}/concat_${FILE_NUM}.txt"
+        (( DRY_RUN )) && echo " [DRY RUN] Would join ${#CURRENT_PARTS[@]} parts with the concat demuxer (list file: $CONCAT_LIST)"
+        if ! write_concat_list "$CONCAT_LIST" "${CURRENT_PARTS[@]}"; then
+            echo " ERROR: could not write the concat list: $CONCAT_LIST" >&2
+            log "FAILED (concat list): $INPUT"
+            return 1
+        fi
+        INPUT_ARGS=(-analyzeduration "$PROBE_SIZE" -probesize "$PROBE_SIZE" -f concat -safe 0 -i "$CONCAT_LIST")
+    fi
     local -a EXTSUB_WITH_IDX=()
     local _next_input_idx=1
-    for line in "${EXTSUB_LINES[@]+"${EXTSUB_LINES[@]}"}"; do
+    for line in "${MUX_SRC_LINES[@]+"${MUX_SRC_LINES[@]}"}"; do
         local _e_lang _e_type _e_path _e_mux_path
         read -r _e_lang _e_type _e_path <<< "$line"
 
