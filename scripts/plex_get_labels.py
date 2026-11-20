@@ -131,9 +131,9 @@ import sys
 import time
 import urllib.parse
 
-from plex_labels_common import (ABORT_AFTER_FAILURES, LOG_DIR, ApiError, atomic_write,
+from plex_labels_common import (ABORT_AFTER_FAILURES, LIVE, LOG_DIR, ApiError, atomic_write,
                            close_logging, fetch_json, hold_lock, normalize_title,
-                           setup_logging, split_folder_name)
+                           runtime_since, setup_logging, split_folder_name)
 
 if sys.version_info < (3, 8):
     sys.exit(f"ERROR: Python 3.8+ required (current: {sys.version.split()[0]})")
@@ -1077,6 +1077,7 @@ def run_route_check(folders, keys, cache, save, client_id, log):
     of failed lookups."""
     failed = agree = differ = nothing = hopped = 0
     for i, folder in enumerate(folders, 1):
+        LIVE.set(f"Source-route check {i}/{len(folders)}")
         rec = cache.get(keys[folder])
         if not rec or not rec["demographics"]:
             continue
@@ -1128,11 +1129,14 @@ def run(src, dst, force, dry_run, cache_path, log_path, source="jikan", client_i
                         tmdb_key, use_tmdb)
     folders, plex = read_inputs(src)
     log = setup_logging(None if dry_run else log_path)
+    started = time.monotonic()
     try:
         idmap = (load_idmap(idmap_path, refresh_idmap, dry_run, log) if use_idmap else None)
         return _run(folders, dst, dry_run, cache_path, log, source, client_id, plex, idmap,
                     source_works, check_route, assess_genres, tmdb_key, use_tmdb)
     finally:
+        LIVE.stop()
+        log.info("Runtime: %s", runtime_since(started))
         close_logging(log)
 
 
@@ -1183,6 +1187,7 @@ def _run(folders, dst, dry_run, cache_path, log, source="jikan", client_id=None,
         failed, source_failed, looked_up, consecutive = set(), set(), 0, 0
         sourced, backfilled, genre_failed = 0, 0, set()
         for i, folder in enumerate(folders, 1):
+            LIVE.set(f"Looking up folders {i}/{len(folders)}")
             key = keys[folder]
             if key not in cache:
                 try:
@@ -1254,6 +1259,7 @@ def _run(folders, dst, dry_run, cache_path, log, source="jikan", client_id=None,
                     and cache[keys[f]] is None]
             consecutive = 0
             for n, folder in enumerate(todo, 1):
+                LIVE.set(f"TMDB lookups {n}/{len(todo)}")
                 tkey = tkeys[folder]
                 hit = tcache.get(tkey)
                 if hit:
@@ -1309,6 +1315,7 @@ def _run(folders, dst, dry_run, cache_path, log, source="jikan", client_id=None,
     review = sum(1 for r in mal_rows if r[4] == "Review")
     by_id = sum(1 for r in mal_rows if r[4] == "Plex ID")
     inferred = sum(1 for r in rows if r[10])
+    LIVE.stop()
     log.info("Summary: %d folders written to %s", len(rows), dst)
     log.info("  %d looked up on MAL this run, %d served from cache", looked_up,
              len(folders) - looked_up - len(failed))

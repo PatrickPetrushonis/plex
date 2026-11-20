@@ -29,9 +29,11 @@ import hashlib
 import os
 import posixpath
 import sys
+import time
 from contextlib import contextmanager
 
-from plex_labels_common import ABORT_AFTER_FAILURES, LOG_DIR, close_logging, hold_lock, setup_logging
+from plex_labels_common import (ABORT_AFTER_FAILURES, LIVE, LOG_DIR, close_logging, hold_lock,
+                                runtime_since, setup_logging)
 from plex_api import (PAGE_SIZE, SECTION_TYPE_IDS, PlexError, env_token, env_url,
                       find_sections, folder_basename, plex_request, require_credentials)
 
@@ -83,7 +85,8 @@ def list_items(base_url, token, section):
         if not page or start >= mc.get("totalSize", start):
             break
     result = []
-    for it in items:
+    for n, it in enumerate(items, 1):
+        LIVE.set(f"Reading {title} {n}/{len(items)}")
         # The listing may omit an item's labels, and an item with none looks the same,
         # so the labels always come from the item's own metadata record.
         detail = plex_request(base_url, token, "GET", f"/library/metadata/{it['ratingKey']}")
@@ -201,9 +204,12 @@ def run(csv_path, base_url, token, libraries, dry_run, log_path):
     if not rows:
         sys.exit(f"ERROR: no labelable rows in {csv_path}")
     log = setup_logging(log_path)
+    started = time.monotonic()
     try:
         return _run(log, rows, problems, base_url, token, libraries, dry_run)
     finally:
+        LIVE.stop()
+        log.info("Runtime: %s", runtime_since(started))
         close_logging(log)
 
 
@@ -229,7 +235,8 @@ def _run(log, rows, problems, base_url, token, libraries, dry_run):
         for folder, reason in problems:
             log.info(f"SKIP {folder}: {reason}")
         expected, consecutive = {}, 0
-        for folder, age, target in rows:
+        for n, (folder, age, target) in enumerate(rows, 1):
+            LIVE.set(f"Labeling {n}/{len(rows)}")
             if folder in ambiguous:
                 counts["ambiguous"] += 1
                 log.info(f"AMBIGUOUS {folder}: more than one item uses this folder name")
@@ -289,7 +296,8 @@ def _verify(log, base_url, token, sections, expected):
 
 
 def _summary(log, counts, dry_run):
-    """Prints each counter with what it means."""
+    """Stops the live status line and prints each counter with what it means."""
+    LIVE.stop()
     log.info("SUMMARY")
     log.info(f"  {counts['labeled']:4d} {'need labels (dry run, nothing changed)' if dry_run else 'labeled'}")
     log.info(f"  {counts['unchanged']:4d} already correct")

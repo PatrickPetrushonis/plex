@@ -59,7 +59,8 @@
 #     the user who owns the library
 #   • Requires bash 4.4+ (mapfile -d), GNU find (-printf), flock, sha256sum,
 #     realpath, python3, ffprobe, and media_rename.sh, media_classify.py,
-#     media_categories.sh and video_exts.sh alongside this script. A real run
+#     media_categories.sh, media_progress.sh and video_exts.sh alongside this
+#     script. A real run
 #     needs the TMDB_API_KEY environment variable (the key plex_labels.sh uses),
 #     checked before anything is renamed
 #   • One run per <source_dir> at a time; a second run exits 1 immediately. The
@@ -76,6 +77,9 @@
 #   • A top-level entry is moved whole. With a clean preview every video under
 #     it is already renamed, so a folder never leaves half renamed
 #   • A directory is never merged into an existing one: mv would nest it
+#   • On a terminal, the settle wait shows a countdown, and the preview, rename and each
+#     classification show a spinner with the elapsed time. A run without a terminal
+#     (a callback, cron) prints none of it
 #   • Known limitation: an entry that arrives between the settle check and the
 #     preview is renamed with the rest. The change is detected after the rename
 #     and the move waits for the next run, but the rename has already happened
@@ -188,6 +192,13 @@ CLASSIFY_PY="${SCRIPT_DIR}/media_classify.py"
 }
 # shellcheck source=./media_categories.sh
 source "${SCRIPT_DIR}/media_categories.sh"
+# Spinner, countdown and runtime helpers (media_progress.sh, alongside this script).
+[[ -r "${SCRIPT_DIR}/media_progress.sh" ]] || {
+    echo "ERROR: media_progress.sh not found next to this script (${SCRIPT_DIR})" >&2
+    exit 1
+}
+# shellcheck source=./media_progress.sh
+source "${SCRIPT_DIR}/media_progress.sh"
 [[ -n "$OVERRIDES_FILE" ]] || OVERRIDES_FILE="${SCRIPT_DIR}/../data/ingest_categories.tsv"
 [[ -n "$FOLDERS_FILE" ]] || FOLDERS_FILE="${SCRIPT_DIR}/../data/plex_folders.csv"
 # The classifier looks up every entry on TMDB. Checked here, before the rename,
@@ -263,6 +274,8 @@ FAILED=0
 REVIEW_TEXT=""
 CLASS_CATEGORY=""
 CLASS_REASON=""
+ENTRY_NUM=0
+ENTRY_TOTAL=0
 
 # Appends one line to REVIEW_TEXT, the text a person must read. Argument: line.
 add_review() { REVIEW_TEXT+="$1"$'\n'; }
@@ -404,14 +417,16 @@ entry_has_video() {
 # for a chosen category, 2 when it needs a person (HOLD), 3 when a lookup could
 # not complete (DEFER) and 1 on an error (ERROR). Returns 0 for a chosen
 # category that is listed in media_categories.sh, 2 or 3 as the classifier did,
-# and 1 for any other exit or an unlisted category. Argument: entry path.
+# and 1 for any other exit or an unlisted category. Reads ENTRY_NUM and
+# ENTRY_TOTAL for the progress label. Argument: entry path.
 classify_entry() {
-    local entry="$1" out="" rc=0
+    local entry="$1" out="" rc=0 label
+    label="Classifying [${ENTRY_NUM}/${ENTRY_TOTAL}] $(basename -- "$entry")"
     local -a args=(-E "$VIDEO_EXTS" -C "$OVERRIDES_FILE")
     CLASS_CATEGORY=""
     CLASS_REASON=""
     [[ -z "$FOLDERS_FILE" ]] || args+=(-L "$FOLDERS_FILE")
-    out="$(python3 "$CLASSIFY_PY" "${args[@]}" -- "$entry")" || rc=$?
+    out="$(progress_run "$label" python3 "$CLASSIFY_PY" "${args[@]}" -- "$entry")" || rc=$?
     IFS=$'\t' read -r CLASS_CATEGORY CLASS_REASON <<< "$out"
     case "$rc" in
         0)
@@ -502,7 +517,7 @@ echo "----------------------------------------------------------------"
 SIG_SETTLED="$(tree_signature "$SOURCE_DIR")"
 if (( SETTLE_SECONDS > 0 )); then
     echo "Waiting ${SETTLE_SECONDS}s to confirm $SOURCE_DIR has stopped changing..."
-    sleep "$SETTLE_SECONDS"
+    progress_countdown "$SETTLE_SECONDS" "Waiting for $SOURCE_DIR to stop changing"
     SIG_AFTER_WAIT="$(tree_signature "$SOURCE_DIR")"
     if [[ "$SIG_AFTER_WAIT" != "$SIG_SETTLED" ]]; then
         echo "NOT SETTLED: files under $SOURCE_DIR changed during the ${SETTLE_SECONDS}s window; nothing done, the next run retries."
@@ -520,7 +535,7 @@ if (( DRY_RUN )); then
     "$RENAME_SH" -n -x -O "$OPERATIONAL_DIR" "$SOURCE_DIR" || PREVIEW_RC=$?
 else
     PREVIEW_FILE="${WORK_DIR}/preview.txt"
-    "$RENAME_SH" -n -x -O "$OPERATIONAL_DIR" "$SOURCE_DIR" > "$PREVIEW_FILE" 2>&1 || PREVIEW_RC=$?
+    progress_run "Previewing the rename" "$RENAME_SH" -n -x -O "$OPERATIONAL_DIR" "$SOURCE_DIR" > "$PREVIEW_FILE" 2>&1 || PREVIEW_RC=$?
     cat -- "$PREVIEW_FILE"
 fi
 if (( PREVIEW_RC != 0 )); then
@@ -545,7 +560,7 @@ echo "=== Rename: media_rename.sh -x ==="
 log "Rename started: $SOURCE_DIR"
 RENAME_RC=0
 RENAME_FILE="${WORK_DIR}/rename.txt"
-"$RENAME_SH" -x -O "$OPERATIONAL_DIR" "$SOURCE_DIR" < /dev/null > "$RENAME_FILE" 2>&1 || RENAME_RC=$?
+progress_run "Renaming" "$RENAME_SH" -x -O "$OPERATIONAL_DIR" "$SOURCE_DIR" < /dev/null > "$RENAME_FILE" 2>&1 || RENAME_RC=$?
 cat -- "$RENAME_FILE"
 if (( RENAME_RC != 0 )); then
     echo "STOPPED: media_rename.sh exited $RENAME_RC; nothing was moved." >&2
@@ -566,7 +581,9 @@ fi
 # 4. CLASSIFY AND MOVE
 echo "=== Classify and move to $HOLD_DIR ==="
 mapfile -d '' ENTRIES < <(list_entries)
+ENTRY_TOTAL=${#ENTRIES[@]}
 for ENTRY in ${ENTRIES[@]+"${ENTRIES[@]}"}; do
+    ENTRY_NUM=$(( ENTRY_NUM + 1 ))
     ingest_entry "$ENTRY"
 done
 
@@ -580,8 +597,9 @@ echo "  Unplaced:   $UNCLASSIFIED  (no category chosen; left in $SOURCE_DIR, see
 echo "  Deferred:   $DEFERRED_LOOKUP  (a lookup could not complete; the next run retries)"
 echo "  Collisions: $COLLIDED  (name already exists in its category folder; merge manually)"
 echo "  Failed:     $FAILED"
+echo "  Runtime:    $(format_runtime "$SECONDS")"
 echo "------------------------------------------"
-log "Ingest complete: Moved=$PROMOTED Held=$HELD Unplaced=$UNCLASSIFIED Deferred=$DEFERRED_LOOKUP Collisions=$COLLIDED Failed=$FAILED"
+log "Ingest complete: Moved=$PROMOTED Held=$HELD Unplaced=$UNCLASSIFIED Deferred=$DEFERRED_LOOKUP Collisions=$COLLIDED Failed=$FAILED Runtime=$(format_runtime "$SECONDS")"
 echo "Log saved to: $LOG_FILE"
 FINAL_RC=0
 if (( FAILED > 0 )); then

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Runs the Plex label pipeline, or one stage of it. Paths are relative to this script, not
-# the caller's directory.
+# the caller's directory. Needs media_progress.sh alongside this script. On a terminal the
+# stages show a status line with a counter and the elapsed time, and each stage logs its
+# runtime.
 #
 # Usage: plex_labels.sh [all] [-n|--dry-run] [--check-source-route] [-h]
 #        plex_labels.sh sync|get|apply [ARGS...]
@@ -62,6 +64,14 @@ LABELS_CSV="${DATA_DIR}/plex_labels.csv"
 SYNC_PY="${SCRIPT_DIR}/plex_sync_folders.py"
 LABELS_PY="${SCRIPT_DIR}/plex_get_labels.py"
 APPLY_PY="${SCRIPT_DIR}/plex_apply_labels.py"
+
+# Runtime formatting (media_progress.sh, alongside this script).
+[[ -r "${SCRIPT_DIR}/media_progress.sh" ]] || {
+    echo "ERROR: media_progress.sh not found next to this script (${SCRIPT_DIR})" >&2
+    exit 1
+}
+# shellcheck source=./media_progress.sh
+source "${SCRIPT_DIR}/media_progress.sh"
 
 usage() {
     grep '^#' "$0" | grep -v '#!/' | sed 's/^# \{0,2\}//' || true
@@ -165,10 +175,10 @@ run_all() {
     stage "Stage 2/3: get labels (MAL, then TMDB)" 0 run_get "${labels_args[@]}" ${dry_args[@]+"${dry_args[@]}"}
     stage "Stage 3/3: apply to Plex" 1 run_apply ${dry_args[@]+"${dry_args[@]}"}
     if (( NEEDS_ATTENTION )); then
-        echo "==> Done, with items needing attention"
+        echo "==> Done, with items needing attention ($(format_runtime "$SECONDS"))"
         exit 2
     fi
-    echo "==> Done"
+    echo "==> Done ($(format_runtime "$SECONDS"))"
 }
 
 COMMAND="all"

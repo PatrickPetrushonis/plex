@@ -36,7 +36,10 @@
 #
 # Notes:
 #   * Requires bash 4.0+, ffmpeg (built with the zscale and tonemap filters),
-#     ffprobe, python3, flock, find, grep, sed, awk, iconv
+#     ffprobe, python3, flock, find, grep, sed, awk, iconv, and media_progress.sh
+#     alongside this script
+#   * The spinner and elapsed time show on a terminal only; a run without one
+#     (a callback, cron) prints none of it
 #   * Video is copied if already h264, 8-bit 4:2:0, SDR (colour transfer not PQ or
 #     HLG), within MAX_HEIGHT, and at an overall bitrate of at most -K kb/s (container
 #     size over duration, which includes audio; unreadable means copy); otherwise
@@ -278,6 +281,10 @@ STRIP_PY="$(dirname "${BASH_SOURCE[0]}")/subtitle_strip_tags.py"
 [[ -r "$STRIP_PY" ]] || { echo "ERROR: subtitle_strip_tags.py not found next to this script ($STRIP_PY)" >&2; exit 1; }
 # shellcheck source=./video_exts.sh
 source "$(dirname "${BASH_SOURCE[0]}")/video_exts.sh"
+PROGRESS_SH="$(dirname "${BASH_SOURCE[0]}")/media_progress.sh"
+[[ -r "$PROGRESS_SH" ]] || { echo "ERROR: media_progress.sh not found next to this script ($PROGRESS_SH)" >&2; exit 1; }
+# shellcheck source=./media_progress.sh
+source "$PROGRESS_SH"
 # shellcheck source=./lang_table.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lang_table.sh"
 declare -F canon_lang >/dev/null || {
@@ -732,7 +739,7 @@ archive_output() {
         return 1
     }
 
-    cp -- "$SRC" "$DEST" || {
+    progress_run "Archiving $(basename -- "$SRC")" cp -- "$SRC" "$DEST" || {
         echo " WARNING: cp failed: $SRC -> $DEST" >&2
         log "ARCHIVE FAILED (cp): $SRC"
         rm -f -- "$DEST"
@@ -844,23 +851,6 @@ backup_sidecar_subs() {
         move_into_backup "$SIDECAR_SRC" "$ROOT" "$DEST_BASE" " (sidecar)" || FAILED=1
     done
     return "$FAILED"
-}
-
-# -- spin_until_exit -----------------------------------------------------------------
-# Shows a spinner and the elapsed time on stderr, redrawn once a second, until the
-# background process PID exits, then clears the line. It neither waits for the
-# process nor reads its status; the caller does both with `wait`. Args: pid.
-spin_until_exit() {
-    local PID="$1"
-    local SPIN_IDX=0 ELAPSED=0
-    local SPIN_CHARS='|/-'"\\"
-    while kill -0 "$PID" 2>/dev/null; do
-        printf "\r %s  %02d:%02d elapsed" "${SPIN_CHARS:$SPIN_IDX:1}" "$(( ELAPSED / 60 ))" "$(( ELAPSED % 60 ))" >&2
-        SPIN_IDX=$(( (SPIN_IDX + 1) % 4 ))
-        sleep 1
-        ELAPSED=$(( ELAPSED + 1 ))
-    done
-    printf "\r%30s\r" "" >&2
 }
 
 # -- extract_embedded_srt -------------------------------------------------------------

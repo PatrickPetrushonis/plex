@@ -21,6 +21,7 @@ plex/
     ├── media_classify.py           Chooses a category folder for one ingested entry: series or movie, animation or live action, short, series movie (called by media_ingest.sh)
     ├── media_release.sh            Moves held entries from the holding directory to the encoder's input directory (called by media.sh; can also be run standalone)
     ├── media_archive.sh            Moves encoded files from the local archive directory to the NAS archive directory, category by category, with copy verification (called by media.sh; can also be run standalone)
+    ├── media_progress.sh           Shared: the spinner, elapsed time, countdown and runtime helpers (sourced by the media scripts and `plex_labels.sh`)
     ├── media_promote.sh            Moves finished files from the NAS archive directory into the library category folders beside it, by rename inside the share (called by media.sh; can also be run standalone)
     ├── media_encode.sh             Core batch encoder: copy/transcode decisions, HDR-to-SDR conversion, output verification (called by media.sh; can also be run standalone)
     ├── media_encode_args.sh        Shared: media_encode.sh's ffmpeg argument builders for video, audio and embedded subtitle tracks
@@ -252,6 +253,22 @@ The label scripts keep their lock files in `scripts/` instead, and remove them w
 - `plex_get_labels.py` takes `.plex_get_labels_<hash>.lock`, scoped to its cache file, so a second run against the same cache exits while runs against another cache proceed.
 - `plex_apply_labels.py` takes `.plex_apply_labels_<hash>.lock`, scoped to the Plex server and library selection.
 
+## Progress display
+
+`media_progress.sh` gives the media scripts a spinner with the elapsed time (`|  00:42 elapsed  <label>`), a countdown and a `Runtime:` line in each summary. It draws only when stderr is a terminal, and onto the terminal itself, so a callback, a cron job or a run redirected to a file prints none of it and the logs hold no control characters. A spinner appears once a step has run for a second, so quick steps show nothing. The shell scripts read `media_progress.sh` from their own directory and exit 1 when it is missing.
+
+| Script | Shown |
+|---|---|
+| `media_ingest.sh` | A countdown during the settle wait; a spinner for the rename preview, the rename and each entry's classification (`[n/N]`) |
+| `media_archive.sh` | A spinner while listing a category, copying and comparing each file (`[n/N]`) and removing emptied folders; the copy time ends each `MOVED:` line |
+| `media_promote.sh` | A spinner while listing a category and removing emptied folders |
+| `media_release.sh` | A spinner for a move that takes more than a second |
+| `media_encode.sh` | A spinner for the encode, the subtitle extraction and the copy to the archive |
+| `plex_sync_folders.py`, `plex_get_labels.py`, `plex_apply_labels.py` | One status line with a counter and the elapsed time, kept below the log lines; each logs `Runtime:` last (`plex_labels_common.py`) |
+| `plex_labels.sh` | The total runtime beside `Done` |
+
+`media_rename.sh` has no step that waits on anything but local disk, and shows none of this directly; `media_ingest.sh` shows the progress of its calls.
+
 ## Centralized language table
 
 `lang_table.tsv` is the single source of truth for every language code, alias, and display label used across the project — add a language once here and it's picked up everywhere. Each row has a primary 3-letter code (`code3`, ISO 639-2), a 2-letter code (`code2`, ISO 639-1, used in sidecar filenames), a display label, and a comma-separated alias list (e.g. `fra`'s alias is the bibliographic `fre`). **Pass the primary `code3` to `-l`.** Sidecar discovery looks each `-l` value up in `LANG_3TO2` and silently skips a value with no entry, and the encoder's own check only warns when a value is not 2–3 letters. Aliases are for matching a file's own language tag and for display; the lowercase label also resolves as a language name in subtitle file names; English is the supported one.
@@ -348,7 +365,7 @@ Moves finished downloads from the completed-downloads directory into Plex naming
 
 A real run writes three files under `OPDIR/Logs`: `Ingest.log` (one line per move, hold, collision and failure), `Ingest_review.txt` (what needs a person, rewritten only when its content changes and removed when nothing needs review) and `Ingest_state` (the exit code and a hash of the source and holding directories after a non-zero run). A run that finds both directories exactly as the last non-zero run left them repeats that exit code at once, with no wait, rename or log line; renaming a file, or adding or removing a name in either directory, starts the run over.
 
-Exit codes: `0` nothing to do, not settled yet, every entry moved, or entries deferred to the next run because a lookup could not complete; `1` a failed rename, move or classifier run, or bad usage; `2` something needs a person. It refuses to run as root and needs bash 4.4+ (`mapfile -d`), GNU `find`, `flock`, `sha256sum` and `realpath`.
+Exit codes: `0` nothing to do, not settled yet, every entry moved, or entries deferred to the next run because a lookup could not complete; `1` a failed rename, move or classifier run, or bad usage; `2` something needs a person. It refuses to run as root and needs bash 4.4+ (`mapfile -d`), GNU `find`, `flock`, `sha256sum` and `realpath`, and `media_progress.sh` beside it.
 
 ### Categories
 
@@ -381,7 +398,7 @@ Moves entries from the holding directory to the encoder's input directory. It ta
 - A name that already exists in the input directory is skipped and logged, never overwritten or merged.
 - `-n` previews the moves without a lock or a log. A real run logs to `OPDIR/Logs/Release_<date>_<time>.txt`.
 
-Exit codes: `1` when a move fails or the lock is held; skipped and unmatched items do not change the status. It is safe while an encode runs, because `media_encode.sh` lists its input files once at the start, so a released entry waits for the next encode. It refuses to run as root.
+Exit codes: `1` when a move fails or the lock is held; skipped and unmatched items do not change the status. It is safe while an encode runs, because `media_encode.sh` lists its input files once at the start, so a released entry waits for the next encode. It refuses to run as root and needs `media_progress.sh` beside it.
 
 ## `media_archive.sh`
 
@@ -393,7 +410,7 @@ Moves encoded files from the local archive directory to the NAS archive director
 - **Move.** Per file: copy to a hidden `.<name>.tmp` beside the destination, compare size and contents (`cmp`; size only with `-s`), confirm the source's size and modification time did not change during the copy, rename into place with `mv -n`, then delete the source. A failed step removes the partial copy and keeps the source. Folders emptied by the moves are removed, innermost first; the category folders stay.
 - **Collisions.** A destination that already exists is never overwritten. The source stays and is reported as a collision, with the size comparison in the message.
 
-A real run writes `OPDIR/Logs/Archive_<date>_<time>.txt`. Exit codes: `0` nothing to do, files still waiting, or every file moved; `1` a failed copy, verification or delete, a held lock, an unmounted share or bad usage; `2` a collision, or a top-level entry that is not a category folder on the NAS. It refuses to run as root and needs bash 4.0+, `flock`, `mountpoint`, `sha256sum`, `realpath` and `cmp`.
+A real run writes `OPDIR/Logs/Archive_<date>_<time>.txt`. Exit codes: `0` nothing to do, files still waiting, or every file moved; `1` a failed copy, verification or delete, a held lock, an unmounted share or bad usage; `2` a collision, or a top-level entry that is not a category folder on the NAS. It refuses to run as root and needs bash 4.0+, `flock`, `mountpoint`, `sha256sum`, `realpath` and `cmp`, and `media_progress.sh` beside it.
 
 Known limitation: a writer that stalls for longer than the settle window leaves a partial file that looks finished. The size and modification-time recheck catches a file that grows during the copy, not one that has stopped growing short of its full size.
 
@@ -408,7 +425,7 @@ Moves finished files from the NAS archive directory into the library folders bes
 - **Move.** Per file: `mv -n` into the library, which is a rename inside one mount and not a copy. Names starting with a dot are skipped, which includes the `.<name>.tmp` files `media_archive.sh` is still writing. Folders emptied by the moves are removed; the category folders stay.
 - **Collisions.** A destination that already exists is never overwritten. The source stays and is reported as a collision, with the size comparison in the message.
 
-A real run writes `OPDIR/Logs/Promote_<date>_<time>.txt`. Exit codes: `0` nothing to do or every file moved; `1` a failed move, a held lock, an unmounted share, directories on different filesystems or bad usage; `2` a collision, or a top-level entry that is not a category folder in the library. It refuses to run as root and needs bash 4.0+, `flock`, `mountpoint`, `sha256sum`, `realpath` and `stat`.
+A real run writes `OPDIR/Logs/Promote_<date>_<time>.txt`. Exit codes: `0` nothing to do or every file moved; `1` a failed move, a held lock, an unmounted share, directories on different filesystems or bad usage; `2` a collision, or a top-level entry that is not a category folder in the library. It refuses to run as root and needs bash 4.0+, `flock`, `mountpoint`, `sha256sum`, `realpath` and `stat`, and `media_progress.sh` beside it.
 
 Known limitation: the rename is atomic only if the NAS performs it as one operation. This is unconfirmed for the share in use.
 
@@ -526,7 +543,7 @@ Without `PLEX_LIBRARY` or `--library` every show and movie library on the server
 
 ### Logs and exit codes
 
-Logs go to `plex/logs/` (the `logs` directory beside `scripts/`): `plex_get_labels.log`, `plex_apply_labels.log`. Exit codes for stages 1 and 2: `0` complete, `1` aborted (outage, bad credentials, repeated failures, bad input), `2` complete but some lookups failed or rows went unmatched. A re-run retries only the failed lookups. `media_encode.sh` and `media_rename.sh` exit `0` when no file failed and `1` when any did, and `media_encode.sh` also exits `1` with "No video files found." when its input holds none; skipped and unmatched files do not change the status, except with `media_rename.sh -x`, which then exits `2`. `media_ingest.sh`, `media_release.sh`, `media_archive.sh` and `media_promote.sh` exit as described in their sections.
+Logs go to `plex/logs/` (the `logs` directory beside `scripts/`): `plex_get_labels.log`, `plex_apply_labels.log`. Each stage ends its log with a `Runtime:` line. Exit codes for stages 1 and 2: `0` complete, `1` aborted (outage, bad credentials, repeated failures, bad input), `2` complete but some lookups failed or rows went unmatched. A re-run retries only the failed lookups. `media_encode.sh` and `media_rename.sh` exit `0` when no file failed and `1` when any did, and `media_encode.sh` also exits `1` with "No video files found." when its input holds none; skipped and unmatched files do not change the status, except with `media_rename.sh -x`, which then exits `2`. `media_ingest.sh`, `media_release.sh`, `media_archive.sh` and `media_promote.sh` exit as described in their sections.
 
 ### Flag conventions
 

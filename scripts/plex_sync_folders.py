@@ -35,8 +35,10 @@ import csv
 import os
 import re
 import sys
+import time
 
-from plex_labels_common import LOG_DIR, atomic_write, close_logging, hold_lock, setup_logging
+from plex_labels_common import (LIVE, LOG_DIR, atomic_write, close_logging, hold_lock,
+                                runtime_since, setup_logging)
 from plex_api import (PAGE_SIZE, PlexError, env_token, env_url, find_sections, folder_basename,
                       plex_request, require_credentials)
 
@@ -87,7 +89,7 @@ def plex_folders(base_url, token, libraries):
     if not sections:
         raise PlexError("no show library to list (movie libraries are not listed)")
     folders, info = set(), {}
-    for key, _, _ in sections:
+    for key, section_title, _ in sections:
         start = 0
         while True:
             data = plex_request(base_url, token, "GET", f"/library/sections/{key}/all",
@@ -95,7 +97,8 @@ def plex_folders(base_url, token, libraries):
                                  "X-Plex-Container-Size": PAGE_SIZE})
             mc = data.get("MediaContainer", {})
             page = mc.get("Metadata", [])
-            for item in page:
+            for n, item in enumerate(page, 1):
+                LIVE.set(f"Reading {section_title} {start + n}/{mc.get('totalSize', start + len(page))}")
                 if "Location" not in item or not (
                         "Guid" in item or parse_guid(item.get("guid"))):
                     detail = plex_request(base_url, token, "GET",
@@ -108,6 +111,7 @@ def plex_folders(base_url, token, libraries):
             start += len(page)
             if not page or start >= mc.get("totalSize", start):
                 break
+    LIVE.stop()
     return [t for _, t, _ in sections], sorted(folders, key=str.casefold), info
 
 
@@ -177,6 +181,7 @@ def run(csv_path, base_url, token, libraries, directory, dry_run, force, log_pat
         require_credentials(base_url, token)
     header, rows = read_csv(csv_path)
     log = setup_logging(None if dry_run else log_path)
+    started = time.monotonic()
     try:
         try:
             info = None
@@ -232,6 +237,8 @@ def run(csv_path, base_url, token, libraries, directory, dry_run, force, log_pat
                  changed, len(merged))
         return 0
     finally:
+        LIVE.stop()
+        log.info("Runtime: %s", runtime_since(started))
         close_logging(log)
 
 

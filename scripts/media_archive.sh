@@ -37,7 +37,8 @@
 # Notes:
 #   • Refuses to run as root: the folders it creates on the NAS must belong to
 #     the library's owner
-#   • Requires bash 4.0+, flock, mountpoint, sha256sum, realpath and cmp
+#   • Requires bash 4.0+, flock, mountpoint, sha256sum, realpath and cmp, and
+#     media_progress.sh alongside this script
 #   • Only one run may target a given <source_dir> at a time; a second run
 #     exits 1 immediately
 #   • Safe while an encode runs: media_encode.sh -M copies into <source_dir>, and a
@@ -47,6 +48,9 @@
 #     collision (same size) by the next run, and never copied again
 #   • A file whose name the share rejects fails the copy, stays in <source_dir>
 #     and is reported again by every run
+#   • On a terminal, listing a category, and the copy and comparison of each file, show a
+#     spinner with the elapsed time and the file's place in its category. A run without a terminal
+#     (a callback, cron) prints none of it
 #
 # Exit codes:
 #   0  Nothing to do, files still inside the -w window, or every file moved
@@ -126,6 +130,13 @@ if [[ ! -d "$SOURCE_DIR" ]]; then
 fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -z "$OPERATIONAL_DIR" ]] && OPERATIONAL_DIR="$SCRIPT_DIR"
+# Spinner, countdown and runtime helpers (media_progress.sh, alongside this script).
+[[ -r "${SCRIPT_DIR}/media_progress.sh" ]] || {
+    echo "ERROR: media_progress.sh not found next to this script (${SCRIPT_DIR})" >&2
+    exit 1
+}
+# shellcheck source=./media_progress.sh
+source "${SCRIPT_DIR}/media_progress.sh"
 
 # Canonical paths, so the identity and containment checks below hold for any
 # spelling of them.
@@ -203,6 +214,8 @@ WAITING=0
 COLLIDED=0
 NOT_CATEGORY=0
 FAILED=0
+FILE_NUM=0
+FILE_TOTAL=0
 
 # Reports a top-level entry left in the source directory because it is not a
 # category folder on the NAS: prints, logs and counts it. Arguments: reason,
@@ -226,14 +239,21 @@ fail_file() {
     return 0
 }
 
+# Prints the files under one category folder, NUL-delimited and sorted,
+# skipping names that start with a dot. Argument: category folder path.
+list_category_files() {
+    find "$1" -type f ! -name '.*' -print0 | sort -z
+}
+
 # Moves one file to the NAS, or reports why it stays: still inside the settle
 # window, or its destination exists. Checks the dry-run flag itself. Counts
 # MOVED, WAITING, COLLIDED or FAILED and always returns 0, so one bad file
-# never ends the batch. Arguments: absolute source path, path relative to the
-# source directory.
+# never ends the batch. Reads FILE_NUM and FILE_TOTAL for the progress labels.
+# Arguments: absolute source path, path relative to the source directory.
 archive_file() {
     local src="$1" rel="$2"
     local dest="${NAS_REAL}/${rel}" dest_dir base before after now mtime dest_size
+    local place="[${FILE_NUM}/${FILE_TOTAL}]" copy_started
 
     before="$(stat -c '%s %Y' -- "$src")" || { fail_file "source vanished" "$rel"; return 0; }
     mtime="${before#* }"
@@ -272,12 +292,13 @@ archive_file() {
     mkdir -p -- "$dest_dir" || { fail_file "mkdir" "$rel"; return 0; }
 
     CURRENT_TMP="${dest_dir}/.${base}.tmp"
-    cp --preserve=timestamps -- "$src" "$CURRENT_TMP" || { fail_file "copy; the share may reject a character in this name" "$rel"; return 0; }
+    copy_started="$SECONDS"
+    progress_run "Copying ${place} ${rel}" cp --preserve=timestamps -- "$src" "$CURRENT_TMP" || { fail_file "copy; the share may reject a character in this name" "$rel"; return 0; }
 
     [[ "$(stat -c '%s' -- "$CURRENT_TMP" 2>/dev/null)" == "${before%% *}" ]] \
         || { fail_file "size mismatch after copy" "$rel"; return 0; }
     if (( VERIFY_CONTENT )); then
-        cmp -s -- "$src" "$CURRENT_TMP" || { fail_file "content mismatch after copy" "$rel"; return 0; }
+        progress_run "Comparing ${place} ${rel}" cmp -s -- "$src" "$CURRENT_TMP" || { fail_file "content mismatch after copy" "$rel"; return 0; }
     fi
 
     after="$(stat -c '%s %Y' -- "$src")" || { fail_file "source vanished during copy" "$rel"; return 0; }
@@ -293,8 +314,8 @@ archive_file() {
     CURRENT_TMP=""
 
     if rm -- "$src"; then
-        echo "MOVED: $rel"
-        log "MOVED: $rel"
+        echo "MOVED: $rel ($(format_runtime "$(( SECONDS - copy_started ))"))"
+        log "MOVED: $rel ($(format_runtime "$(( SECONDS - copy_started ))"))"
         MOVED=$(( MOVED + 1 ))
     else
         echo "  [FAILED] copied and verified, source not deleted: $rel" >&2
@@ -322,14 +343,21 @@ while IFS= read -r -d '' ENTRY; do
     fi
 
     echo "Category: $CATEGORY"
+    CATEGORY_FILES=()
     while IFS= read -r -d '' FILE; do
+        CATEGORY_FILES+=("$FILE")
+    done < <(progress_run "Listing $CATEGORY" list_category_files "$ENTRY")
+    FILE_TOTAL=${#CATEGORY_FILES[@]}
+    FILE_NUM=0
+    for FILE in ${CATEGORY_FILES[@]+"${CATEGORY_FILES[@]}"}; do
+        FILE_NUM=$(( FILE_NUM + 1 ))
         archive_file "$FILE" "${FILE#"$SOURCE_REAL"/}"
-    done < <(find "$ENTRY" -type f ! -name '.*' -print0 | sort -z)
+    done
 
     # Folders emptied by the moves are removed innermost first. The category
     # folder itself stays, as in media_encode.sh's own cleanup.
     if (( ! DRY_RUN )); then
-        find "$ENTRY" -mindepth 1 -type d -empty -delete \
+        progress_run "Removing empty folders under $CATEGORY" find "$ENTRY" -mindepth 1 -type d -empty -delete \
             || log "WARNING: could not remove every empty folder under $CATEGORY"
     fi
 done < <(find "$SOURCE_REAL" -mindepth 1 -maxdepth 1 -print0 | sort -z)
@@ -347,8 +375,9 @@ echo "  Waiting:    $WAITING  (modified within the last ${SETTLE_SECONDS}s; the 
 echo "  Collisions: $COLLIDED  (already on the NAS; source kept - review manually)"
 echo "  Held:       $NOT_CATEGORY  (not a category folder on the NAS; left in $SOURCE_DIR)"
 echo "  Failed:     $FAILED"
+echo "  Runtime:    $(format_runtime "$SECONDS")"
 echo "------------------------------------------"
-log "Archive complete: Moved=$MOVED Waiting=$WAITING Collisions=$COLLIDED Held=$NOT_CATEGORY Failed=$FAILED"
+log "Archive complete: Moved=$MOVED Waiting=$WAITING Collisions=$COLLIDED Held=$NOT_CATEGORY Failed=$FAILED Runtime=$(format_runtime "$SECONDS")"
 (( DRY_RUN )) || echo "Log saved to: $LOG_FILE"
 
 (( FAILED == 0 )) || exit 1

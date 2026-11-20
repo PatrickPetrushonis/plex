@@ -35,13 +35,17 @@
 # Notes:
 #   • Refuses to run as root: the folders it creates in the library must belong
 #     to the library's owner
-#   • Requires bash 4.0+, find, flock, mountpoint, sha256sum, realpath and stat
+#   • Requires bash 4.0+, find, flock, mountpoint, sha256sum, realpath and stat,
+#     and media_progress.sh alongside this script
 #   • Both directories must be under <mount_point> and on one filesystem; when
 #     they are not, the run ends before any work, because a move between
 #     filesystems copies the file and a partly copied file would be visible in
 #     the library
 #   • Only one run may target a given <nas_archive_dir> at a time; a second run
 #     exits 1 immediately
+#   • On a terminal, listing a category and removing its emptied folders show a
+#     spinner with the elapsed time. A run without a terminal (a callback, cron)
+#     prints none of it
 #   • Safe while media_archive.sh runs: it never takes a file that still has a
 #     hidden ".tmp" name. Neither script takes the other's lock
 #
@@ -110,6 +114,13 @@ ARCHIVE_DIR="${1%/}"
 LIBRARY_DIR="${2%/}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -z "$OPERATIONAL_DIR" ]] && OPERATIONAL_DIR="$SCRIPT_DIR"
+# Spinner, countdown and runtime helpers (media_progress.sh, alongside this script).
+[[ -r "${SCRIPT_DIR}/media_progress.sh" ]] || {
+    echo "ERROR: media_progress.sh not found next to this script (${SCRIPT_DIR})" >&2
+    exit 1
+}
+# shellcheck source=./media_progress.sh
+source "${SCRIPT_DIR}/media_progress.sh"
 
 MOUNT_REAL="$(realpath -- "$MOUNT_POINT")" || {
     echo "ERROR: mount point '$MOUNT_POINT' does not exist." >&2
@@ -214,6 +225,12 @@ fail_file() {
     return 0
 }
 
+# Prints the files under one category folder, NUL-delimited and sorted,
+# skipping names that start with a dot. Argument: category folder path.
+list_category_files() {
+    find "$1" -type f ! -name '.*' -print0 | sort -z
+}
+
 # Moves one file into the library, or reports why it stays: its destination
 # exists. Checks the dry-run flag itself. Counts MOVED, COLLIDED or FAILED and
 # always returns 0, so one bad file never ends the batch. Arguments: absolute
@@ -278,14 +295,18 @@ while IFS= read -r -d '' ENTRY; do
     fi
 
     echo "Category: $CATEGORY"
+    CATEGORY_FILES=()
     while IFS= read -r -d '' FILE; do
+        CATEGORY_FILES+=("$FILE")
+    done < <(progress_run "Listing $CATEGORY" list_category_files "$ENTRY")
+    for FILE in ${CATEGORY_FILES[@]+"${CATEGORY_FILES[@]}"}; do
         promote_file "$FILE" "${FILE#"$ARCHIVE_REAL"/}"
-    done < <(find "$ENTRY" -type f ! -name '.*' -print0 | sort -z)
+    done
 
     # Folders emptied by the moves are removed innermost first. The category
     # folder itself stays.
     if (( ! DRY_RUN )); then
-        find "$ENTRY" -mindepth 1 -type d -empty -delete \
+        progress_run "Removing empty folders under $CATEGORY" find "$ENTRY" -mindepth 1 -type d -empty -delete \
             || log "WARNING: could not remove every empty folder under $CATEGORY"
     fi
 done < <(find "$ARCHIVE_REAL" -mindepth 1 -maxdepth 1 -print0 | sort -z)
@@ -302,8 +323,9 @@ fi
 echo "  Collisions: $COLLIDED  (already in the library; source kept - review manually)"
 echo "  Held:       $NOT_CATEGORY  (not a category folder in the library; left in $ARCHIVE_DIR)"
 echo "  Failed:     $FAILED"
+echo "  Runtime:    $(format_runtime "$SECONDS")"
 echo "------------------------------------------"
-log "Promote complete: Moved=$MOVED Collisions=$COLLIDED Held=$NOT_CATEGORY Failed=$FAILED"
+log "Promote complete: Moved=$MOVED Collisions=$COLLIDED Held=$NOT_CATEGORY Failed=$FAILED Runtime=$(format_runtime "$SECONDS")"
 (( DRY_RUN )) || echo "Log saved to: $LOG_FILE"
 
 (( FAILED == 0 )) || exit 1

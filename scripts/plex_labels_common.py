@@ -1,8 +1,8 @@
 """Helpers shared by plex_get_labels.py, plex_sync_folders.py and plex_apply_labels.py.
 
 HTTP with throttling and retries (fetch_json), folder-name parsing, atomic file
-writes, a self-cleaning single-run lock, and logging to the logs directory beside the
-scripts directory.
+writes, a self-cleaning single-run lock, logging to the logs directory beside the
+scripts directory, and a live status line (LIVE) with the elapsed time of a slow step.
 """
 import contextlib
 import fcntl
@@ -10,8 +10,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -160,8 +162,106 @@ def hold_lock(lock_path, busy_message):
         os.close(fd)
 
 
+class LiveStatus:
+    """One status line at the bottom of the terminal while a slow step runs: a spinner,
+    the elapsed time since the first set() and the text last given to set(), redrawn
+    once a second by a background thread. It draws only while stderr is a terminal, so
+    a redirected or unattended run prints nothing extra, and not before the first
+    second, so a quick step shows nothing. Log records written through the logger from
+    setup_logging appear above the line, which is erased and redrawn around them."""
+
+    FRAMES = "|/-\\"
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self._text = ""
+        self._started = 0.0
+        self._frame = 0
+        self._drawn = False
+        self._thread = None
+        self._stop = threading.Event()
+
+    def set(self, text):
+        """Sets the status text and starts the redraw thread on the first call. Does
+        nothing when stderr is not a terminal."""
+        if not sys.stderr.isatty():
+            return
+        with self.lock:
+            self._text = text
+            if self._thread is None:
+                self._started = time.monotonic()
+                self._stop = threading.Event()
+                self._thread = threading.Thread(target=self._run, args=(self._stop,),
+                                                daemon=True)
+                self._thread.start()
+
+    def stop(self):
+        """Stops the redraw thread and erases the line. Safe to call when nothing is
+        running."""
+        with self.lock:
+            thread, self._thread = self._thread, None
+            self._stop.set()
+        if thread is not None:
+            thread.join(timeout=2)
+        with self.lock:
+            self.erase()
+
+    def erase(self):
+        """Erases the status line if it is on screen."""
+        with self.lock:
+            if self._drawn:
+                sys.stderr.write("\r\033[K")
+                sys.stderr.flush()
+                self._drawn = False
+
+    def redraw(self):
+        """Draws the status line when the thread is running and the first second has
+        passed."""
+        with self.lock:
+            if self._thread is None:
+                return
+            elapsed = int(time.monotonic() - self._started)
+            if elapsed < 1:
+                return
+            width = max(shutil.get_terminal_size((80, 24)).columns - 1, 20)
+            text = " %s  %02d:%02d elapsed  %s" % (
+                self.FRAMES[self._frame % len(self.FRAMES)], elapsed // 60, elapsed % 60,
+                self._text)
+            sys.stderr.write("\r" + text[:width] + "\033[K")
+            sys.stderr.flush()
+            self._drawn = True
+
+    def _run(self, stop):
+        """Thread body: advances the spinner and redraws once a second until stop is set."""
+        while not stop.wait(1.0):
+            with self.lock:
+                self._frame += 1
+                self.redraw()
+
+
+LIVE = LiveStatus()
+
+
+class _TerminalHandler(logging.StreamHandler):
+    """A stdout handler that keeps LIVE's status line below its records."""
+
+    def emit(self, record):
+        with LIVE.lock:
+            LIVE.erase()
+            super().emit(record)
+            LIVE.redraw()
+
+
+def runtime_since(start):
+    """Returns the time since start (a time.monotonic() value) as '<m>m <s>s'."""
+    seconds = int(time.monotonic() - start)
+    return "%dm %ds" % (seconds // 60, seconds % 60)
+
+
 def close_logging(log):
-    """Closes and detaches every handler on log, releasing the log file."""
+    """Stops the live status line, then closes and detaches every handler on log,
+    releasing the log file."""
+    LIVE.stop()
     for h in list(log.handlers):
         log.removeHandler(h)
         h.close()
@@ -174,7 +274,7 @@ def setup_logging(log_path):
     close_logging(log)
     log.setLevel(logging.INFO)
     fmt = logging.Formatter("[%(asctime)s] %(message)s", "%Y-%m-%d %H:%M:%S")
-    handlers = [logging.StreamHandler(sys.stdout)]
+    handlers = [_TerminalHandler(sys.stdout)]
     if log_path:
         os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
         handlers.append(logging.FileHandler(log_path, encoding="utf-8"))

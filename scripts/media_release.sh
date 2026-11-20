@@ -25,13 +25,17 @@
 # Notes:
 #   • Refuses to run as root: the folders and logs it creates must belong to
 #     the user who owns the library
-#   • Requires bash 4.0+, GNU find (-printf), flock, sha256sum and realpath
+#   • Requires bash 4.0+, GNU find (-printf), flock, sha256sum and realpath, and
+#     media_progress.sh alongside this script
 #   • An entry keeps its category folder, which is created in <input_dir> when
 #     missing, so media_encode.sh -r carries it through to the archive
 #   • An entry sitting directly in <holding_dir>, outside a category folder, is
 #     listed but not released: move it into a category folder first
 #   • A target that already exists in <input_dir> is skipped and logged, never
 #     overwritten or merged: mv would nest a directory inside an existing one
+#   • On a terminal, a move that takes more than a second (a copy, when the two
+#     directories are on different filesystems) shows a spinner with the elapsed
+#     time. A run without a terminal prints none of it
 #   • Safe while an encode runs: media_encode.sh lists its input files once at the
 #     start, so a released entry waits for the next encode
 #   • Only one run may target a given <input_dir> at a time; a second run exits
@@ -119,6 +123,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 }
 # shellcheck source=./media_categories.sh
 source "${SCRIPT_DIR}/media_categories.sh"
+# Spinner, countdown and runtime helpers (media_progress.sh, alongside this script).
+[[ -r "${SCRIPT_DIR}/media_progress.sh" ]] || {
+    echo "ERROR: media_progress.sh not found next to this script (${SCRIPT_DIR})" >&2
+    exit 1
+}
+# shellcheck source=./media_progress.sh
+source "${SCRIPT_DIR}/media_progress.sh"
 
 # Canonical paths, so the identity check below holds for any spelling of them.
 SOURCE_REAL="$(realpath -- "$SOURCE_DIR")"
@@ -257,7 +268,7 @@ release_entry() {
     }
     # -T keeps mv from nesting the entry inside a directory that appeared at
     # the target after the check above; -n keeps it from overwriting a file that did.
-    if mv -nT -- "$src" "$dest" && [[ ! -e "$src" && -e "$dest" ]]; then
+    if progress_run "Moving $name" mv -nT -- "$src" "$dest" && [[ ! -e "$src" && -e "$dest" ]]; then
         echo "  [SUCCESS] Moved."
         log "RELEASED: $src -> $dest"
         RELEASED=$(( RELEASED + 1 ))
@@ -321,8 +332,9 @@ echo "  Released:   $RELEASED"
 echo "  Skipped:    $SKIPPED  (name already exists in $DEST_DIR - review manually)"
 echo "  No match:   $NO_MATCH  (not held, or not a Category/Entry item)"
 echo "  Failed:     $FAILED"
+echo "  Runtime:    $(format_runtime "$SECONDS")"
 echo "------------------------------------------"
-log "Release complete: Released=$RELEASED Previewed=$PREVIEWED Skipped=$SKIPPED NoMatch=$NO_MATCH Failed=$FAILED"
+log "Release complete: Released=$RELEASED Previewed=$PREVIEWED Skipped=$SKIPPED NoMatch=$NO_MATCH Failed=$FAILED Runtime=$(format_runtime "$SECONDS")"
 (( DRY_RUN )) || echo "Log saved to: $LOG_FILE"
 (( FAILED == 0 )) || exit 1
 exit 0
