@@ -30,6 +30,7 @@ plex/
     ├── subtitle_mux.sh             Shared: container-aware subtitle codec choice, sidecar discovery, external-subtitle ffmpeg arg building
     ├── subtitle_strip_tags.py      Strips leftover ASS override tags (e.g. {\an8}) from a plain-text subtitle file; called by media_encode.sh
     ├── subtitle_join.py            Joins SubRip files, shifting each by an offset, for the subtitles of a multi-part movie; called by media_encode.sh
+    ├── subtitle_ocr.py             Reads a VobSub pair (.idx and .sub) by OCR into SubRip; called by media_encode.sh
     ├── subtitle_scan_types.sh      Standalone, read-only inventory of embedded subtitle codecs across a directory - no wrapper, no config.sh dependency
     ├── lang_table.sh               Shared language-code loader (bash side)
     ├── lang_table.tsv              Canonical language data (single source of truth)
@@ -341,6 +342,17 @@ Known limitation: two separate movies whose names differ only by a part number (
 ### Subtitles
 
 Sidecar discovery, the container-aware subtitle codec choice and external-subtitle ffmpeg arg building live in the shared `subtitle_mux.sh`. Sidecars are tag-stripped before muxing (see [Subtitle tag stripping](#subtitle-tag-stripping-subtitle_strip_tagspy)). A `.sub` file is claimed only when ffprobe identifies it as MicroDVD; with ffprobe 6.1.1 that needs a first line `{1}{1}<fps>` (for example `{1}{1}25.000`), and a file of bare `{start}{end}text` lines is reported as unclaimed.
+
+**VobSub (`.idx` + `.sub`).** A pair named `<video>.<lang2>[.cc|.sdh|.forced].idx` and `<video>.<lang2>[...].sub` is bitmap, so `media_encode.sh` reads it by OCR (`subtitle_ocr.py`, tesseract) into SubRip and muxes that like any other sidecar. Merged CD1/CD2 sets work unchanged: each part is read, then the parts are shifted and joined.
+
+- **Track.** The first track in the `.idx` whose language matches the file name is read. A pair with no track in that language is reported and left alone.
+- **Precedence.** A text sidecar of the same language and type wins; the VobSub pair is then reported as unused.
+- **Cost.** About 0.1 s per cue on the test machine, so a feature film takes a minute or two per part. The spinner shows while it runs, and a dry run skips OCR.
+- **Quality.** OCR text can hold errors (a capital I read as a pipe is corrected), and a cue it cannot read is skipped. Spot-check the result.
+- **Needs.** `tesseract` with the data for each `-l` language (`tesseract --list-langs`) and Pillow for `python3`. Without them the pair is reported once and left alone, and the encode goes on.
+- **`-A`.** The `.idx` and the `.sub` move together.
+- **Not covered.** Bitmap tracks embedded in a video, and `.sup` (PGS) files.
+- **Dry run.** The plan line for the subtitle shows the VobSub codec (`dvd_subtitle`) because the SubRip file does not exist yet.
 
 ## `media_rename.sh`
 

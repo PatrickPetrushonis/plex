@@ -39,7 +39,10 @@
 # Notes:
 #   * Requires bash 4.0+, ffmpeg (built with the zscale and tonemap filters),
 #     ffprobe, python3, flock, find, grep, sed, awk, iconv, and media_progress.sh
-#     and subtitle_join.py alongside this script
+#     subtitle_join.py and subtitle_ocr.py alongside this script. VobSub subtitles
+#     (.idx and .sub) also need tesseract with the language data for each target
+#     language, and Pillow for python3; without them the VobSub files are reported
+#     and left alone, and the encode goes on
 #   * The spinner and elapsed time show on a terminal only; a run without one
 #     (a callback, cron) prints none of it
 #   * Video is copied if already h264, 8-bit 4:2:0, SDR (colour transfer not PQ or
@@ -70,10 +73,23 @@
 #     A sidecar replaces an embedded track of the same
 #     language and the same type (standard, CC, forced); language codes are
 #     compared after alias resolution and an untagged track counts as eng
+#   * VobSub sidecars (<name>.<lang2>[.cc|.sdh|.forced].idx with its .sub beside it) are
+#     bitmap subtitles. For each target language the first track of that language in
+#     the .idx is read by OCR (subtitle_ocr.py, tesseract) into SubRip, which is muxed
+#     like any other sidecar, so merged sets, -S sidecar and the tag-stripping all
+#     apply. A text sidecar of the same language and type wins over a VobSub one. OCR
+#     takes about 0.1 s per cue, so a feature film takes a minute or two per part; the
+#     spinner shows while it runs. Text recognised by OCR can hold errors, and a cue it
+#     cannot read is skipped. A dry run does not run OCR. -A moves the .idx and the .sub
+#     together. A VobSub pair is reported and left alone when OCR is unavailable, the
+#     language data is not installed, the .idx has no track in the language, or the
+#     OCR fails. Embedded bitmap tracks (a VobSub or PGS track inside the video) and
+#     .sup files are not read by OCR
 #   * Subtitle-extension files next to a video that discovery does not embed
-#     (.idx, .sup, .smi, a bitmap .sub, a lower-precedence duplicate format,
-#     a language outside -l, an unrecognized modifier)
-#     are reported as warnings, are not embedded, and stay where they are
+#     (.sup, .smi, a bitmap .sub with no .idx, a lower-precedence duplicate format,
+#     a language outside -l, an unrecognized modifier, or a VobSub pair that could
+#     not be read as above) are reported as warnings, are not embedded, and stay
+#     where they are
 #   * -S sidecar: embedded text tracks (subrip, mov_text, webvtt, microdvd, ass/ssa) in target
 #     languages are extracted, and input sidecars are written, next to the output as
 #     <output name>.<lang2>[.cc|.forced].<ext> (srt; ass for ASS/SSA; vtt for WebVTT), in
@@ -306,6 +322,8 @@ STRIP_PY="$(dirname "${BASH_SOURCE[0]}")/subtitle_strip_tags.py"
 [[ -r "$STRIP_PY" ]] || { echo "ERROR: subtitle_strip_tags.py not found next to this script ($STRIP_PY)" >&2; exit 1; }
 JOIN_PY="$(dirname "${BASH_SOURCE[0]}")/subtitle_join.py"
 [[ -r "$JOIN_PY" ]] || { echo "ERROR: subtitle_join.py not found next to this script ($JOIN_PY)" >&2; exit 1; }
+# Optional: only VobSub sidecars need it (see ocr_ready).
+OCR_PY="$(dirname "${BASH_SOURCE[0]}")/subtitle_ocr.py"
 # shellcheck source=./video_exts.sh
 source "$(dirname "${BASH_SOURCE[0]}")/video_exts.sh"
 PROGRESS_SH="$(dirname "${BASH_SOURCE[0]}")/media_progress.sh"
@@ -1055,6 +1073,10 @@ backup_sidecar_subs() {
     for line in "${LINES[@]+"${LINES[@]}"}"; do
         read -r _lang _type SIDECAR_SRC <<< "$line"
         move_into_backup "$SIDECAR_SRC" "$ROOT" "$DEST_BASE" " (sidecar)" || FAILED=1
+        # A VobSub .idx travels with the .sub beside it.
+        if [[ "$SIDECAR_SRC" == *.idx ]]; then
+            move_into_backup "${SIDECAR_SRC%.idx}.sub" "$ROOT" "$DEST_BASE" " (sidecar)" || FAILED=1
+        fi
     done
     return "$FAILED"
 }
@@ -1665,6 +1687,133 @@ write_concat_list() {
     done
 }
 
+# -- VobSub sidecars (.idx + .sub) -----------------------------------------------------
+# State of the VobSub OCR check: "" until ocr_ready() has run, then 1 (usable) or 0.
+OCR_READY=""
+# The tesseract languages installed, space separated with a space at each end. Set by
+# ocr_ready().
+OCR_LANGS=""
+
+# Checks once per run that VobSub OCR can run: subtitle_ocr.py beside this script,
+# tesseract on the PATH, Pillow for python3. Prints one warning naming the first thing
+# missing and returns 1 when OCR cannot run. Called from the main shell, never from a
+# command substitution, so the result is kept.
+ocr_ready() {
+    if [[ -n "$OCR_READY" ]]; then
+        [[ "$OCR_READY" == 1 ]]
+        return
+    fi
+    OCR_READY=0
+    if [[ ! -r "$OCR_PY" ]]; then
+        echo " WARNING: VobSub subtitles found but subtitle_ocr.py is missing next to this script; they are not used" >&2
+    elif ! command -v tesseract >/dev/null 2>&1; then
+        echo " WARNING: VobSub subtitles found but tesseract is not installed; they are not used" >&2
+    elif ! python3 -I -c 'import PIL' 2>/dev/null; then
+        echo " WARNING: VobSub subtitles found but python3 lacks Pillow; they are not used" >&2
+    else
+        OCR_LANGS=" $(tesseract --list-langs 2>/dev/null | tail -n +2 | tr '\n' ' ')"
+        OCR_READY=1
+    fi
+    [[ "$OCR_READY" == 1 ]]
+}
+
+# Echoes the tesseract language name for the 3-letter language code LANG3 (tesseract
+# names its data after the ISO 639-2 terminology codes, where bibliographic codes such
+# as fre and ger differ from them).
+tesseract_lang() {
+    case "$1" in
+        fre|fra) echo fra ;;
+        ger|deu) echo deu ;;
+        dut|nld) echo nld ;;
+        cze|ces) echo ces ;;
+        gre|ell) echo ell ;;
+        per|fas) echo fas ;;
+        wel|cym) echo cym ;;
+        baq|eus) echo eus ;;
+        mac|mkd) echo mkd ;;
+        may|msa) echo msa ;;
+        bur|mya) echo mya ;;
+        chi|zho) echo chi_sim ;;
+        *)       echo "$1" ;;
+    esac
+}
+
+# Finds the VobSub sidecars next to INPUT: for each target language in SUB_LANGS and
+# each of <base>.<lang2>.idx, <base>.<lang2>.cc.idx (or .sdh.idx, after .cc) and
+# <base>.<lang2>.forced.idx, an .idx with its .sub beside it and a track of that
+# language in the .idx. A language and type that already has a claimed text sidecar is
+# skipped. Appends one "LANG3 TYPE IDX_PATH" line per find to the array named by arg 2;
+# the remaining args are the already claimed "LANG3 TYPE PATH" lines. An .idx that
+# cannot be used is not appended, so it is reported as unclaimed. Runs in the calling
+# shell (no command substitution) so the one-time OCR warning is kept.
+discover_vobsub_sidecars() {
+    local INPUT="$1"
+    # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function
+    local -n _VOUT="$2"
+    shift 2
+    local DIR BASE
+    DIR="$(dirname "$INPUT")"
+    BASE="$(basename "${INPUT%.*}")"
+
+    local -A TAKEN=()
+    local line _l _t _p
+    for line in "$@"; do
+        read -r _l _t _p <<< "$line"
+        TAKEN["${_l} ${_t}"]=1
+    done
+
+    local -a TARGET_LANGS=()
+    IFS=',' read -ra TARGET_LANGS <<< "$SUB_LANGS"
+    local lang3 lang2 cand type suffix f tl
+    for lang3 in "${TARGET_LANGS[@]+"${TARGET_LANGS[@]}"}"; do
+        lang2="${LANG_3TO2[$lang3]:-}"
+        [[ -n "$lang2" ]] || continue
+        for cand in "target:" "cc:.cc" "cc:.sdh" "forced:.forced"; do
+            type="${cand%%:*}"
+            suffix="${cand#*:}"
+            [[ -z "${TAKEN[${lang3} ${type}]+_}" ]] || continue
+            f="${DIR}/${BASE}.${lang2}${suffix}.idx"
+            [[ -f "$f" && -f "${f%.idx}.sub" ]] || continue
+            ocr_ready || continue
+            tl="$(tesseract_lang "$lang3")"
+            if [[ "$OCR_LANGS" != *" ${tl} "* ]]; then
+                echo " WARNING: tesseract has no '${tl}' language data installed; not using $(basename "$f")" >&2
+                continue
+            fi
+            if ! python3 -I "$OCR_PY" tracks "$f" 2>/dev/null | awk -v l="$lang2" '$1 == l { found = 1 } END { exit !found }'; then
+                echo " WARNING: $(basename "$f") has no '${lang2}' track; not using it" >&2
+                continue
+            fi
+            TAKEN["${lang3} ${type}"]=1
+            _VOUT+=("${lang3} ${type} ${f}")
+        done
+    done
+}
+
+# Reads the first track of language LANG3 in the VobSub IDX by OCR and writes it to OUT
+# as SubRip. The spinner shows while it runs, and the process is registered in
+# CURRENT_FFMPEG_PID so the SIGINT/SIGTERM handler stops it. Prints the cue count on
+# success. Returns 1 on a failure, after printing why.
+ocr_vobsub() {
+    local IDX="$1" LANG3="$2" OUT="$3"
+    local lang2 track RC=0 msg
+    lang2="${LANG_3TO2[$LANG3]:-}"
+    track="$(python3 -I "$OCR_PY" tracks "$IDX" 2>/dev/null | awk -v l="$lang2" '$1 == l { print $2; exit }')"
+    [[ -n "$track" ]] || { echo " WARNING: $(basename "$IDX") has no '${lang2}' track" >&2; return 1; }
+    mkdir -p -- "${OUT%/*}" || return 1
+    python3 -I "$OCR_PY" ocr "$IDX" "$track" "$OUT" "$(tesseract_lang "$LANG3")" >"${OUT}.out" 2>"${OUT}.err" &
+    CURRENT_FFMPEG_PID=$!
+    spin_until_exit "$CURRENT_FFMPEG_PID" "OCR $(basename "$IDX")"
+    wait "$CURRENT_FFMPEG_PID" || RC=$?
+    CURRENT_FFMPEG_PID=""
+    if (( RC != 0 )) || [[ ! -s "$OUT" ]]; then
+        msg="$(head -n 1 "${OUT}.err" 2>/dev/null)"
+        echo " WARNING: OCR of $(basename "$IDX") failed${msg:+: $msg}" >&2
+        return 1
+    fi
+    echo " Subtitles: OCR of $(basename "$IDX") ($LANG3, track $track): $(< "${OUT}.out")"
+}
+
 # -- join_part_sidecars --------------------------------------------------------------
 # Joins the sidecar subtitles of each language and type across the parts of a merged
 # set into one SubRip file under SUB_TMP_DIR/join, so the subtitles follow the joined video:
@@ -1834,8 +1983,10 @@ process_file() {
     # below, only for the copy that gets fed to ffmpeg.
     # PART_SUB_LINES carries the same lines prefixed with the index of the part they
     # belong to, for join_part_sidecars().
-    local -a EXTSUB_LINES=() PART_SUB_LINES=() _part_lines=()
-    local _unclaimed _pi
+    local -a EXTSUB_LINES=() PART_SUB_LINES=() _part_lines=() _report_lines=() _vob_lines=()
+    # VobSub .idx path -> the SubRip file its OCR wrote, for the sidecars muxed below
+    local -A OCR_SRT=()
+    local _unclaimed _pi _vl _vt _vp _vsrt
     for (( _pi=0; _pi<${#CURRENT_PARTS[@]}; _pi++ )); do
         _part_lines=()
         while IFS= read -r line; do
@@ -1845,13 +1996,37 @@ process_file() {
             PART_SUB_LINES+=("${_pi} ${line}")
         done < <(discover_sidecar_subs "${CURRENT_PARTS[$_pi]}")
 
+        # VobSub pairs for the languages and types the text sidecars did not cover.
+        # Each is read by OCR into a SubRip file under SUB_TMP_DIR; EXTSUB_LINES keeps
+        # the .idx path, which is what -A moves later.
+        _report_lines=("${_part_lines[@]+"${_part_lines[@]}"}")
+        _vob_lines=()
+        discover_vobsub_sidecars "${CURRENT_PARTS[$_pi]}" _vob_lines "${_part_lines[@]+"${_part_lines[@]}"}"
+        for line in "${_vob_lines[@]+"${_vob_lines[@]}"}"; do
+            read -r _vl _vt _vp <<< "$line"
+            if (( DRY_RUN )); then
+                echo " [DRY RUN] Would read $(basename "$_vp") by OCR ($_vl/$_vt) into SubRip"
+            else
+                _vsrt="${SUB_TMP_DIR}/ocr/p${FILE_NUM}_${_pi}_${_vl}_${_vt}.srt"
+                if ! ocr_vobsub "$_vp" "$_vl" "$_vsrt"; then
+                    log "VOBSUB OCR FAILED: $_vp"
+                    continue
+                fi
+                OCR_SRT["$_vp"]="$_vsrt"
+            fi
+            _part_lines+=("$line")
+            _report_lines+=("$line" "${_vl} ${_vt} ${_vp%.idx}.sub")
+            EXTSUB_LINES+=("$line")
+            PART_SUB_LINES+=("${_pi} ${line}")
+        done
+
         # Files next to the video that discovery does not embed (other formats, a
         # language outside -l, an unrecognized modifier, a shadowed .sdh.srt).
         while IFS= read -r _unclaimed; do
             [[ -n "$_unclaimed" ]] || continue
-            echo " WARNING: subtitle file not used (format, language, modifier, duplicate, or text not valid UTF-8), stays in the source directory: $(basename "$_unclaimed")" >&2
+            echo " WARNING: subtitle file not used (format, language, modifier, duplicate, text not valid UTF-8, or VobSub that could not be read), stays in the source directory: $(basename "$_unclaimed")" >&2
             log "SUBTITLE FILE UNCLAIMED: $_unclaimed"
-        done < <(report_unclaimed_sidecars "${CURRENT_PARTS[$_pi]}" "${_part_lines[@]+"${_part_lines[@]}"}")
+        done < <(report_unclaimed_sidecars "${CURRENT_PARTS[$_pi]}" "${_report_lines[@]+"${_report_lines[@]}"}")
     done
 
     # Sidecar wins per language and type: an embedded track is dropped only
@@ -1903,10 +2078,20 @@ process_file() {
 
     # The sidecars ffmpeg opens: each one as found for a single file; one joined file
     # per language and type for a merged set.
-    local -a MUX_SRC_LINES=("${EXTSUB_LINES[@]+"${EXTSUB_LINES[@]}"}")
+    # A VobSub .idx is replaced by the SubRip file its OCR wrote.
+    local -a MUX_SRC_LINES=() MUX_PART_LINES=()
+    local _mi _ml _mt _mp
+    for line in "${EXTSUB_LINES[@]+"${EXTSUB_LINES[@]}"}"; do
+        read -r _ml _mt _mp <<< "$line"
+        MUX_SRC_LINES+=("${_ml} ${_mt} ${OCR_SRT[$_mp]:-$_mp}")
+    done
+    for line in "${PART_SUB_LINES[@]+"${PART_SUB_LINES[@]}"}"; do
+        read -r _mi _ml _mt _mp <<< "$line"
+        MUX_PART_LINES+=("${_mi} ${_ml} ${_mt} ${OCR_SRT[$_mp]:-$_mp}")
+    done
     if (( IS_GROUP && ${#EXTSUB_LINES[@]} > 0 )); then
         MUX_SRC_LINES=()
-        if ! join_part_sidecars MUX_SRC_LINES PART_DURS "${PART_SUB_LINES[@]}"; then
+        if ! join_part_sidecars MUX_SRC_LINES PART_DURS "${MUX_PART_LINES[@]}"; then
             log "FAILED (sidecar join): $INPUT"
             return 1
         fi
