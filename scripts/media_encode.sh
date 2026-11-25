@@ -77,7 +77,8 @@
 #     bitmap subtitles. For each target language the first track of that language in
 #     the .idx is read by OCR (subtitle_ocr.py, tesseract) into SubRip, which is muxed
 #     like any other sidecar, so merged sets, -S sidecar and the tag-stripping all
-#     apply. A text sidecar of the same language and type wins over a VobSub one. OCR
+#     apply. A text sidecar of the same language and type wins over a VobSub one; the
+#     VobSub pair is not read, is named in a message, and -A moves it with the video. OCR
 #     takes about 0.1 s per cue, so a feature film takes a minute or two per part; the
 #     spinner shows while it runs. Text recognised by OCR can hold errors, and a cue it
 #     cannot read is skipped. A dry run does not run OCR. -A moves the .idx and the .sub
@@ -1458,7 +1459,8 @@ finish_outputs() {
 # subtitle stream count), promotes it to OUTPUT, then runs finish_outputs() for
 # -M and -A. Args 7-9
 # are the names of the ffmpeg arg array, the container-flag array, and the
-# sidecar "LANG TYPE PATH" line array; arg 10 is the number of subtitle streams
+# sidecar "LANG TYPE PATH" line array (the files -A moves, including a VobSub pair a text
+# sidecar made redundant); arg 10 is the number of subtitle streams
 # the build step emitted; args 11 and 12 are the names of the sidecar ffmpeg
 # output-argument array and sidecar job array (-S sidecar; empty otherwise, see
 # build_sidecar_outputs). Returns 0 on success, 1 on any failure (including a
@@ -1741,13 +1743,18 @@ tesseract_lang() {
 # Finds the VobSub sidecars next to INPUT: for each target language in SUB_LANGS and
 # each of <base>.<lang2>.idx, <base>.<lang2>.cc.idx (or .sdh.idx, after .cc) and
 # <base>.<lang2>.forced.idx, an .idx with its .sub beside it and a track of that
-# language in the .idx. A language and type that already has a claimed text sidecar is
-# skipped. Appends one "LANG3 TYPE IDX_PATH" line per find to the array named by arg 2;
-# the remaining args are the already claimed "LANG3 TYPE PATH" lines. An .idx that
-# cannot be used is not appended, so it is reported as unclaimed. Runs in the calling
-# shell (no command substitution) so the one-time OCR warning is kept.
+# language in the .idx. Appends one "LANG3 TYPE IDX_PATH" line per find to the array
+# named by arg 2; the remaining args are the already claimed "LANG3 TYPE PATH" lines.
+# A pair whose language and type already has a claimed text sidecar is not read; it is
+# appended to the global VOBSUB_SHADOWED instead (same line form), which each call
+# resets, so the caller can say why it is unused and back it up with the video. An .idx
+# that cannot be used for any other reason is in neither array, so it is reported as
+# unclaimed. Runs in the calling shell (no command substitution) so the one-time OCR
+# warning is kept.
+VOBSUB_SHADOWED=()
 discover_vobsub_sidecars() {
     local INPUT="$1"
+    VOBSUB_SHADOWED=()
     # shellcheck disable=SC2178  # false positive: -n declares a fresh nameref scoped to this function
     local -n _VOUT="$2"
     shift 2
@@ -1755,11 +1762,12 @@ discover_vobsub_sidecars() {
     DIR="$(dirname "$INPUT")"
     BASE="$(basename "${INPUT%.*}")"
 
-    local -A TAKEN=()
+    local -A TAKEN=() TEXT_TAKEN=()
     local line _l _t _p
     for line in "$@"; do
         read -r _l _t _p <<< "$line"
         TAKEN["${_l} ${_t}"]=1
+        TEXT_TAKEN["${_l} ${_t}"]=1
     done
 
     local -a TARGET_LANGS=()
@@ -1771,9 +1779,13 @@ discover_vobsub_sidecars() {
         for cand in "target:" "cc:.cc" "cc:.sdh" "forced:.forced"; do
             type="${cand%%:*}"
             suffix="${cand#*:}"
-            [[ -z "${TAKEN[${lang3} ${type}]+_}" ]] || continue
             f="${DIR}/${BASE}.${lang2}${suffix}.idx"
             [[ -f "$f" && -f "${f%.idx}.sub" ]] || continue
+            if [[ -n "${TEXT_TAKEN[${lang3} ${type}]+_}" ]]; then
+                VOBSUB_SHADOWED+=("${lang3} ${type} ${f}")
+                continue
+            fi
+            [[ -z "${TAKEN[${lang3} ${type}]+_}" ]] || continue
             ocr_ready || continue
             tl="$(tesseract_lang "$lang3")"
             if [[ "$OCR_LANGS" != *" ${tl} "* ]]; then
@@ -1984,6 +1996,8 @@ process_file() {
     # PART_SUB_LINES carries the same lines prefixed with the index of the part they
     # belong to, for join_part_sidecars().
     local -a EXTSUB_LINES=() PART_SUB_LINES=() _part_lines=() _report_lines=() _vob_lines=()
+    # EXTSUB_LINES plus the VobSub pairs a text sidecar made redundant: what -A moves
+    local -a BACKUP_LINES=() SHADOWED_LINES=()
     # VobSub .idx path -> the SubRip file its OCR wrote, for the sidecars muxed below
     local -A OCR_SRT=()
     local _unclaimed _pi _vl _vt _vp _vsrt
@@ -2002,6 +2016,14 @@ process_file() {
         _report_lines=("${_part_lines[@]+"${_part_lines[@]}"}")
         _vob_lines=()
         discover_vobsub_sidecars "${CURRENT_PARTS[$_pi]}" _vob_lines "${_part_lines[@]+"${_part_lines[@]}"}"
+        # A pair a text sidecar of the same language and type made redundant is not read.
+        # It belongs to this video, so -A moves it with the rest.
+        for line in "${VOBSUB_SHADOWED[@]+"${VOBSUB_SHADOWED[@]}"}"; do
+            read -r _vl _vt _vp <<< "$line"
+            echo " Subtitles: $(basename "$_vp") not used, the text sidecar of the same language and type ($_vl/$_vt) is used instead"
+            SHADOWED_LINES+=("$line")
+            _report_lines+=("$line" "${_vl} ${_vt} ${_vp%.idx}.sub")
+        done
         for line in "${_vob_lines[@]+"${_vob_lines[@]}"}"; do
             read -r _vl _vt _vp <<< "$line"
             if (( DRY_RUN )); then
@@ -2028,6 +2050,8 @@ process_file() {
             log "SUBTITLE FILE UNCLAIMED: $_unclaimed"
         done < <(report_unclaimed_sidecars "${CURRENT_PARTS[$_pi]}" "${_report_lines[@]+"${_report_lines[@]}"}")
     done
+
+    BACKUP_LINES=("${EXTSUB_LINES[@]+"${EXTSUB_LINES[@]}"}" "${SHADOWED_LINES[@]+"${SHADOWED_LINES[@]}"}")
 
     # Sidecar wins per language and type: an embedded track is dropped only
     # when a sidecar of the same primary language code and the same type
@@ -2176,11 +2200,11 @@ process_file() {
         printf -v DRY_CMD '%q ' ffmpeg "${FF_ARGS[@]}" "${CONTAINER_FLAGS[@]+"${CONTAINER_FLAGS[@]}"}" \
             "$OUTPUT_TMP" "${SIDECAR_FF[@]+"${SIDECAR_FF[@]}"}"
         echo " [DRY RUN] ${DRY_CMD}&& mv -- $(printf '%q %q' "$OUTPUT_TMP" "$OUTPUT")"
-        finish_outputs "$INPUT" "$OUTPUT" "$ROOT" SIDECAR_JOBS EXTSUB_LINES || true
+        finish_outputs "$INPUT" "$OUTPUT" "$ROOT" SIDECAR_JOBS BACKUP_LINES || true
         return 3
     fi
 
-    execute_encode "$INPUT" "$OUTPUT" "$OUTPUT_TMP" "$OUTPUT_DIR_FOR_FILE" "$ROOT" "${VID_CODEC_LABEL:-$VID_CODEC}" FF_ARGS CONTAINER_FLAGS EXTSUB_LINES "$SUB_OUT_IDX" SIDECAR_FF SIDECAR_JOBS
+    execute_encode "$INPUT" "$OUTPUT" "$OUTPUT_TMP" "$OUTPUT_DIR_FOR_FILE" "$ROOT" "${VID_CODEC_LABEL:-$VID_CODEC}" FF_ARGS CONTAINER_FLAGS BACKUP_LINES "$SUB_OUT_IDX" SIDECAR_FF SIDECAR_JOBS
 }
 
 # -- Main loop -------------------------------------------------------------------------
