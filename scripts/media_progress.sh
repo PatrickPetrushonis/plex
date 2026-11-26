@@ -5,7 +5,8 @@
 # Functions:
 #   spin_until_exit PID [LABEL [DELAY]]   Spinner with elapsed time until PID exits
 #   progress_run LABEL COMMAND [ARG...]   Runs COMMAND in the foreground under a spinner
-#   progress_countdown SECONDS LABEL      Sleeps SECONDS with the time left shown
+#   progress_countdown SECONDS LABEL      Sleeps SECONDS with the time left shown; a key press
+#                                         ends it early and sets PROGRESS_SKIPPED=1
 #   format_runtime SECONDS                Prints SECONDS as "<m>m <s>s"
 #
 # Notes:
@@ -38,6 +39,9 @@ if (( PROGRESS_ENABLED )); then
         PROGRESS_WIDTH=$(( PROGRESS_COLUMNS - 1 ))
     fi
 fi
+
+# 1 when the last progress_countdown ended on a key press, 0 when it ran its full time.
+PROGRESS_SKIPPED=0
 
 # Seconds the last progress_run command took. Set by progress_run in the
 # calling shell; a call inside $(...) or a process substitution does not
@@ -103,19 +107,30 @@ progress_run() {
     return "$rc"
 }
 
-# Sleeps SECONDS, showing the time left and LABEL once a second when
-# PROGRESS_ENABLED is 1; a plain sleep otherwise. Arguments: whole seconds,
-# label.
+# Sleeps SECONDS, showing the time left, LABEL and the skip hint once a second when
+# PROGRESS_ENABLED is 1; a plain sleep otherwise. On a terminal any key press ends the
+# wait at once and sets PROGRESS_SKIPPED=1 (0 otherwise); with no terminal nothing can
+# skip it. Arguments: whole seconds, label.
 progress_countdown() {
-    local total="$1" label="$2" left text
+    local total="$1" label="$2" left text key rc
+    PROGRESS_SKIPPED=0
     if (( ! PROGRESS_ENABLED )); then
         sleep "$total"
         return 0
     fi
     for (( left = total; left > 0; left-- )); do
-        printf -v text ' %02d:%02d left  %s' "$(( left / 60 ))" "$(( left % 60 ))" "$label"
+        printf -v text ' %02d:%02d left  %s  (press any key to skip)' "$(( left / 60 ))" "$(( left % 60 ))" "$label"
         printf '\r%s\033[K' "${text:0:PROGRESS_WIDTH}" > /dev/tty
-        sleep 1
+        # read waits up to a second for a key: status 0 is a key, above 128 is the
+        # timeout, anything else means the terminal cannot be read, so sleep instead.
+        rc=0
+        read -rsn1 -t 1 key < /dev/tty 2> /dev/null || rc=$?
+        if (( rc == 0 )); then
+            PROGRESS_SKIPPED=1
+            break
+        elif (( rc <= 128 )); then
+            sleep 1
+        fi
     done
     progress_clear
 }

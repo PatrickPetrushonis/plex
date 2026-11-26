@@ -8,7 +8,8 @@
 # Steps, in order, against <source_dir> (the completed-downloads directory):
 #   1. Settle check: the files under <source_dir> must be unchanged across the
 #      settle window (-w). A directory that is still changing ends the run with
-#      exit 0; the next run tries again.
+#      exit 0; the next run tries again. On a terminal a key press ends the wait
+#      early and skips the check for that run.
 #   2. Preview: media_rename.sh -n -x on the whole directory. A skipped, unmatched or
 #      to-be-deleted file stops the run with exit 2 before anything changes.
 #   3. Rename: media_rename.sh -x with no input attached, so a subtitle-deletion
@@ -20,8 +21,12 @@
 #      review; an entry whose lookup could not complete stays and the next run
 #      retries it.
 #   5. Move: each classified entry moves to <holding_dir>/<Category>/, unless
-#      the files changed during step 3. An entry with no video, or whose name
-#      already exists in its category folder, stays.
+#      the files changed during step 3. An entry with no video stays. A folder
+#      whose name already exists in its category folder is merged into it at file
+#      level: each file moves to the same relative path, a file whose name already
+#      exists there stays and is reported, and the folders emptied by the moves are
+#      removed. A file whose name already exists as a different kind of entry
+#      stays and is reported.
 #
 # Options:
 #   -n              Dry run: runs the settle check and the preview, then prints
@@ -76,8 +81,11 @@
 #     another entry needs a person
 #   • A top-level entry is moved whole. With a clean preview every video under
 #     it is already renamed, so a folder never leaves half renamed
-#   • A directory is never merged into an existing one: mv would nest it
-#   • On a terminal, the settle wait shows a countdown, and the preview, rename and each
+#   • Merging never overwrites: a file that already exists at its destination stays in
+#     <source_dir>, with its folder, and is listed in the review file. The entry then counts
+#     as a collision, not as moved, and the next run merges what is left once the
+#     collision is resolved
+#   • On a terminal, the settle wait shows a countdown (any key skips it), and the preview, rename and each
 #     classification show a spinner with the elapsed time. A run without a terminal
 #     (a callback, cron) prints none of it
 #   • Known limitation: an entry that arrives between the settle check and the
@@ -270,6 +278,7 @@ HELD=0
 UNCLASSIFIED=0
 DEFERRED_LOOKUP=0
 COLLIDED=0
+MERGED=0
 FAILED=0
 REVIEW_TEXT=""
 CLASS_CATEGORY=""
@@ -290,14 +299,23 @@ report_held() {
 }
 
 # Reports an entry left in the source directory because its name already exists
-# in its category folder in the holding directory. A directory is never merged:
-# mv would nest it. Prints, logs and counts it, and adds it to the review text.
-# Arguments: name, category folder.
+# in its category folder in the holding directory and cannot be merged (a file, or a
+# folder and a file with the same name). Prints, logs and counts it, and adds it to
+# the review text. Arguments: name, category folder.
 report_collision() {
-    echo "COLLISION (name already exists in $2; merge manually): $1"
+    echo "COLLISION (name already exists in $2 and cannot be merged; source kept): $1"
     log "COLLISION: $2/$1"
-    add_review "COLLISION (name already exists in $2; merge manually): $1"
+    add_review "COLLISION (name already exists in $2 and cannot be merged; source kept in $SOURCE_DIR): $1"
     COLLIDED=$(( COLLIDED + 1 ))
+}
+
+# Reports one file of a merged entry that stays in the source directory because its
+# destination exists: prints, logs and adds it to the review text; the caller counts the
+# entry. Arguments: path relative to the category folder, the reason.
+report_file_collision() {
+    echo "COLLISION ($2; source kept): $1"
+    log "COLLISION: $1 ($2)"
+    add_review "COLLISION ($2; source kept in $SOURCE_DIR): $1"
 }
 
 # Reports an entry left in the source directory because the classifier needs a
@@ -444,11 +462,75 @@ classify_entry() {
     esac
 }
 
+# Merges the directory SRC into the existing directory DEST at file level: each file
+# under SRC moves to the same relative path under DEST, and nothing is overwritten. A
+# file whose destination exists stays in SRC and is reported (same name and size, same
+# name and a different size, or a directory with the name); a move that fails is a
+# failure. The folders in SRC emptied by the moves are removed, SRC itself too when
+# nothing is left. Checks the dry-run flag itself. Counts MERGED when every file moved,
+# COLLIDED when any stayed because of a collision, and FAILED per failed move.
+# Arguments: SRC, DEST, entry name, category folder, why it was classified.
+merge_entry() {
+    local src="$1" dest="$2" name="$3" category_dir="$4" reason="$5"
+    local file rel target moved=0 collided=0 s_size d_size why
+    while IFS= read -r -d '' file; do
+        rel="${file#"$src"/}"
+        target="${dest}/${rel}"
+        if [[ -e "$target" || -L "$target" ]]; then
+            if [[ -d "$target" ]]; then
+                why="a folder with this name exists in $category_dir"
+            else
+                s_size="$(stat -c '%s' -- "$file" 2>/dev/null)" || s_size="unknown"
+                d_size="$(stat -c '%s' -- "$target" 2>/dev/null)" || d_size="unknown"
+                if [[ "$s_size" == "$d_size" ]]; then
+                    why="same name and size already in $category_dir"
+                else
+                    why="same name, different size in $category_dir"
+                fi
+            fi
+            report_file_collision "$name/$rel" "$why"
+            collided=$(( collided + 1 ))
+            continue
+        fi
+        if (( DRY_RUN )); then
+            echo "  [DRY RUN] Would move: $name/$rel"
+            moved=$(( moved + 1 ))
+            continue
+        fi
+        mkdir -p -- "$(dirname -- "$target")" || { report_failure "$name/$rel (mkdir)"; continue; }
+        # mv -n exits 0 without moving when the destination appeared in the meantime,
+        # so a source that is still there is the failure signal.
+        if mv -n -- "$file" "$target" && [[ ! -e "$file" && ( -e "$target" || -L "$target" ) ]]; then
+            moved=$(( moved + 1 ))
+        else
+            report_failure "$name/$rel (mv error)"
+        fi
+    done < <(find "$src" -mindepth 1 ! -type d -print0 | sort -z)
+
+    if (( DRY_RUN )); then
+        echo "  [DRY RUN] Would merge: $name -> $category_dir ($moved to move, $collided collision(s); $reason)"
+        return 0
+    fi
+    # Emptied folders, children first, SRC last (-delete implies -depth).
+    find "$src" -type d -empty -delete 2>/dev/null || true
+    if (( collided > 0 )); then
+        COLLIDED=$(( COLLIDED + 1 ))
+        echo "PARTLY MERGED: $name -> $category_dir ($moved moved, $collided stayed as collisions)"
+        log "PARTLY MERGED: $src -> $dest ($moved moved, $collided collisions)"
+    elif [[ ! -e "$src" ]]; then
+        MERGED=$(( MERGED + 1 ))
+        PROMOTED=$(( PROMOTED + 1 ))
+        echo "MERGED: $name -> $category_dir ($moved file(s) into the existing folder; $reason)"
+        log "MERGED: $src -> $dest ($moved files)"
+    fi
+}
+
 # Moves one top-level entry to its category folder in the holding directory, or
 # reports why it stays: gone since the listing (a failure), no video inside
 # (held), no category chosen (a decision, or deferred to the next run), or its
-# name already in the category folder (a collision). Checks the dry-run flag
-# itself. Counts PROMOTED, HELD, UNCLASSIFIED, DEFERRED_LOOKUP, COLLIDED or
+# name already in the category folder: a folder is merged into the existing one
+# (merge_entry), anything else is a collision. Checks the dry-run flag
+# itself. Counts PROMOTED, MERGED, HELD, UNCLASSIFIED, DEFERRED_LOOKUP, COLLIDED or
 # FAILED. Sets nothing else. Argument: entry path.
 ingest_entry() {
     local entry="$1" name dest class_rc=0
@@ -470,7 +552,11 @@ ingest_entry() {
     esac
     dest="${HOLD_DIR}/${CLASS_CATEGORY}/${name}"
     if [[ -e "$dest" || -L "$dest" ]]; then
-        report_collision "$name" "${HOLD_DIR}/${CLASS_CATEGORY}"
+        if [[ -d "$entry" && ! -L "$entry" && -d "$dest" ]]; then
+            merge_entry "$entry" "$dest" "$name" "${HOLD_DIR}/${CLASS_CATEGORY}" "$CLASS_REASON"
+        else
+            report_collision "$name" "${HOLD_DIR}/${CLASS_CATEGORY}"
+        fi
         return 0
     fi
     if (( DRY_RUN )); then
@@ -516,10 +602,13 @@ echo "----------------------------------------------------------------"
 # 1. SETTLE CHECK
 SIG_SETTLED="$(tree_signature "$SOURCE_DIR")"
 if (( SETTLE_SECONDS > 0 )); then
-    echo "Waiting ${SETTLE_SECONDS}s to confirm $SOURCE_DIR has stopped changing..."
+    echo "Waiting ${SETTLE_SECONDS}s to confirm $SOURCE_DIR has stopped changing (any key skips the wait on a terminal)..."
     progress_countdown "$SETTLE_SECONDS" "Waiting for $SOURCE_DIR to stop changing"
     SIG_AFTER_WAIT="$(tree_signature "$SOURCE_DIR")"
-    if [[ "$SIG_AFTER_WAIT" != "$SIG_SETTLED" ]]; then
+    if (( PROGRESS_SKIPPED )); then
+        echo "Settle wait skipped by a key press; the settle check was not applied."
+        (( DRY_RUN )) || log "SETTLE SKIPPED by a key press: $SOURCE_DIR"
+    elif [[ "$SIG_AFTER_WAIT" != "$SIG_SETTLED" ]]; then
         echo "NOT SETTLED: files under $SOURCE_DIR changed during the ${SETTLE_SECONDS}s window; nothing done, the next run retries."
         log "NOT SETTLED: $SOURCE_DIR changed during the ${SETTLE_SECONDS}s window"
         exit 0
@@ -595,7 +684,8 @@ echo "  Moved:      $PROMOTED"
 echo "  Held:       $HELD  (no video file inside; left in $SOURCE_DIR)"
 echo "  Unplaced:   $UNCLASSIFIED  (no category chosen; left in $SOURCE_DIR, see the review file)"
 echo "  Deferred:   $DEFERRED_LOOKUP  (a lookup could not complete; the next run retries)"
-echo "  Collisions: $COLLIDED  (name already exists in its category folder; merge manually)"
+echo "  Merged:     $MERGED  (folders merged into one already in its category folder; counted in Moved)"
+echo "  Collisions: $COLLIDED  (a file already exists in its category folder, or an entry cannot be merged; left in $SOURCE_DIR)"
 echo "  Failed:     $FAILED"
 echo "  Runtime:    $(format_runtime "$SECONDS")"
 echo "------------------------------------------"
