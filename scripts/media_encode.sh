@@ -841,7 +841,7 @@ SUB_TMP_DIR=""
 # created or is already gone, so the EXIT trap can call it unconditionally.
 # Wired into that trap alongside the lock-file removal, so an interrupted run
 # doesn't leave stripped copies behind - the same reasoning
-# Linux_Script_Style_Guide.md section 5 applies to restoring any state on exit,
+# script_style_guide.md section 5 applies to restoring any state on exit,
 # not just locks.
 cleanup_sub_tmp() {
     [[ -n "$SUB_TMP_DIR" && -d "$SUB_TMP_DIR" ]] || return 0
