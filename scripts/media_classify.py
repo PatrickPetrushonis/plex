@@ -209,6 +209,8 @@ def video_seconds(path):
             capture_output=True, text=True)
     except FileNotFoundError:
         raise ClassifyError("ffprobe not found on PATH") from None
+    if result.returncode != 0:
+        raise ClassifyError(f"ffprobe failed for {os.path.basename(path)}")
     try:
         seconds = float(result.stdout.strip())
     except ValueError:
