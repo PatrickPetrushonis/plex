@@ -2,7 +2,7 @@
 # media_rename.sh: Rename movie AND TV episode video/subtitle files (and
 #                  optionally their containing directories) into Plex naming
 #                  convention. Handles both already-Plex-formatted names and
-#                  raw scene-release names — see "Name parsing" below.
+#                  raw scene-release names; see "Name parsing" below.
 #
 # Usage:  ./media_rename.sh [OPTIONS] <target_dir>
 #
@@ -10,7 +10,7 @@
 #   -n              Dry run: print decisions, do not rename; takes no lock and
 #                   writes no log (default: off)
 #   -f              Force: overwrite destination if a rename target already
-#                   exists (default: off — collisions are skipped and logged).
+#                   exists (default: off; collisions are skipped and logged).
 #                   Applies to files only: a directory-rename collision is
 #                   always skipped, since mv nests a directory inside an
 #                   existing target rather than replacing it. Asks for a
@@ -18,7 +18,7 @@
 #                   dry run); any other answer aborts the run
 #   -F              Files only: rename in place; skip renaming containing
 #                   directories and all franchise-folder and Season-folder
-#                   restructuring (default: off — see "Franchise-folder
+#                   restructuring (default: off; see "Franchise-folder
 #                   restructuring" and "Episode folder layout" below)
 #   -O DIR          Operational directory: base for logs (OPDIR/Logs) and the
 #                   lock file (OPDIR/.locks), never <target_dir> itself; used
@@ -520,7 +520,7 @@ attempt_rename() {
             # mv onto an existing directory nests the source inside it
             # (new/old/...) instead of replacing it, so this is never forced,
             # whatever -f says or the source type.
-            echo "SKIPPING (rename target directory already exists — merge manually): $new_base"
+            echo "SKIPPING (rename target directory already exists, merge manually): $new_base"
             log "SKIPPED (directory collision): $old_base -> $new_base"
             SKIPPED=$(( SKIPPED + 1 ))
             return 0

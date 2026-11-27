@@ -7,7 +7,7 @@
 # Usage:  ./scripts/lint.sh
 #
 # Exits non-zero if any file has findings, so it's usable as a
-# pre-commit gate later if wanted — not wired up as one yet, this is
+# pre-commit gate later if wanted; not wired up as one yet, this is
 # just the standalone runner.
 
 set -euo pipefail
@@ -27,7 +27,7 @@ FAILED=0
 # -- Shell: shellcheck ------------------------------------------------------------
 if [[ ${#SHELL_SCRIPTS[@]} -gt 0 ]]; then
     if ! command -v shellcheck &>/dev/null; then
-        echo "shellcheck not found — installing via apt..."
+        echo "shellcheck not found, installing via apt..."
         sudo apt-get update -qq
         sudo apt-get install -y shellcheck
     fi
@@ -76,7 +76,7 @@ echo "------------------------------------------"
 if [[ $FAILED -eq 0 ]]; then
     echo "All $TOTAL file(s) clean."
 else
-    echo "$FAILED of $TOTAL file(s) have findings — see above."
+    echo "$FAILED of $TOTAL file(s) have findings; see above."
 fi
 
 exit "$FAILED"
